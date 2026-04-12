@@ -1,0 +1,24 @@
+{
+  "name": "Corpus Scribe",
+  "manifest_version": 3,
+  "version": "2.0",
+  "description": "Capture web pages and PDFs into a markdown-first research corpus with reading PDFs, notes, and bibliography",
+  "permissions": ["activeTab", "scripting", "tabs", "cookies", "notifications", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": ["*://*/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "assets/icons/16.png",
+      "48": "assets/icons/48.png",
+      "128": "assets/icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "assets/icons/16.png",
+    "48": "assets/icons/48.png",
+    "128": "assets/icons/128.png"
+  }
+}

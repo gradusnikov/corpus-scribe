@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ${HOST_OUTPUT_DIR:-./output}:/output
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json
+    environment:
+      - API_KEY=api-key-1234
+      - OUTPUT_DIR=/output
+      - NOTES_LLM_PROVIDER=${NOTES_LLM_PROVIDER:-anthropic}
+      - NOTES_LLM_BASE_URL=${NOTES_LLM_BASE_URL:-http://172.24.208.1:1234/v1}
+      - NOTES_LLM_MODEL=${NOTES_LLM_MODEL:-claude-sonnet-4-20250514}
+      - NOTES_LLM_API_KEY=${NOTES_LLM_API_KEY:-}
+      - NOTES_LLM_TIMEOUT=${NOTES_LLM_TIMEOUT:-120}
+      - NOTES_ANTHROPIC_VERSION=${NOTES_ANTHROPIC_VERSION:-2023-06-01}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - MISTRAL_BASE_URL=${MISTRAL_BASE_URL:-https://api.mistral.ai}
+      - MISTRAL_OCR_MODEL=${MISTRAL_OCR_MODEL:-mistral-ocr-latest}
