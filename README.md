@@ -6,6 +6,12 @@ It captures messy publisher pages and source PDFs, normalizes them into **clean 
 
 Comes with a Chrome extension for one-click capture and a Dockerized Flask backend.
 
+## At a glance
+
+![Corpus Scribe popup](docs/popup-demo.svg)
+
+![Corpus Scribe bundle layout](docs/bundle-demo.svg)
+
 ## Why use it
 
 - Build a personal research corpus in plain Markdown instead of scattered bookmarks, PDFs, and clipped HTML.
