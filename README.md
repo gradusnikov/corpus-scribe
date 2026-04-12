@@ -1,8 +1,28 @@
 # Corpus Scribe
 
-Extract articles from web pages and save them as **Markdown-first article bundles** with an optional **PDF** (A5, Kindle Scribe-optimized) and optional **companion notes**, or send directly to a Kindle device via Gmail.
+Corpus Scribe turns web articles and PDFs into a **personalized, high-quality, LLM-friendly knowledge base**.
+
+It captures messy publisher pages and source PDFs, normalizes them into **clean Markdown-first article bundles**, preserves local assets, generates citation metadata, and optionally writes companion notes. Reading PDFs are still supported, but they are a derived artifact rather than the primary output.
 
 Comes with a Chrome extension for one-click capture and a Dockerized Flask backend.
+
+## Why use it
+
+- Build a personal research corpus in plain Markdown instead of scattered bookmarks, PDFs, and clipped HTML.
+- Create a knowledge base that is easier for local agents and LLM workflows to read, search, summarize, and link.
+- Preserve higher-quality source structure than generic clipping tools: equations, tables, code blocks, images, bibliography, and notes.
+- Keep both provenance and usability:
+  - original source PDF when applicable
+  - canonical `.md`
+  - optional `.notes.md`
+  - optional reading PDF for Kindle or offline reading
+
+## Ways to use it
+
+- Build a personal LLM knowledge base from articles, blog posts, papers, and technical documentation.
+- Save papers into labeled folders like `ml`, `agents`, `biology`, or `ideas` and query them later with local tools.
+- Generate clean reading copies from difficult source PDFs without making the PDF workflow the center of the system.
+- Maintain a private markdown library with stable frontmatter, bibliography files, notes, and an index that can be processed by scripts or agents.
 
 ## Project structure
 
@@ -31,7 +51,7 @@ docker compose up -d
 ```
 
 The backend starts on `http://localhost:5000`. Saved files appear in `./output/<label>/<article>/`.
-The canonical artifact is the saved `.md` file; the PDF is a derived reading copy.
+The canonical artifact is the saved `.md` file. Notes, bibliography, source PDFs, and reading PDFs are derived artifacts around that markdown core.
 The backend container runs as `${UID:-1000}:${GID:-1000}` by default so files created under `./output/` stay owned by your host user.
 
 If you want markdown and image assets to open cleanly in Windows apps from outside WSL, point the output mount at a Windows-backed folder.
@@ -63,6 +83,13 @@ Inside the container the backend still writes to `/output`, but Docker will map 
      - `Extraction: Mistral OCR`
      - or `Extraction: pdftotext fallback`
 7. Choose **Send to Kindle** or **Save PDF + MD**
+
+The usual workflow is:
+
+- capture article or PDF
+- store it under a label
+- keep the markdown as the main artifact
+- optionally generate notes and reading PDFs
 
 ## API
 
