@@ -2444,11 +2444,51 @@ function App() {
     [detail?.markdown],
   )
 
+  const [noisyHeadingIndexes, setNoisyHeadingIndexes] = useState<Set<number>>(() => new Set())
+
+  useEffect(() => {
+    if (!detail?.markdown) {
+      setNoisyHeadingIndexes(new Set())
+      return
+    }
+    const compute = () => {
+      const root = document.querySelector('.markdown-body')
+      if (!root) {
+        setNoisyHeadingIndexes(new Set())
+        return
+      }
+      const all = root.querySelectorAll('h1, h2, h3, h4, h5, h6')
+      const next = new Set<number>()
+      all.forEach((element, index) => {
+        if (
+          element.classList.contains('section-noise') ||
+          element.closest('.section-noise') ||
+          element.closest('mark.inline-noise')
+        ) {
+          next.add(index)
+        }
+      })
+      setNoisyHeadingIndexes((current) => {
+        if (current.size === next.size && [...current].every((value) => next.has(value))) {
+          return current
+        }
+        return next
+      })
+    }
+    const frame = window.requestAnimationFrame(compute)
+    return () => window.cancelAnimationFrame(frame)
+  }, [detail?.markdown, highlights, referencesAreNoise])
+
+  const visibleHeadings = useMemo(() => {
+    if (!noisyHeadingIndexes.size) return articleHeadings
+    return articleHeadings.filter((entry) => !noisyHeadingIndexes.has(entry.index))
+  }, [articleHeadings, noisyHeadingIndexes])
+
   const tocCandidates = useMemo(() => {
     const q = tocQuery.trim().toLowerCase()
-    if (!q) return articleHeadings
-    return articleHeadings.filter((entry) => entry.text.toLowerCase().includes(q))
-  }, [articleHeadings, tocQuery])
+    if (!q) return visibleHeadings
+    return visibleHeadings.filter((entry) => entry.text.toLowerCase().includes(q))
+  }, [visibleHeadings, tocQuery])
 
   useEffect(() => {
     if (!tocOpen) return
@@ -2634,11 +2674,11 @@ function App() {
               type="text"
               autoFocus
               placeholder={
-                articleHeadings.length
+                visibleHeadings.length
                   ? 'Jump to section…'
                   : 'No headings in current document'
               }
-              disabled={!articleHeadings.length}
+              disabled={!visibleHeadings.length}
               value={tocQuery}
               onChange={(event) => {
                 setTocQuery(event.target.value)
@@ -2674,7 +2714,7 @@ function App() {
             <div className="switcher-list" role="listbox">
               {tocCandidates.length === 0 ? (
                 <div className="switcher-empty">
-                  {articleHeadings.length ? 'No matching headings.' : 'This document has no headings.'}
+                  {visibleHeadings.length ? 'No matching headings.' : 'This document has no headings.'}
                 </div>
               ) : (
                 tocCandidates.slice(0, 200).map((entry, index) => {
@@ -2702,7 +2742,7 @@ function App() {
             </div>
             <div className="switcher-footer">
               <span>↑↓ navigate · ↵ jump · Esc close · Ctrl+Shift+O toggle</span>
-              <span>{articleHeadings.length} headings</span>
+              <span>{visibleHeadings.length} headings</span>
             </div>
           </div>
         </div>
@@ -2947,7 +2987,7 @@ function App() {
               >
                 Docs{openDocIds.length ? ` · ${openDocIds.length}` : ''}
               </button>
-              {detail && articleHeadings.length ? (
+              {detail && visibleHeadings.length ? (
                 <button
                   type="button"
                   className="ghost-button reader-toolbar-button"
@@ -2959,7 +2999,7 @@ function App() {
                   title="Jump to heading (Ctrl+Shift+O)"
                   aria-label="Open table of contents"
                 >
-                  TOC · {articleHeadings.length}
+                  TOC · {visibleHeadings.length}
                 </button>
               ) : null}
               {detail ? (
