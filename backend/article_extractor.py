@@ -299,10 +299,11 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
         md_file.write_text(md_text, encoding="utf-8")
 
     # --- Generate PDF from the final markdown using a single browser renderer ---
+    # Assets stay at full resolution on disk; _generate_pdf resizes a staged copy
+    # for the PDF layout only.
     pdf_file = None
     if render_pdf:
         try:
-            _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
             pdf_file = _generate_pdf(md_text, title, article_dir, page_cfg["papersize"])
         except Exception:
             if pdf_required:
@@ -435,7 +436,6 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         reading_pdf = None
         if render_pdf:
             try:
-                _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
                 generated_pdf = _generate_pdf(md_text, title, article_dir, page_cfg["papersize"])
                 reading_pdf = article_dir / f"{safe_name}.reading.pdf"
                 if generated_pdf != reading_pdf:
@@ -2574,10 +2574,15 @@ def _generate_pdf(
     article_dir: Path,
     papersize: str = "a5",
 ) -> Path:
-    """Generate PDF from final markdown via Pandoc -> HTML -> Chromium."""
+    """Generate PDF from final markdown via Pandoc -> HTML -> Chromium.
+
+    Images in the bundle's assets/ are left at full resolution. A staged copy
+    is resized to fit the target page width just for the PDF render.
+    """
     pdf_file = article_dir / f"{article_dir.name}.pdf"
     assets_src = article_dir / "assets"
     md_text = _sanitize_unicode_text(md_text)
+    page_cfg = _PAGE_SIZES.get(papersize.lower(), _PAGE_SIZES["a5"])
 
     with tempfile.TemporaryDirectory(prefix="scribe-pdf-") as stage_tmp:
         stage_dir = Path(stage_tmp)
@@ -2585,7 +2590,9 @@ def _generate_pdf(
         stage_html = stage_dir / "article.html"
 
         if assets_src.exists():
-            shutil.copytree(assets_src, stage_dir / "assets")
+            staged_assets = stage_dir / "assets"
+            shutil.copytree(assets_src, staged_assets)
+            _resize_images_for_pdf(staged_assets, max_width=page_cfg["max_img_width"])
         html_fragment = _render_markdown_to_html(md_text)
         stage_html.write_text(
             _wrap_html_for_browser_pdf(html_fragment, title, papersize),
@@ -2651,6 +2658,7 @@ def regenerate_reading_pdf(
     """Regenerate the reading PDF for an existing markdown article.
 
     Applies noise removal and highlight wrapping before rendering.
+    Bundle assets are never mutated — _generate_pdf resizes a staged copy.
     """
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     md_raw = article_path.read_text(encoding="utf-8")
@@ -2660,9 +2668,6 @@ def regenerate_reading_pdf(
     article_dir = article_path.parent
     safe_name = article_path.stem
     body = _apply_reader_annotations(body, highlights or [])
-    assets_dir = article_dir / "assets"
-    if assets_dir.exists():
-        _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
     generated_pdf = _generate_pdf(body, title, article_dir, page_cfg["papersize"])
     reading_pdf = article_dir / f"{safe_name}.reading.pdf"
     if generated_pdf != reading_pdf:

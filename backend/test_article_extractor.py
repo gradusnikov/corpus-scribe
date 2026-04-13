@@ -432,6 +432,32 @@ class ArticleExtractorTests(unittest.TestCase):
                 self.assertEqual(im.width, 240)
                 self.assertEqual(im.mode, "RGBA")
 
+    def test_generate_pdf_keeps_bundle_assets_at_full_resolution(self):
+        """Bundle assets must not be destructively resized by PDF generation."""
+        import article_extractor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_dir = Path(tmpdir) / "fixture"
+            assets_dir = article_dir / "assets"
+            assets_dir.mkdir(parents=True)
+            full_image = assets_dir / "figure.png"
+            Image.new("RGB", (2400, 1800), (255, 0, 0)).save(full_image, format="PNG")
+            original_size = full_image.stat().st_size
+
+            md_text = (
+                '---\n'
+                'title: "Fixture"\n'
+                '---\n\n'
+                "# Fixture\n\nInline image ![caption](assets/figure.png)\n"
+            )
+
+            article_extractor._generate_pdf(md_text, "Fixture", article_dir, "a5")
+
+            with Image.open(full_image) as im:
+                self.assertEqual(im.width, 2400)
+                self.assertEqual(im.height, 1800)
+            self.assertEqual(full_image.stat().st_size, original_size)
+
     def test_extract_article_preserves_math_tables_and_pdf_rendering(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             result = extract_article(
@@ -550,6 +576,7 @@ class ArticleExtractorTests(unittest.TestCase):
                     url="https://arxiv.org/pdf/2604.08369",
                     source_name="fixture.pdf",
                     label="Research",
+                    render_pdf=True,
                 )
 
             saved_pdf = Path(result["file-path"])

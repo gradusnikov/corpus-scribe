@@ -45,6 +45,8 @@
 26. [x] Feature: Add "Info" button to display the frontmatter in a popup
 27. [x] Feature: Change how the Readable PDFs are generated. Do not generate them automatically - instead lazy generate upon request. The generated pdfs should exclude noise, and include highlights. No need to regenerate the PDF if highlights, or noise is not changed. Default page size should be in settings.
 28. [x] Feature: Exclude Noise from TOC
+29. [ ] Feature: Add "Open location" button that opens file explorer with the directory containing artifacts of the opened document
+30. [ ] Feature: In Info, add information from the citation (e.g. Authors are missing)
 
 ## Notes
 
@@ -72,7 +74,7 @@
 ## Updates to Corpus Extractor
 
 1. [x] Bug: References are not correctly processed (e.g. "Validation of Fractional Anisotropy*") 
-2. [ ] Feature: Save images in a displayed resolution (current) and full resolution (if available)
+2. [x] Feature: Save images in a displayed resolution (current) and full resolution (if available)
 3. [x] Bug: When sanitizing equations add surround with new lines (if not already surrounded) single line equations
 
 ## MCP server - instead of a chat panel, allow to use any LLM app to interface with the corpus db via MCP
