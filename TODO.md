@@ -7,7 +7,7 @@
 3. [x] Feature: Use file selector dialog to set the corpus root
 4. [x] Bug: Do not load automatically the first document
 5. [ ] Feature: Search related to the current document (based on references found in the current document, or semantic search)
-6. [ ] Feature: Allow to link a related document to the current document - allow to add a note
+6. [x] Feature: Allow to link a related document to the current document - allow to add a note
 7. [ ] Feature: Allow to display and image in full resolution
 8. [~] Feature: search should prioritize highly ranked sources, affinity to the current document (rating priority done; affinity pending)
 9. [x] Feature: In search use author, latex article id, doi, date, etc.
@@ -67,7 +67,7 @@
 
 ## Related
 
-1. [ ] Feature: Show documents linked by the user
+1. [x] Feature: Show documents linked by the user
 
 ## Updates to Corpus Extractor
 

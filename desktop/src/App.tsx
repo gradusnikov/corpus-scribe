@@ -41,6 +41,14 @@ type LibraryIndex = {
 
 type FrontmatterValue = string | number | boolean | null | FrontmatterValue[]
 
+type RelatedLink = {
+  id: string
+  targetPath: string
+  targetTitle: string
+  note: string
+  createdAt: string
+}
+
 type DocumentDetail = {
   summary: DocumentSummary
   markdown: string
@@ -48,6 +56,7 @@ type DocumentDetail = {
   highlights: Highlight[]
   bibliography: string
   frontmatter: Record<string, FrontmatterValue>
+  related: RelatedLink[]
 }
 
 type SearchRequest = {
@@ -242,6 +251,21 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       const data = await response.json()
       if (!response.ok || !data.success) {
         throw new Error(data.message ?? 'Failed to rebuild index')
+      }
+      return data as T
+    }
+    case 'save_related': {
+      const response = await fetch(`${browserApiBase}/desktop/related`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+          items: payload.items,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to save related links')
       }
       return data as T
     }
@@ -1393,6 +1417,11 @@ function App() {
   })
   const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const [highlights, setHighlights] = useState<Highlight[]>([])
+  const [relatedLinks, setRelatedLinks] = useState<RelatedLink[]>([])
+  const [relatedPickerOpen, setRelatedPickerOpen] = useState(false)
+  const [relatedPickerQuery, setRelatedPickerQuery] = useState('')
+  const [relatedDraftNote, setRelatedDraftNote] = useState('')
+  const [relatedSaving, setRelatedSaving] = useState(false)
   const [loadingLibrary, setLoadingLibrary] = useState(false)
   const [reindexing, setReindexing] = useState(false)
   const [searching, setSearching] = useState(false)
@@ -1958,6 +1987,9 @@ function App() {
       setDetail(loaded)
       setNotesDraft(loaded.notesMarkdown)
       setHighlights(loaded.highlights)
+      setRelatedLinks(loaded.related ?? [])
+      setRelatedDraftNote('')
+      setRelatedPickerQuery('')
       setPendingSelection(null)
       setStatus(`Opened ${loaded.summary.title}`)
     } catch (error) {
@@ -2095,6 +2127,66 @@ function App() {
     } finally {
       setSavingHighlights(false)
     }
+  }
+
+  async function persistRelated(next: RelatedLink[], successMessage: string) {
+    if (!detail) return
+    setRelatedSaving(true)
+    try {
+      const response = await desktopCommand<{ items: RelatedLink[]; relatedPath: string }>('save_related', {
+        articlePath: detail.summary.articlePath,
+        items: next,
+      })
+      setRelatedLinks(response.items)
+      setDetail((current) =>
+        current ? { ...current, related: response.items } : current,
+      )
+      setStatus(successMessage)
+    } catch (error) {
+      setStatus(stringifyError(error))
+    } finally {
+      setRelatedSaving(false)
+    }
+  }
+
+  async function addRelatedLink(target: DocumentSummary) {
+    if (!detail) return
+    if (target.articlePath === detail.summary.articlePath) {
+      setStatus('Cannot link a document to itself')
+      return
+    }
+    if (relatedLinks.some((link) => link.targetPath === target.articlePath)) {
+      setStatus('Already linked')
+      return
+    }
+    const entry: RelatedLink = {
+      id: `${target.id}-${Date.now()}`,
+      targetPath: target.articlePath,
+      targetTitle: target.title,
+      note: relatedDraftNote.trim(),
+      createdAt: new Date().toISOString(),
+    }
+    const next = [...relatedLinks, entry]
+    setRelatedPickerOpen(false)
+    setRelatedPickerQuery('')
+    setRelatedDraftNote('')
+    await persistRelated(next, `Linked ${target.title}`)
+  }
+
+  async function removeRelatedLink(targetPath: string) {
+    const next = relatedLinks.filter((link) => link.targetPath !== targetPath)
+    await persistRelated(next, 'Removed related link')
+  }
+
+  async function updateRelatedNote(targetPath: string, note: string) {
+    const next = relatedLinks.map((link) =>
+      link.targetPath === targetPath ? { ...link, note } : link,
+    )
+    setRelatedLinks(next)
+  }
+
+  async function commitRelatedNote(_targetPath: string) {
+    await persistRelated(relatedLinks, 'Updated related note')
   }
 
   async function addHighlightFromSelection(variant: NoiseVariant = 'highlight') {
@@ -3770,6 +3862,108 @@ function App() {
               <p className="search-hint">Select text in the article, then add it as a highlight.</p>
             )}
           </section>
+
+          {detail ? (
+            <section className="info-card">
+              <div className="highlights-header">
+                <h3>Related</h3>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => {
+                    setRelatedPickerOpen((value) => !value)
+                    setRelatedPickerQuery('')
+                  }}
+                  disabled={relatedSaving}
+                >
+                  {relatedPickerOpen ? 'Cancel' : '+ Link'}
+                </button>
+              </div>
+              {relatedPickerOpen ? (
+                <div className="related-picker">
+                  <input
+                    type="text"
+                    className="text-input"
+                    placeholder="Filter library…"
+                    value={relatedPickerQuery}
+                    onChange={(event) => setRelatedPickerQuery(event.target.value)}
+                    autoFocus
+                  />
+                  <input
+                    type="text"
+                    className="text-input"
+                    placeholder="Optional note"
+                    value={relatedDraftNote}
+                    onChange={(event) => setRelatedDraftNote(event.target.value)}
+                  />
+                  <ul className="related-picker-list">
+                    {library.documents
+                      .filter((doc) => {
+                        if (doc.articlePath === detail.summary.articlePath) return false
+                        if (relatedLinks.some((link) => link.targetPath === doc.articlePath)) return false
+                        const needle = relatedPickerQuery.trim().toLowerCase()
+                        if (!needle) return true
+                        return (
+                          (doc.title || '').toLowerCase().includes(needle) ||
+                          (doc.label || '').toLowerCase().includes(needle)
+                        )
+                      })
+                      .slice(0, 20)
+                      .map((doc) => (
+                        <li key={doc.id}>
+                          <button
+                            type="button"
+                            className="related-picker-item"
+                            onClick={() => void addRelatedLink(doc)}
+                            disabled={relatedSaving}
+                          >
+                            <strong>{doc.title}</strong>
+                            <span className="muted">{doc.label ?? 'unlabeled'}</span>
+                          </button>
+                        </li>
+                      ))}
+                  </ul>
+                </div>
+              ) : null}
+              {relatedLinks.length ? (
+                <ul className="related-list">
+                  {relatedLinks.map((link) => (
+                    <li key={link.targetPath} className="related-item">
+                      <div className="related-row">
+                        <button
+                          type="button"
+                          className="related-title"
+                          onClick={() => void loadDocumentByPath(link.targetPath, link.targetTitle)}
+                          title={link.targetPath}
+                        >
+                          {link.targetTitle || link.targetPath}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button highlight-button"
+                          onClick={() => void removeRelatedLink(link.targetPath)}
+                          disabled={relatedSaving}
+                          title="Remove link"
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <input
+                        type="text"
+                        className="text-input related-note-input"
+                        value={link.note}
+                        placeholder="Note"
+                        onChange={(event) => void updateRelatedNote(link.targetPath, event.target.value)}
+                        onBlur={() => void commitRelatedNote(link.targetPath)}
+                      />
+                    </li>
+                  ))}
+                </ul>
+              ) : !relatedPickerOpen ? (
+                <p className="search-hint">Link documents that cite or build on this one.</p>
+              ) : null}
+            </section>
+          ) : null}
 
           </div>
         </div>

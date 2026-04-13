@@ -241,6 +241,52 @@ def _write_highlights(path: Path, highlights: list[dict]) -> Path:
     return highlights_path
 
 
+def _related_path(path: Path) -> Path:
+    return path.with_name(path.stem + ".related.json")
+
+
+def _load_related(path: Path) -> list[dict]:
+    related_path = _related_path(path)
+    if not related_path.exists():
+        return []
+    try:
+        payload = json.loads(related_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        target_path = item.get("targetPath")
+        if not isinstance(target_path, str) or not target_path.strip():
+            continue
+        cleaned_item = {
+            "id": str(item.get("id") or "").strip(),
+            "targetPath": target_path.strip(),
+            "targetTitle": str(item.get("targetTitle") or "").strip(),
+            "note": str(item.get("note") or "").strip(),
+            "createdAt": str(item.get("createdAt") or "").strip(),
+        }
+        cleaned.append(cleaned_item)
+    return cleaned
+
+
+def _write_related(path: Path, items: list[dict]) -> Path:
+    related_path = _related_path(path)
+    if items:
+        payload = {"articlePath": str(path), "items": items}
+        related_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    elif related_path.exists():
+        related_path.unlink()
+    return related_path
+
+
 def _stable_doc_id(path: Path) -> str:
     return path.as_posix().lower()
 
@@ -1332,6 +1378,7 @@ def desktop_document():
     notes_markdown = _read_markdown_body(notes_path) if notes_path else ""
     bibliography = bib_path.read_text(encoding="utf-8") if bib_path else ""
     highlights = _load_highlights(path)
+    related = _load_related(path)
 
     return jsonify(
         success=True,
@@ -1342,6 +1389,7 @@ def desktop_document():
             "highlights": highlights,
             "bibliography": bibliography,
             "frontmatter": frontmatter,
+            "related": related,
         },
     )
 
@@ -1483,6 +1531,53 @@ def desktop_save_highlights():
 
     highlights_path = _write_highlights(article_path, cleaned)
     return jsonify(success=True, highlightsPath=str(highlights_path), highlights=cleaned)
+
+
+@app.route("/desktop/related", methods=["POST"])
+def desktop_save_related():
+    data = request.get_json(silent=True) or {}
+    article_path = Path((data.get("articlePath") or "").strip())
+    raw_items = data.get("items")
+    if not article_path.name:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+    if not isinstance(raw_items, list):
+        return jsonify(success=False, message="Missing items"), 400
+
+    cleaned: list[dict] = []
+    seen_targets: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        target_path_raw = item.get("targetPath")
+        if not isinstance(target_path_raw, str) or not target_path_raw.strip():
+            continue
+        try:
+            target_path = Path(target_path_raw.strip()).resolve()
+        except Exception:
+            continue
+        try:
+            self_path = article_path.resolve()
+        except Exception:
+            self_path = article_path
+        if target_path == self_path:
+            continue
+        key = str(target_path)
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+        entry = {
+            "id": str(item.get("id") or "").strip() or _stable_doc_id(target_path),
+            "targetPath": str(target_path),
+            "targetTitle": str(item.get("targetTitle") or "").strip(),
+            "note": str(item.get("note") or "").strip(),
+            "createdAt": str(item.get("createdAt") or "").strip(),
+        }
+        cleaned.append(entry)
+
+    related_path = _write_related(article_path, cleaned)
+    return jsonify(success=True, relatedPath=str(related_path), items=cleaned)
 
 
 @app.route("/desktop/rating", methods=["POST"])

@@ -1629,6 +1629,104 @@ select {
   border-top: 1px solid var(--color-card-border);
 }
 
+.related-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.related-picker-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--color-card-border);
+  border-radius: 8px;
+}
+
+.related-picker-list li + li {
+  border-top: 1px solid var(--color-card-border);
+}
+
+.related-picker-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  color: var(--color-text-primary);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.related-picker-item:hover {
+  background: var(--color-card-hover);
+}
+
+.related-picker-item strong {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.related-picker-item .muted {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.related-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.related-item {
+  padding: 10px 12px;
+  border: 1px solid var(--color-card-border);
+  border-radius: 10px;
+  background: var(--color-card-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.related-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.related-title {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+}
+
+.related-title:hover {
+  text-decoration-color: currentColor;
+}
+
+.related-note-input {
+  font-size: 0.82rem;
+  padding: 6px 8px;
+}
+
 .highlight-card p {
   margin: 0;
   color: var(--color-text-primary);

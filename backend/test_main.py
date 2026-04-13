@@ -776,6 +776,70 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertFalse(response.get_json()["success"])
 
+    def test_desktop_related_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "A.md"
+            target = root / "B.md"
+            source.write_text(
+                "---\n" 'title: "Source"\n' "---\n\nbody\n",
+                encoding="utf-8",
+            )
+            target.write_text(
+                "---\n" 'title: "Target"\n' "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            save = self.client.post(
+                "/desktop/related",
+                json={
+                    "articlePath": str(source),
+                    "items": [
+                        {
+                            "targetPath": str(target),
+                            "targetTitle": "Target",
+                            "note": "Cited in section 3",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(save.status_code, 200)
+            saved = save.get_json()
+            self.assertTrue(saved["success"])
+            self.assertEqual(len(saved["items"]), 1)
+            self.assertEqual(saved["items"][0]["targetTitle"], "Target")
+            self.assertEqual(saved["items"][0]["note"], "Cited in section 3")
+
+            detail_response = self.client.get(
+                "/desktop/document",
+                query_string={"articlePath": str(source)},
+            )
+            self.assertEqual(detail_response.status_code, 200)
+            related = detail_response.get_json()["detail"]["related"]
+            self.assertEqual(len(related), 1)
+            self.assertEqual(related[0]["targetTitle"], "Target")
+
+            cleared = self.client.post(
+                "/desktop/related",
+                json={"articlePath": str(source), "items": []},
+            )
+            self.assertEqual(cleared.status_code, 200)
+            self.assertFalse((root / "A.related.json").exists())
+
+    def test_desktop_related_rejects_self_link(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article = Path(tmpdir) / "A.md"
+            article.write_text("---\ntitle: \"A\"\n---\n\nbody\n", encoding="utf-8")
+            response = self.client.post(
+                "/desktop/related",
+                json={
+                    "articlePath": str(article),
+                    "items": [{"targetPath": str(article), "targetTitle": "Self"}],
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"], [])
+
     def test_desktop_search_invalid_query_returns_400(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
             (Path(tmpdir) / "label").mkdir()
