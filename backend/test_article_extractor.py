@@ -304,6 +304,59 @@ class ArticleExtractorTests(unittest.TestCase):
         self.assertNotRegex(markdown, r"(?m)^[-*+]\s*$")
         self.assertNotIn("<br", markdown)
 
+    def test_pmc_reference_span_labels_become_ordered_list(self):
+        html = """<article>
+        <section class="ref-list"><h2>References</h2>
+        <ul class="ref-list" style="list-style-type:none">
+          <li id="REF1"><span class="label">1.</span><cite>First ref title. Author A. Journal. 2020.</cite> [<a href="https://doi.org/1">DOI</a>]</li>
+          <li id="REF2"><span class="label">2.</span><cite>Second ref title. Author B. Journal. 2021.</cite></li>
+          <li id="REF3"><span class="label">3.</span><cite>Third ref title. Author C. Journal. 2022.</cite></li>
+        </ul>
+        </section>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _convert_html_to_markdown(str(soup))
+
+        self.assertRegex(markdown, r"(?m)^1\.\s+First ref title\.")
+        self.assertRegex(markdown, r"(?m)^2\.\s+Second ref title\.")
+        self.assertRegex(markdown, r"(?m)^3\.\s+Third ref title\.")
+        self.assertNotRegex(markdown, r"(?m)^-\s+1\.")
+        self.assertNotIn("1.First", markdown)
+
+    def test_ul_with_numeric_text_prefix_becomes_ordered_list(self):
+        html = """<article>
+        <ul>
+          <li>1. Hicks CW et al. First paper. Sci Rep. 2021;11:19159.</li>
+          <li>2. Smith J et al. Second paper. J Med. 2022;12:1.</li>
+          <li>3. Doe A et al. Third paper. Nat. 2023;13:99.</li>
+        </ul>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _convert_html_to_markdown(str(soup))
+
+        self.assertRegex(markdown, r"(?m)^1\.\s+Hicks CW")
+        self.assertRegex(markdown, r"(?m)^2\.\s+Smith J")
+        self.assertRegex(markdown, r"(?m)^3\.\s+Doe A")
+        self.assertNotRegex(markdown, r"(?m)^-\s+1\\?\.")
+
+    def test_numbered_ul_conversion_leaves_unrelated_bullets_alone(self):
+        html = """<article>
+        <ul>
+          <li>Apple</li>
+          <li>Banana</li>
+          <li>Cherry</li>
+        </ul>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _convert_html_to_markdown(str(soup))
+
+        self.assertRegex(markdown, r"(?m)^-\s+Apple")
+        self.assertRegex(markdown, r"(?m)^-\s+Banana")
+        self.assertRegex(markdown, r"(?m)^-\s+Cherry")
+
     def test_image_cleanup_is_structural_and_captioned_figures_expand_in_pdf(self):
         html = """<article>
         <figure class="fig">

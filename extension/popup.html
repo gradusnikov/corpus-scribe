@@ -14,12 +14,12 @@
     <div class="row">
       <label for="page-size">Page size</label>
       <select id="page-size">
-        <option value="a5" selected>A5 (Kindle)</option>
+        <option value="a5" selected>A5</option>
         <option value="a4">A4</option>
       </select>
     </div>
     <div id="doc-hint" class="hint"></div>
-    <button id="btn-kindle" class="btn btn-primary">Send to Kindle</button>
+    <button id="btn-open-scribe" class="btn btn-primary">Open in Corpus Scribe</button>
     <button id="btn-save" class="btn btn-secondary">Save PDF + MD</button>
     <div id="status" class="status"></div>
 
@@ -30,10 +30,8 @@
         <input id="cfg-api-base" type="text" placeholder="http://127.0.0.1:5000">
         <label for="cfg-api-key">API key</label>
         <input id="cfg-api-key" type="text" placeholder="api-key-1234">
-        <label for="cfg-email">Gmail address</label>
-        <input id="cfg-email" type="email" placeholder="you@gmail.com">
-        <label for="cfg-kindle-email">Kindle email</label>
-        <input id="cfg-kindle-email" type="email" placeholder="you@kindle.com">
+        <label for="cfg-reader-url">Corpus Scribe URL</label>
+        <input id="cfg-reader-url" type="text" placeholder="http://127.0.0.1:1420">
       </div>
     </details>
   </div>

@@ -613,6 +613,38 @@ select {
   text-align: right;
 }
 
+.settings-switch {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 16px;
+  background: var(--color-panel-border);
+  border-radius: 999px;
+  transition: background 120ms ease;
+  flex-shrink: 0;
+}
+
+.settings-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: transform 120ms ease;
+}
+
+.settings-switch.is-on {
+  background: var(--color-accent, #3b82f6);
+}
+
+.settings-switch.is-on::after {
+  transform: translateX(12px);
+}
+
 .badge {
   padding: 6px 10px;
   border-radius: 999px;
@@ -744,6 +776,15 @@ select {
   text-decoration-color: currentColor;
   opacity: 0.7;
   padding: 0;
+  cursor: context-menu;
+}
+
+.markdown-body mark.inline-highlight.inline-noise:hover {
+  background: rgba(220, 78, 78, 0.14);
+  color: var(--color-text-primary);
+  outline: 1px dashed rgba(220, 78, 78, 0.5);
+  outline-offset: 1px;
+  border-radius: 2px;
 }
 
 .markdown-body[data-hide-noise="true"] mark.inline-highlight.inline-noise {
@@ -756,6 +797,31 @@ select {
 }
 
 .markdown-body[data-hide-noise="true"] .section-noise {
+  display: none;
+}
+
+.markdown-body [data-element-noise="true"] {
+  outline: 2px dashed rgba(220, 78, 78, 0.55);
+  outline-offset: 4px;
+  opacity: 0.55;
+  cursor: context-menu;
+}
+
+.markdown-body img[data-element-noise="true"] {
+  filter: grayscale(0.7);
+}
+
+.markdown-body[data-hide-noise="true"] [data-element-noise="true"] {
+  display: none;
+}
+
+.markdown-body .table-wrapper:has(table[data-element-noise="true"]) {
+  outline: 2px dashed rgba(220, 78, 78, 0.55);
+  outline-offset: 2px;
+  opacity: 0.55;
+}
+
+.markdown-body[data-hide-noise="true"] .table-wrapper:has(table[data-element-noise="true"]) {
   display: none;
 }
 
@@ -1389,6 +1455,7 @@ select {
   margin: 0;
   color: var(--color-text-primary);
   line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .highlight-actions {

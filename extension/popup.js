@@ -1,14 +1,13 @@
 const DEFAULTS = {
   apiBase: "http://127.0.0.1:5000",
   apiKey: "api-key-1234",
-  email: "",
-  kindleEmail: "",
+  readerUrl: "http://127.0.0.1:1420",
   pageSize: "a5",
   lastLabel: "",
   labelHistory: [],
 };
 
-const btnKindle = document.getElementById("btn-kindle");
+const btnOpenScribe = document.getElementById("btn-open-scribe");
 const btnSave = document.getElementById("btn-save");
 const statusEl = document.getElementById("status");
 const docHintEl = document.getElementById("doc-hint");
@@ -18,8 +17,7 @@ const labelOptionsEl = document.getElementById("label-options");
 
 const cfgApiBase = document.getElementById("cfg-api-base");
 const cfgApiKey = document.getElementById("cfg-api-key");
-const cfgEmail = document.getElementById("cfg-email");
-const cfgKindleEmail = document.getElementById("cfg-kindle-email");
+const cfgReaderUrl = document.getElementById("cfg-reader-url");
 
 function getTrimmedValue(el) {
   return el.value.trim();
@@ -35,8 +33,7 @@ function collectConfigFromInputs() {
   return {
     apiBase: getTrimmedValue(cfgApiBase),
     apiKey: getTrimmedValue(cfgApiKey),
-    email: getTrimmedValue(cfgEmail),
-    kindleEmail: getTrimmedValue(cfgKindleEmail),
+    readerUrl: getTrimmedValue(cfgReaderUrl),
     pageSize: pageSizeEl.value,
     lastLabel: getTrimmedValue(labelEl),
   };
@@ -90,6 +87,20 @@ async function fetchCapabilities(apiBase, apiKey) {
   }
 }
 
+async function lookupExistingArticle(apiBase, apiKey, url) {
+  if (!url) return null;
+  try {
+    const resp = await fetch(
+      `${apiBase}/lookup_url?apiKey=${encodeURIComponent(apiKey)}&url=${encodeURIComponent(url)}`,
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data && data.exists ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
@@ -122,8 +133,7 @@ async function loadPopupState() {
   pageSizeEl.value = cfg.pageSize;
   cfgApiBase.value = cfg.apiBase;
   cfgApiKey.value = cfg.apiKey;
-  cfgEmail.value = cfg.email;
-  cfgKindleEmail.value = cfg.kindleEmail;
+  cfgReaderUrl.value = cfg.readerUrl;
   labelEl.value = cfg.lastLabel;
 
   const backendLabels = await fetchExistingLabels(cfg.apiBase, cfg.apiKey);
@@ -138,8 +148,7 @@ for (const [el, key] of [
   [pageSizeEl, "pageSize"],
   [cfgApiBase, "apiBase"],
   [cfgApiKey, "apiKey"],
-  [cfgEmail, "email"],
-  [cfgKindleEmail, "kindleEmail"],
+  [cfgReaderUrl, "readerUrl"],
 ]) {
   el.addEventListener("change", () => {
     setStorage({ [key]: getTrimmedValue(el) });
@@ -163,7 +172,7 @@ function setStatus(msg, cls) {
 }
 
 function setButtonsDisabled(disabled) {
-  btnKindle.disabled = disabled;
+  btnOpenScribe.disabled = disabled;
   btnSave.disabled = disabled;
 }
 
@@ -225,18 +234,28 @@ async function getPdfData() {
   };
 }
 
-async function sendToEndpoint(endpoint) {
+async function saveCurrentPage({ allowReuse = true } = {}) {
   setButtonsDisabled(true);
-  setStatus("Extracting article...");
+  setStatus("Checking...");
 
   try {
     const cfg = await getConfig();
-    const tab = await getActiveTab();
-    const savePdfNatively = endpoint === "/save_local" && isLikelyPdfUrl(tab?.url || "");
-    const pageData = savePdfNatively ? await getPdfData() : await getPageData();
-    if (endpoint === "/save_local" && !cfg.lastLabel) {
+    if (!cfg.lastLabel) {
       throw new Error("Choose a label before saving");
     }
+    const tab = await getActiveTab();
+    const savePdfNatively = isLikelyPdfUrl(tab?.url || "");
+
+    if (allowReuse && tab?.url) {
+      const existing = await lookupExistingArticle(cfg.apiBase, cfg.apiKey, tab.url);
+      if (existing) {
+        setStatus(`Already saved: ${existing.title}`, "success");
+        return { data: existing, cfg, reused: true };
+      }
+    }
+
+    setStatus("Extracting article...");
+    const pageData = savePdfNatively ? await getPdfData() : await getPageData();
 
     if (savePdfNatively) {
       setStatus("Downloading PDF...");
@@ -244,14 +263,12 @@ async function sendToEndpoint(endpoint) {
 
     const body = {
       apiKey: cfg.apiKey,
-      email: cfg.email,
-      kindleEmail: cfg.kindleEmail,
       pageSize: cfg.pageSize,
       label: cfg.lastLabel,
       ...pageData,
     };
 
-    const resp = await fetch(`${cfg.apiBase}${savePdfNatively ? "/save_pdf" : endpoint}`, {
+    const resp = await fetch(`${cfg.apiBase}${savePdfNatively ? "/save_pdf" : "/save_local"}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -264,36 +281,26 @@ async function sendToEndpoint(endpoint) {
 
     const data = await resp.json();
 
-    if (endpoint === "/generate_pdf") {
-      setStatus("Sent to Kindle!", "success");
-      chrome.notifications.create({
-        type: "basic",
-        iconUrl: "assets/icons/128.png",
-        title: "Success",
-        message: `"${data.title}" sent to Kindle`,
-      });
-    } else {
-      const labels = uniqueLabels([cfg.lastLabel, ...(cfg.labelHistory || []), ...(await fetchExistingLabels(cfg.apiBase, cfg.apiKey))]);
-      await setStorage({
-        apiBase: cfg.apiBase,
-        apiKey: cfg.apiKey,
-        email: cfg.email,
-        kindleEmail: cfg.kindleEmail,
-        pageSize: cfg.pageSize,
-        lastLabel: cfg.lastLabel,
-        labelHistory: labels,
-      });
-      renderLabelOptions(labels);
-      const engine = data?.metadata?.ocr_engine;
-      const suffix = savePdfNatively && engine ? ` (${engine})` : "";
-      setStatus(`Saved: ${data.title}${suffix}`, "success");
-      chrome.notifications.create({
-        type: "basic",
-        iconUrl: "assets/icons/128.png",
-        title: "Saved",
-        message: `PDF + MD saved to "${cfg.lastLabel}" for "${data.title}"${suffix}`,
-      });
-    }
+    const labels = uniqueLabels([cfg.lastLabel, ...(cfg.labelHistory || []), ...(await fetchExistingLabels(cfg.apiBase, cfg.apiKey))]);
+    await setStorage({
+      apiBase: cfg.apiBase,
+      apiKey: cfg.apiKey,
+      readerUrl: cfg.readerUrl,
+      pageSize: cfg.pageSize,
+      lastLabel: cfg.lastLabel,
+      labelHistory: labels,
+    });
+    renderLabelOptions(labels);
+    const engine = data?.metadata?.ocr_engine;
+    const suffix = savePdfNatively && engine ? ` (${engine})` : "";
+    setStatus(`Saved: ${data.title}${suffix}`, "success");
+    chrome.notifications.create({
+      type: "basic",
+      iconUrl: "assets/icons/128.png",
+      title: "Saved",
+      message: `PDF + MD saved to "${cfg.lastLabel}" for "${data.title}"${suffix}`,
+    });
+    return { data, cfg, reused: false };
   } catch (err) {
     setStatus(err.message, "error");
     chrome.notifications.create({
@@ -302,12 +309,43 @@ async function sendToEndpoint(endpoint) {
       title: "Error",
       message: err.message,
     });
+    return null;
   } finally {
     setButtonsDisabled(false);
   }
 }
 
-btnKindle.addEventListener("click", () => sendToEndpoint("/generate_pdf"));
-btnSave.addEventListener("click", () => sendToEndpoint("/save_local"));
+async function openInCorpusScribe(articlePath, readerBase) {
+  const base = (readerBase || "").replace(/\/+$/, "");
+  if (!base) {
+    setStatus("Corpus Scribe URL not set", "error");
+    return;
+  }
+  const targetUrl = `${base}/#open=${encodeURIComponent(articlePath)}`;
+  const existing = await chrome.tabs.query({ url: `${base}/*` });
+  if (existing && existing.length > 0) {
+    const tab = existing[0];
+    await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
+    if (tab.windowId) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+    return;
+  }
+  await chrome.tabs.create({ url: targetUrl });
+}
+
+btnSave.addEventListener("click", () => {
+  void saveCurrentPage();
+});
+btnOpenScribe.addEventListener("click", async () => {
+  const result = await saveCurrentPage();
+  if (!result) return;
+  const articlePath = result.data?.md || result.data?.primary;
+  if (!articlePath) {
+    setStatus("Saved, but article path missing", "error");
+    return;
+  }
+  await openInCorpusScribe(articlePath, result.cfg.readerUrl);
+});
 chrome.tabs.onActivated.addListener(() => void updateDocHint());
 chrome.tabs.onUpdated.addListener(() => void updateDocHint());

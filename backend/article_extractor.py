@@ -2174,6 +2174,7 @@ def _prepare_html_for_markdown(soup: BeautifulSoup) -> None:
     _normalize_figures_for_markdown(soup)
     _remove_image_utility_blocks(soup)
     _normalize_tables_for_markdown(soup)
+    _normalize_numbered_ul_to_ol(soup)
     _normalize_lists_for_markdown(soup)
 
     for tag in soup.find_all(["script", "style", "svg", "noscript"]):
@@ -2228,6 +2229,95 @@ def _node_has_substantive_content(node) -> bool:
         return True
 
     return node.find(["img", "math", "table", "pre", "code"]) is not None
+
+
+_REFERENCE_LABEL_PATTERN = re.compile(r"^\[?(\d+)\]?\.?$")
+_REFERENCE_TEXT_PREFIX_PATTERN = re.compile(r"^\[?(\d+)\]?\.\s+")
+
+
+def _normalize_numbered_ul_to_ol(soup: BeautifulSoup) -> None:
+    """Convert `<ul>` lists that encode an explicit numeric sequence into `<ol>`.
+
+    PMC references wrap each entry as
+    `<li><span class="label">1.</span><cite>Text</cite>...</li>` with no
+    whitespace between the label span and the cite, so Pandoc emits bullet
+    items like `- 1.Text`. Other publishers drop the number directly in the
+    `<li>` text (e.g. `<li>1. Hicks, R. ...</li>`), which Pandoc escapes to
+    `- 1\\. Hicks...`. In both cases the correct representation is an ordered
+    list: we promote the parent `<ul>` to `<ol>` and remove the redundant
+    numeric prefix so Pandoc renders a clean numbered list.
+    """
+    for list_tag in list(soup.find_all("ul")):
+        items = list_tag.find_all("li", recursive=False)
+        if len(items) < 2:
+            continue
+
+        span_labels: list = []
+        text_prefixes: list = []
+        numbers: list = []
+        mode = None
+
+        for li in items:
+            first_element = None
+            leading_text_node = None
+            for child in li.children:
+                if isinstance(child, NavigableString):
+                    if str(child).strip():
+                        leading_text_node = child
+                        break
+                    continue
+                if getattr(child, "name", None):
+                    first_element = child
+                    break
+
+            item_number = None
+            if (
+                leading_text_node is None
+                and first_element is not None
+                and first_element.name == "span"
+                and "label" in (first_element.get("class") or [])
+            ):
+                match = _REFERENCE_LABEL_PATTERN.match(first_element.get_text(strip=True))
+                if match:
+                    if mode is None:
+                        mode = "span"
+                    if mode == "span":
+                        span_labels.append(first_element)
+                        item_number = int(match.group(1))
+
+            if item_number is None and leading_text_node is not None:
+                match = _REFERENCE_TEXT_PREFIX_PATTERN.match(str(leading_text_node))
+                if match:
+                    if mode is None:
+                        mode = "text"
+                    if mode == "text":
+                        text_prefixes.append((leading_text_node, match.end()))
+                        item_number = int(match.group(1))
+
+            if item_number is None:
+                mode = None
+                break
+            numbers.append(item_number)
+
+        if mode is None or len(numbers) != len(items):
+            continue
+
+        if numbers[0] != 1 or any(b - a != 1 for a, b in zip(numbers, numbers[1:])):
+            continue
+
+        if mode == "span":
+            for span in span_labels:
+                span.decompose()
+        else:
+            for node, end in text_prefixes:
+                remainder = str(node)[end:]
+                node.replace_with(NavigableString(remainder))
+
+        list_tag.name = "ol"
+        if "class" in list_tag.attrs:
+            del list_tag.attrs["class"]
+        if "style" in list_tag.attrs:
+            del list_tag.attrs["style"]
 
 
 def _normalize_lists_for_markdown(soup: BeautifulSoup) -> None:

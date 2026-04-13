@@ -6,6 +6,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
@@ -192,9 +193,16 @@ def _load_highlights(path: Path) -> list[dict]:
     for item in highlights:
         if not isinstance(item, dict):
             continue
+        kind = item.get("kind")
+        element_type = item.get("elementType")
+        element_index = item.get("elementIndex")
+        is_element = kind == "element" or (
+            isinstance(element_type, str) and isinstance(element_index, int)
+        )
         text = item.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
+        if not is_element:
+            if not isinstance(text, str) or not text.strip():
+                continue
         highlight_id = item.get("id")
         created_at = item.get("createdAt")
         start_offset = item.get("startOffset")
@@ -203,7 +211,7 @@ def _load_highlights(path: Path) -> list[dict]:
         variant = item.get("variant")
         cleaned_item = {
             "id": str(highlight_id).strip() if highlight_id is not None else "",
-            "text": text.strip(),
+            "text": text.strip() if isinstance(text, str) else "",
             "createdAt": str(created_at).strip() if created_at is not None else "",
         }
         if isinstance(start_offset, int) and isinstance(end_offset, int) and end_offset > start_offset:
@@ -213,6 +221,12 @@ def _load_highlights(path: Path) -> list[dict]:
             cleaned_item["comment"] = comment.strip()
         if isinstance(variant, str) and variant.strip():
             cleaned_item["variant"] = variant.strip()
+        if is_element:
+            cleaned_item["kind"] = "element"
+            if isinstance(element_type, str) and element_type.strip():
+                cleaned_item["elementType"] = element_type.strip()
+            if isinstance(element_index, int) and element_index >= 0:
+                cleaned_item["elementIndex"] = element_index
         cleaned.append(cleaned_item)
     return cleaned
 
@@ -567,6 +581,69 @@ def _notes_markdown_to_html(notes_markdown: str) -> str:
 def _notes_html_to_markdown(notes_html: str) -> str:
     markdown = pypandoc.convert_text(notes_html or "", "gfm", format="html", extra_args=["--wrap=none"])
     return markdown.strip() + ("\n" if markdown.strip() else "")
+
+
+def _normalize_url_for_match(value: str | None) -> str:
+    if not value:
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return text.lower().rstrip("/")
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or ""
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return f"{parsed.scheme.lower()}://{host}{path}"
+
+
+def _lookup_article_by_url(target_url: str) -> Path | None:
+    normalized = _normalize_url_for_match(target_url)
+    if not normalized:
+        return None
+    root = Path(OUTPUT_DIR)
+    if not root.exists():
+        return None
+    for path in root.rglob("*.md"):
+        if path.name.endswith(".notes.md"):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        frontmatter, _ = _split_frontmatter(content)
+        candidates = [
+            _frontmatter_string(frontmatter, "url"),
+            _frontmatter_string(frontmatter, "canonical_url"),
+        ]
+        for candidate in candidates:
+            if _normalize_url_for_match(candidate) == normalized:
+                return path
+    return None
+
+
+@app.route("/lookup_url", methods=["GET"])
+def lookup_url():
+    api_key = request.args.get("apiKey", "")
+    if api_key != API_KEY:
+        return jsonify(success=False, message="Unauthorized"), 401
+
+    target = request.args.get("url", "").strip()
+    if not target:
+        return jsonify(success=True, exists=False)
+
+    match = _lookup_article_by_url(target)
+    if not match:
+        return jsonify(success=True, exists=False)
+
+    payload = _build_existing_article_payload(match)
+    payload["exists"] = True
+    return jsonify(**payload)
 
 
 @app.route("/labels", methods=["GET"])
@@ -974,6 +1051,12 @@ def desktop_save_highlights():
     for item in raw_highlights:
         if not isinstance(item, dict):
             continue
+        kind = item.get("kind")
+        element_type = item.get("elementType")
+        element_index = item.get("elementIndex")
+        is_element = kind == "element" or (
+            isinstance(element_type, str) and isinstance(element_index, int)
+        )
         text = str(item.get("text") or "").strip()
         highlight_id = str(item.get("id") or "").strip()
         created_at = str(item.get("createdAt") or "").strip()
@@ -981,7 +1064,7 @@ def desktop_save_highlights():
         end_offset = item.get("endOffset")
         comment = str(item.get("comment") or "").strip()
         variant = str(item.get("variant") or "").strip()
-        if not text:
+        if not is_element and not text:
             continue
         cleaned_item = {
             "id": highlight_id,
@@ -995,6 +1078,12 @@ def desktop_save_highlights():
             cleaned_item["comment"] = comment
         if variant:
             cleaned_item["variant"] = variant
+        if is_element:
+            cleaned_item["kind"] = "element"
+            if isinstance(element_type, str) and element_type.strip():
+                cleaned_item["elementType"] = element_type.strip()
+            if isinstance(element_index, int) and element_index >= 0:
+                cleaned_item["elementIndex"] = element_index
         cleaned.append(cleaned_item)
 
     highlights_path = _write_highlights(article_path, cleaned)

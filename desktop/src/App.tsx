@@ -1,5 +1,5 @@
-import { memo, startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -7,6 +7,12 @@ import 'katex/dist/katex.min.css'
 import './App.css'
 
 const browserApiBase = import.meta.env.VITE_DESKTOP_API_BASE ?? 'http://127.0.0.1:5000'
+
+const markdownRemarkPlugins = [remarkGfm, remarkMath]
+const markdownRehypePlugins: [typeof rehypeKatex, { output: string; throwOnError: boolean; strict: string }][] = [
+  [rehypeKatex, { output: 'html', throwOnError: false, strict: 'ignore' }],
+]
+const markdownUrlTransform = (url: string) => url
 
 type DocumentSummary = {
   id: string
@@ -55,6 +61,9 @@ type Highlight = {
   endOffset?: number
   comment?: string
   variant?: 'noise'
+  kind?: 'element'
+  elementType?: 'img' | 'table'
+  elementIndex?: number
 }
 
 type PendingSelection = {
@@ -669,6 +678,49 @@ function resolveHighlightOffsets(root: HTMLElement, highlight: Highlight) {
   return { startOffset, endOffset: startOffset + text.length }
 }
 
+function applyElementNoise(root: HTMLElement, highlights: Highlight[]) {
+  root.querySelectorAll('[data-element-noise="true"]').forEach((element) => {
+    if (element instanceof HTMLElement) {
+      delete element.dataset.elementNoise
+      delete element.dataset.elementNoiseId
+    }
+  })
+  const buckets: Record<string, HTMLElement[]> = {
+    img: Array.from(root.querySelectorAll('img')),
+    table: Array.from(root.querySelectorAll('table')),
+  }
+  for (const highlight of highlights) {
+    if (highlight.kind !== 'element') continue
+    const type = highlight.elementType
+    if (type !== 'img' && type !== 'table') continue
+    const index = highlight.elementIndex ?? -1
+    if (index < 0) continue
+    const target = buckets[type]?.[index]
+    if (!target) continue
+    target.dataset.elementNoise = 'true'
+    target.dataset.elementNoiseId = highlight.id
+  }
+}
+
+function findElementNoiseTarget(
+  root: HTMLElement,
+  element: HTMLElement,
+): { type: 'img' | 'table'; index: number; element: HTMLElement } | null {
+  const img = element.closest('img')
+  if (img instanceof HTMLImageElement && root.contains(img)) {
+    const list = Array.from(root.querySelectorAll('img'))
+    const index = list.indexOf(img)
+    if (index >= 0) return { type: 'img', index, element: img }
+  }
+  const table = element.closest('table')
+  if (table instanceof HTMLTableElement && root.contains(table)) {
+    const list = Array.from(root.querySelectorAll('table'))
+    const index = list.indexOf(table)
+    if (index >= 0) return { type: 'table', index, element: table }
+  }
+  return null
+}
+
 function applyInlineHighlights(root: HTMLElement, highlights: Highlight[]) {
   unwrapHighlightMarks(root)
   if (!highlights.length) {
@@ -676,6 +728,7 @@ function applyInlineHighlights(root: HTMLElement, highlights: Highlight[]) {
   }
 
   const resolved = highlights
+    .filter((highlight) => highlight.kind !== 'element')
     .map((highlight) => {
       const offsets = resolveHighlightOffsets(root, highlight)
       if (!offsets) {
@@ -687,101 +740,139 @@ function applyInlineHighlights(root: HTMLElement, highlights: Highlight[]) {
     .sort((left, right) => right.startOffset - left.startOffset)
 
   for (const entry of resolved) {
-    const textNodes = collectHighlightTextNodes(root)
-    let accumulated = 0
-    let startNode: Text | null = null
-    let endNode: Text | null = null
-    let startInnerOffset = 0
-    let endInnerOffset = 0
+    try {
+      const textNodes = collectHighlightTextNodes(root)
+      let accumulated = 0
+      let startNode: Text | null = null
+      let endNode: Text | null = null
+      let startInnerOffset = 0
+      let endInnerOffset = 0
 
-    for (const node of textNodes) {
-      const textLength = node.textContent?.length ?? 0
-      const nextAccumulated = accumulated + textLength
+      for (const node of textNodes) {
+        const textLength = node.textContent?.length ?? 0
+        const nextAccumulated = accumulated + textLength
 
-      if (!startNode && entry.startOffset >= accumulated && entry.startOffset < nextAccumulated) {
-        startNode = node
-        startInnerOffset = entry.startOffset - accumulated
+        if (!startNode && entry.startOffset >= accumulated && entry.startOffset < nextAccumulated) {
+          startNode = node
+          startInnerOffset = entry.startOffset - accumulated
+        }
+
+        if (!endNode && entry.endOffset > accumulated && entry.endOffset <= nextAccumulated) {
+          endNode = node
+          endInnerOffset = entry.endOffset - accumulated
+        }
+
+        accumulated = nextAccumulated
+        if (startNode && endNode) {
+          break
+        }
       }
 
-      if (!endNode && entry.endOffset > accumulated && entry.endOffset <= nextAccumulated) {
-        endNode = node
-        endInnerOffset = entry.endOffset - accumulated
+      if (!startNode || !endNode) {
+        continue
       }
 
-      accumulated = nextAccumulated
-      if (startNode && endNode) {
-        break
+      const range = document.createRange()
+      range.setStart(startNode, startInnerOffset)
+      range.setEnd(endNode, endInnerOffset)
+
+      if (range.collapsed || !range.toString().trim()) {
+        continue
       }
+
+      const mark = document.createElement('mark')
+      const isNoise = entry.highlight.variant === 'noise'
+      mark.className = isNoise ? 'inline-highlight inline-noise' : 'inline-highlight'
+      mark.dataset.highlightId = entry.highlight.id
+      if (isNoise) {
+        mark.dataset.variant = 'noise'
+        mark.title = 'Right-click to delete this noise mark'
+      }
+
+      const contents = range.extractContents()
+      mark.appendChild(contents)
+      range.insertNode(mark)
+      root.normalize()
+    } catch (error) {
+      console.error('applyInlineHighlights: failed to wrap entry', entry.highlight.id, error)
     }
-
-    if (!startNode || !endNode) {
-      continue
-    }
-
-    const range = document.createRange()
-    range.setStart(startNode, startInnerOffset)
-    range.setEnd(endNode, endInnerOffset)
-
-    if (range.collapsed || !range.toString().trim()) {
-      continue
-    }
-
-    const mark = document.createElement('mark')
-    const isNoise = entry.highlight.variant === 'noise'
-    mark.className = isNoise ? 'inline-highlight inline-noise' : 'inline-highlight'
-    mark.dataset.highlightId = entry.highlight.id
-    if (isNoise) {
-      mark.dataset.variant = 'noise'
-    }
-
-    const contents = range.extractContents()
-    mark.appendChild(contents)
-    range.insertNode(mark)
-    root.normalize()
   }
 }
 
 function getSelectionHighlightCandidate(root: HTMLElement): PendingSelection | null {
-  const selection = window.getSelection()
-  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-    return null
-  }
-
-  const range = selection.getRangeAt(0)
-  const text = selection.toString().trim()
-  if (text.length < 12) {
-    return null
-  }
-
-  if (!(range.startContainer instanceof Text) || !(range.endContainer instanceof Text)) {
-    return null
-  }
-  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
-    return null
-  }
-
-  const textNodes = collectHighlightTextNodes(root)
-  let accumulated = 0
-  let startOffset: number | null = null
-  let endOffset: number | null = null
-
-  for (const node of textNodes) {
-    const textLength = node.textContent?.length ?? 0
-    if (node === range.startContainer) {
-      startOffset = accumulated + range.startOffset
+  try {
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null
     }
-    if (node === range.endContainer) {
-      endOffset = accumulated + range.endOffset
-      break
-    }
-    accumulated += textLength
-  }
 
-  if (startOffset == null || endOffset == null || endOffset <= startOffset) {
+    const range = selection.getRangeAt(0)
+    const text = selection.toString().replace(/^\s+|\s+$/g, '')
+    if (text.length < 12) {
+      return null
+    }
+
+    if (!root.contains(range.commonAncestorContainer)) {
+      return null
+    }
+
+    const textNodes = collectHighlightTextNodes(root)
+    let accumulated = 0
+    let startOffset: number | null = null
+    let endOffset: number | null = null
+
+    for (const node of textNodes) {
+      const textLength = node.textContent?.length ?? 0
+      let intersects = false
+      try {
+        intersects = range.intersectsNode(node)
+      } catch {
+        intersects = false
+      }
+      if (intersects) {
+        let localStart = 0
+        let localEnd = textLength
+        if (node === range.startContainer && range.startContainer instanceof Text) {
+          localStart = Math.max(0, Math.min(textLength, range.startOffset))
+        } else {
+          try {
+            if (range.comparePoint(node, 0) === -1) {
+              localStart = 0
+            }
+          } catch {
+            // ignore — fall back to 0
+          }
+        }
+        if (node === range.endContainer && range.endContainer instanceof Text) {
+          localEnd = Math.max(0, Math.min(textLength, range.endOffset))
+        } else {
+          try {
+            if (range.comparePoint(node, textLength) === 1) {
+              localEnd = textLength
+            }
+          } catch {
+            // ignore — fall back to full node
+          }
+        }
+        if (localEnd > localStart) {
+          if (startOffset == null) {
+            startOffset = accumulated + localStart
+          }
+          endOffset = accumulated + localEnd
+        }
+      }
+      accumulated += textLength
+    }
+
+    if (startOffset == null || endOffset == null || endOffset <= startOffset) {
+      return null
+    }
+
+    return { text, startOffset, endOffset }
+  } catch (error) {
+    console.error('getSelectionHighlightCandidate failed', error)
     return null
   }
-
-  return { text, startOffset, endOffset }
 }
 
 type ReaderContentProps = {
@@ -797,6 +888,8 @@ type ReaderContentProps = {
   onCopy: (text: string, label: string) => void
   onHighlightClick?: (highlightId: string) => void
   onImageOpen?: (src: string, alt: string) => void
+  onDeleteNoise?: (highlightId: string) => void
+  onToggleElementNoise?: (type: 'img' | 'table', index: number) => void
 }
 
 function CodeBlock({
@@ -922,10 +1015,33 @@ const ReaderContent = memo(function ReaderContent({
   onCopy,
   onHighlightClick,
   onImageOpen,
+  onDeleteNoise,
+  onToggleElementNoise,
 }: ReaderContentProps) {
   const chunks = useMemo(() => splitMarkdownIntoChunks(markdown), [markdown])
   const articleRef = useRef<HTMLElement | null>(null)
   const pendingHeadingIndexRef = useRef<number | null>(null)
+
+  const onCopyRef = useRef(onCopy)
+  const onImageOpenRef = useRef(onImageOpen)
+  const onHighlightClickRef = useRef(onHighlightClick)
+  const onDeleteNoiseRef = useRef(onDeleteNoise)
+  const onToggleElementNoiseRef = useRef(onToggleElementNoise)
+
+  useEffect(() => {
+    onCopyRef.current = onCopy
+    onImageOpenRef.current = onImageOpen
+    onHighlightClickRef.current = onHighlightClick
+    onDeleteNoiseRef.current = onDeleteNoise
+    onToggleElementNoiseRef.current = onToggleElementNoise
+  })
+
+  const stableCopy = useCallback((text: string, label: string) => {
+    onCopyRef.current(text, label)
+  }, [])
+  const stableImageOpen = useCallback((src: string, alt: string) => {
+    onImageOpenRef.current?.(src, alt)
+  }, [])
 
   useEffect(() => {
     if (!scrollHeadingRequest) return
@@ -952,6 +1068,7 @@ const ReaderContent = memo(function ReaderContent({
       return
     }
     applyInlineHighlights(articleRef.current, highlights)
+    applyElementNoise(articleRef.current, highlights)
   }, [highlights, markdown])
 
   useEffect(() => {
@@ -1001,11 +1118,15 @@ const ReaderContent = memo(function ReaderContent({
       if (target.closest('.code-copy-button, .table-copy-button')) {
         return
       }
+      if (target.closest('.noise-delete-button')) {
+        return
+      }
       const mark = target.closest('mark.inline-highlight')
       if (mark instanceof HTMLElement) {
         const id = mark.dataset.highlightId
-        if (id && onHighlightClick) {
-          onHighlightClick(id)
+        const handler = onHighlightClickRef.current
+        if (id && handler) {
+          handler(id)
         }
       }
       const equation = target.closest('.katex-display, .katex')
@@ -1014,12 +1135,130 @@ const ReaderContent = memo(function ReaderContent({
       const latex = annotation?.textContent?.trim()
       if (latex) {
         event.preventDefault()
-        onCopy(latex, 'LaTeX')
+        onCopyRef.current(latex, 'LaTeX')
       }
     }
+    const handleContextMenu = (event: MouseEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const mark = target.closest('mark.inline-noise')
+      if (mark instanceof HTMLElement) {
+        const id = mark.dataset.highlightId
+        const handler = onDeleteNoiseRef.current
+        if (id && handler) {
+          event.preventDefault()
+          handler(id)
+          return
+        }
+      }
+      if (!(target instanceof HTMLElement)) return
+      const found = findElementNoiseTarget(root, target)
+      if (!found) return
+      const toggleHandler = onToggleElementNoiseRef.current
+      if (!toggleHandler) return
+      event.preventDefault()
+      toggleHandler(found.type, found.index)
+    }
     root.addEventListener('click', handleClick)
-    return () => root.removeEventListener('click', handleClick)
-  }, [onCopy, onHighlightClick, markdown])
+    root.addEventListener('contextmenu', handleContextMenu)
+    return () => {
+      root.removeEventListener('click', handleClick)
+      root.removeEventListener('contextmenu', handleContextMenu)
+    }
+  }, [markdown])
+
+  const markdownComponents = useMemo<Components>(
+    () => ({
+      img: ({ node: _node, src = '', alt = '', title, ...props }) => {
+        const resolvedSrc = toAssetUrl(typeof src === 'string' ? src : '', articlePath) ?? src
+        const displayAlt = alt ?? ''
+        return (
+          <img
+            src={typeof resolvedSrc === 'string' ? resolvedSrc : ''}
+            alt={displayAlt}
+            title={title ?? 'Click to view full size'}
+            loading="lazy"
+            decoding="async"
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              stableImageOpen(typeof resolvedSrc === 'string' ? resolvedSrc : '', displayAlt)
+            }}
+            {...props}
+          />
+        )
+      },
+      table: ({ children }) => (
+        <TableBlock onCopyText={stableCopy}>{children}</TableBlock>
+      ),
+      a: ({ node: _node, href = '', children, title, ...props }) => {
+        const resolvedHref = resolveExternalHref(href, sourceSite)
+        const finalHref = resolvedHref ?? href ?? '#'
+        return (
+          <a
+            href={finalHref}
+            title={title}
+            target={resolvedHref ? '_blank' : undefined}
+            rel={resolvedHref ? 'noopener noreferrer' : undefined}
+            onClick={(event) => {
+              if (!resolvedHref) {
+                event.preventDefault()
+                return
+              }
+              event.preventDefault()
+              window.open(resolvedHref, '_blank', 'noopener,noreferrer')
+            }}
+            {...props}
+          >
+            {children}
+          </a>
+        )
+      },
+      pre: ({ children }) => <>{children}</>,
+      code: ({ className, children, ...codeProps }) => {
+        const content = children
+        const asString =
+          typeof content === 'string'
+            ? content
+            : Array.isArray(content)
+            ? content.map((part: unknown) => (typeof part === 'string' ? part : '')).join('')
+            : ''
+        const isBlock =
+          (className && className.includes('language-')) ||
+          asString.includes('\n')
+        if (!isBlock) {
+          return (
+            <code className={className} {...codeProps}>
+              {children}
+            </code>
+          )
+        }
+        return (
+          <CodeBlock className={className} onCopyText={stableCopy} {...codeProps}>
+            {children}
+          </CodeBlock>
+        )
+      },
+    }),
+    [articlePath, sourceSite, stableCopy, stableImageOpen],
+  )
+
+  const renderedChunks = useMemo(
+    () =>
+      chunks.map((chunk, index) => (
+        <section className="markdown-chunk" key={`${index}-${chunk.slice(0, 32)}`}>
+          <ReactMarkdown
+            remarkPlugins={markdownRemarkPlugins}
+            rehypePlugins={markdownRehypePlugins}
+            urlTransform={markdownUrlTransform}
+            components={markdownComponents}
+          >
+            {chunk}
+          </ReactMarkdown>
+        </section>
+      )),
+    [chunks, markdownComponents],
+  )
 
   if (loading) {
     return <div className="empty-state">Loading document…</div>
@@ -1038,90 +1277,7 @@ const ReaderContent = memo(function ReaderContent({
       style={inlineStyle}
       data-hide-noise={hideNoise ? 'true' : 'false'}
     >
-      {chunks.map((chunk, index) => (
-        <section className="markdown-chunk" key={`${index}-${chunk.slice(0, 32)}`}>
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[[rehypeKatex, { output: 'html', throwOnError: false, strict: 'ignore' }]]}
-            urlTransform={(url) => url}
-            components={{
-              img: ({ node: _node, src = '', alt = '', title, ...props }) => {
-                const resolvedSrc = toAssetUrl(src, articlePath) ?? src
-                const displayAlt = alt ?? ''
-                return (
-                  <img
-                    src={resolvedSrc}
-                    alt={displayAlt}
-                    title={title ?? 'Click to view full size'}
-                    loading="lazy"
-                    decoding="async"
-                    onClick={(event) => {
-                      if (!onImageOpen) return
-                      event.preventDefault()
-                      event.stopPropagation()
-                      onImageOpen(resolvedSrc, displayAlt)
-                    }}
-                    {...props}
-                  />
-                )
-              },
-              table: ({ children }) => (
-                <TableBlock onCopyText={onCopy}>{children}</TableBlock>
-              ),
-              a: ({ node: _node, href = '', children, title, ...props }) => {
-                const resolvedHref = resolveExternalHref(href, sourceSite)
-                const finalHref = resolvedHref ?? href ?? '#'
-                return (
-                  <a
-                    href={finalHref}
-                    title={title}
-                    target={resolvedHref ? '_blank' : undefined}
-                    rel={resolvedHref ? 'noopener noreferrer' : undefined}
-                    onClick={(event) => {
-                      if (!resolvedHref) {
-                        event.preventDefault()
-                        return
-                      }
-                      event.preventDefault()
-                      window.open(resolvedHref, '_blank', 'noopener,noreferrer')
-                    }}
-                    {...props}
-                  >
-                    {children}
-                  </a>
-                )
-              },
-              pre: ({ children }) => <>{children}</>,
-              code: ({ className, children, ...codeProps }) => {
-                const content = children
-                const asString =
-                  typeof content === 'string'
-                    ? content
-                    : Array.isArray(content)
-                    ? content.map((part) => (typeof part === 'string' ? part : '')).join('')
-                    : ''
-                const isBlock =
-                  (className && className.includes('language-')) ||
-                  asString.includes('\n')
-                if (!isBlock) {
-                  return (
-                    <code className={className} {...codeProps}>
-                      {children}
-                    </code>
-                  )
-                }
-                return (
-                  <CodeBlock className={className} onCopyText={onCopy} {...codeProps}>
-                    {children}
-                  </CodeBlock>
-                )
-              },
-            }}
-          >
-            {chunk}
-          </ReactMarkdown>
-        </section>
-      ))}
+      {renderedChunks}
     </article>
   )
 })
@@ -1222,6 +1378,7 @@ function App() {
   const [tocQuery, setTocQuery] = useState('')
   const [tocCursor, setTocCursor] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [pendingHashPath, setPendingHashPath] = useState<string | null>(null)
   const [scrollHeadingRequest, setScrollHeadingRequest] = useState<{ index: number; ts: number } | null>(null)
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
   const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
@@ -1232,10 +1389,64 @@ function App() {
   const pendingNotesSelectionRef = useRef<{ selStart: number; selEnd: number } | null>(null)
   const activeDocIdRef = useRef<string | null>(null)
   const settingsMenuRef = useRef<HTMLDivElement | null>(null)
+  const hashRefreshAttemptedRef = useRef<string | null>(null)
 
   useEffect(() => {
     void initializeLibrary()
   }, [])
+
+  useEffect(() => {
+    const parseHash = () => {
+      const hash = window.location.hash
+      if (!hash || !hash.startsWith('#')) return null
+      const params = new URLSearchParams(hash.slice(1))
+      return params.get('open')
+    }
+    const updateFromHash = () => {
+      const path = parseHash()
+      if (path) setPendingHashPath(path)
+    }
+    updateFromHash()
+    window.addEventListener('hashchange', updateFromHash)
+    return () => window.removeEventListener('hashchange', updateFromHash)
+  }, [])
+
+  useEffect(() => {
+    if (!pendingHashPath) return
+    if (loadingLibrary) return
+    if (!library.root) return
+    if (hashRefreshAttemptedRef.current === pendingHashPath) return
+    const hasTarget = library.documents.some(
+      (doc) => doc.articlePath === pendingHashPath,
+    )
+    if (!hasTarget) {
+      hashRefreshAttemptedRef.current = pendingHashPath
+      void refreshLibrary()
+    }
+  }, [pendingHashPath, library.root, library.documents, loadingLibrary])
+
+  useEffect(() => {
+    if (!pendingHashPath) return
+    if (loadingLibrary) return
+    const target = library.documents.find(
+      (doc) => doc.articlePath === pendingHashPath,
+    )
+    const refreshed = hashRefreshAttemptedRef.current === pendingHashPath
+    if (!target && !refreshed) return
+    const path = pendingHashPath
+    setPendingHashPath(null)
+    hashRefreshAttemptedRef.current = null
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search,
+    )
+    if (target) {
+      void loadDocument(target)
+    } else {
+      void loadDocumentByPath(path)
+    }
+  }, [pendingHashPath, library.documents, loadingLibrary])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -1516,12 +1727,12 @@ function App() {
     }
   }
 
-  async function loadDocument(summary: DocumentSummary) {
+  async function loadDocumentByPath(articlePath: string, statusTitle?: string) {
     setLoadingDetail(true)
-    setStatus(`Loading ${summary.title}…`)
+    setStatus(statusTitle ? `Loading ${statusTitle}…` : 'Loading…')
     try {
       const loaded = await desktopCommand<DocumentDetail>('load_document', {
-        articlePath: summary.articlePath,
+        articlePath,
       })
       setDetail(loaded)
       setNotesDraft(loaded.notesMarkdown)
@@ -1533,6 +1744,10 @@ function App() {
     } finally {
       setLoadingDetail(false)
     }
+  }
+
+  async function loadDocument(summary: DocumentSummary) {
+    await loadDocumentByPath(summary.articlePath, summary.title)
   }
 
   async function runSearch() {
@@ -1713,6 +1928,32 @@ function App() {
     await persistHighlights(nextHighlights, 'Deleted highlight')
   }
 
+  async function toggleElementNoise(type: 'img' | 'table', index: number) {
+    const existing = highlights.find(
+      (entry) =>
+        entry.kind === 'element' &&
+        entry.elementType === type &&
+        entry.elementIndex === index,
+    )
+    if (existing) {
+      const nextHighlights = highlights.filter((entry) => entry.id !== existing.id)
+      await persistHighlights(nextHighlights, `Removed ${type === 'img' ? 'image' : 'table'} noise`)
+      return
+    }
+    const createdAt = new Date().toISOString()
+    const nextEntry: Highlight = {
+      id: `${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+      text: type === 'img' ? `[image ${index + 1}]` : `[table ${index + 1}]`,
+      createdAt,
+      kind: 'element',
+      elementType: type,
+      elementIndex: index,
+      variant: 'noise',
+    }
+    const nextHighlights: Highlight[] = [nextEntry, ...highlights]
+    await persistHighlights(nextHighlights, `Marked ${type === 'img' ? 'image' : 'table'} as noise`)
+  }
+
   function openHighlightComment(highlight: Highlight) {
     setHighlightCommentDraft({ id: highlight.id, value: highlight.comment ?? '' })
   }
@@ -1855,7 +2096,7 @@ function App() {
   }
 
   function goToHighlight(nextIndex: number) {
-    const list = highlights.filter((entry) => entry.variant !== 'noise')
+    const list = highlights.filter((entry) => entry.variant !== 'noise' && entry.kind !== 'element')
     if (!list.length) return
     const total = list.length
     const normalized = ((nextIndex % total) + total) % total
@@ -2257,7 +2498,7 @@ function App() {
     return rendered + (notesDraft.endsWith('\n') || !notesDraft ? '\n ' : '')
   }, [notesDraft])
   const visibleHighlights = useMemo(
-    () => highlights.filter((entry) => entry.variant !== 'noise'),
+    () => highlights.filter((entry) => entry.variant !== 'noise' && entry.kind !== 'element'),
     [highlights],
   )
 
@@ -2722,7 +2963,7 @@ function App() {
                       aria-checked={hideNoise}
                     >
                       <span>Hide noise</span>
-                      <span className="settings-check">{hideNoise ? '✓' : ''}</span>
+                      <span className={`settings-switch${hideNoise ? ' is-on' : ''}`} aria-hidden="true" />
                     </button>
                     <button
                       type="button"
@@ -2733,7 +2974,7 @@ function App() {
                       title="Treat the References/Bibliography section as noise"
                     >
                       <span>References = noise</span>
-                      <span className="settings-check">{referencesAreNoise ? '✓' : ''}</span>
+                      <span className={`settings-switch${referencesAreNoise ? ' is-on' : ''}`} aria-hidden="true" />
                     </button>
                     <button
                       type="button"
@@ -2743,7 +2984,7 @@ function App() {
                       aria-checked={focusMode}
                     >
                       <span>Focus mode</span>
-                      <span className="settings-check">{focusMode ? '✓' : ''}</span>
+                      <span className={`settings-switch${focusMode ? ' is-on' : ''}`} aria-hidden="true" />
                     </button>
                     <button
                       type="button"
@@ -2753,7 +2994,7 @@ function App() {
                       aria-checked={theme === 'dark'}
                     >
                       <span>Dark theme</span>
-                      <span className="settings-check">{theme === 'dark' ? '✓' : ''}</span>
+                      <span className={`settings-switch${theme === 'dark' ? ' is-on' : ''}`} aria-hidden="true" />
                     </button>
                   </div>
                 ) : null}
@@ -2817,6 +3058,8 @@ function App() {
             onCopy={copyTextToClipboard}
             onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
             onImageOpen={(src, alt) => setLightbox({ src, alt })}
+            onDeleteNoise={(id) => void deleteHighlight(id)}
+            onToggleElementNoise={(type, index) => void toggleElementNoise(type, index)}
           />
         </section>
       </main>

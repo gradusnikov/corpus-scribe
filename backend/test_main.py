@@ -152,6 +152,53 @@ class MainApiTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["labels"], ["Machine Learning", "Research"])
 
+    def test_lookup_url_finds_existing_article_by_frontmatter_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_dir = Path(tmpdir) / "Research" / "Sample"
+            article_dir.mkdir(parents=True)
+            article_path = article_dir / "Sample.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Sample Paper"\n'
+                'label: "Research"\n'
+                'url: "https://www.example.com/articles/42/"\n'
+                'canonical_url: "https://example.com/articles/42"\n'
+                "---\n\n"
+                "# Sample\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(main, "OUTPUT_DIR", tmpdir):
+                response = self.client.get(
+                    "/lookup_url",
+                    query_string={
+                        "apiKey": main.API_KEY,
+                        "url": "https://example.com/articles/42/?utm=ignored",
+                    },
+                )
+                response_alt = self.client.get(
+                    "/lookup_url",
+                    query_string={
+                        "apiKey": main.API_KEY,
+                        "url": "https://unrelated.example/nope",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["exists"])
+        self.assertEqual(payload["title"], "Sample Paper")
+        self.assertEqual(payload["md"], str(article_path))
+        self.assertEqual(payload["primary"], str(article_path))
+
+        self.assertEqual(response_alt.status_code, 200)
+        alt_payload = response_alt.get_json()
+        self.assertFalse(alt_payload["exists"])
+
+    def test_lookup_url_requires_api_key(self):
+        response = self.client.get("/lookup_url", query_string={"url": "https://example.com"})
+        self.assertEqual(response.status_code, 401)
+
     def test_capabilities_reports_pdf_ocr_availability(self):
         with patch.dict(main.os.environ, {"MISTRAL_API_KEY": "test-key"}, clear=False):
             response = self.client.get("/capabilities", query_string={"apiKey": main.API_KEY})
