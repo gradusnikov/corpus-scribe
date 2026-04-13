@@ -42,7 +42,7 @@
 23. [x] Feature: In settings change checkboxes to on/off switches
 24. [x] Feature: Allow to treat images / tables as noise
 25. [ ] Feature: Add search within a document
-26. [ ] Feature: Add "Info" button to display the frontmatter in a popup
+26. [x] Feature: Add "Info" button to display the frontmatter in a popup
 27. [ ] Feature: Change how the Readable PDFs are generated. Do not generate them automatically - instead lazy generate upon request. The generated pdfs should exclude noise, and include highlights. No need to regenerate the PDF if highlights, or noise is not changed. Default page size should be in settings.
 28. [ ] Feature: Exclude Noise from TOC
 
@@ -90,8 +90,13 @@
 ## Chrome Extension
 
 1. [x] Feature: Remove send to scribe button
+
 2. [x] Feature: Add a button to open the document in Corpus Scribe
+
 3. [x] Bug: Open in Corpus Scribe button should open the downloaded md file
+
 4. [x] Bug: When user tries to re-download already existing article, do not re-download
+
 5. [ ] Bug: Note summaries should be async. No need to wait for notes, to open the extracted article.
-6. [ ] Feature: Remove 
+
+   

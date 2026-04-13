@@ -947,6 +947,7 @@ def desktop_document():
             "notesMarkdown": notes_markdown,
             "highlights": highlights,
             "bibliography": bibliography,
+            "frontmatter": frontmatter,
         },
     )
 

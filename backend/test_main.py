@@ -605,6 +605,35 @@ class MainApiTests(unittest.TestCase):
         summary = response.get_json()["detail"]["summary"]
         self.assertEqual(summary["rating"], 3)
 
+    def test_desktop_document_returns_frontmatter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'authors: "A. Smith, B. Jones"\n'
+                'doi: "10.1000/xyz"\n'
+                "year: 2024\n"
+                "rating: 4\n"
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get(
+                "/desktop/document",
+                query_string={"articlePath": str(article_path)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        detail = response.get_json()["detail"]
+        frontmatter = detail["frontmatter"]
+        self.assertEqual(frontmatter["title"], "Fixture Article")
+        self.assertEqual(frontmatter["authors"], "A. Smith, B. Jones")
+        self.assertEqual(frontmatter["doi"], "10.1000/xyz")
+        self.assertEqual(frontmatter["year"], 2024)
+        self.assertEqual(frontmatter["rating"], 4)
+
     def test_desktop_delete_document_removes_bundle_and_index_records(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
             bundle_dir = Path(tmpdir) / "Label" / "Fixture"

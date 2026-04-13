@@ -39,12 +39,15 @@ type LibraryIndex = {
   documents: DocumentSummary[]
 }
 
+type FrontmatterValue = string | number | boolean | null | FrontmatterValue[]
+
 type DocumentDetail = {
   summary: DocumentSummary
   markdown: string
   notesMarkdown: string
   highlights: Highlight[]
   bibliography: string
+  frontmatter: Record<string, FrontmatterValue>
 }
 
 type SearchRequest = {
@@ -1326,6 +1329,7 @@ function App() {
   })
   const [focusedHighlight, setFocusedHighlight] = useState<{ id: string; ts: number } | null>(null)
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null)
+  const [infoOpen, setInfoOpen] = useState(false)
   const highlightCardRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -1599,6 +1603,19 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
+
+  useEffect(() => {
+    if (!infoOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setInfoOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [infoOpen])
+
+  useEffect(() => {
+    if (!detail) setInfoOpen(false)
+  }, [detail?.summary.id])
 
   useEffect(() => {
     if (!activeId) {
@@ -2731,6 +2748,43 @@ function App() {
           />
         </div>
       ) : null}
+      {infoOpen && detail ? (
+        <div
+          className="info-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Document metadata"
+          onClick={() => setInfoOpen(false)}
+        >
+          <div className="info-panel" onClick={(event) => event.stopPropagation()}>
+            <header className="info-header">
+              <h2>{detail.summary.title}</h2>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setInfoOpen(false)}
+                aria-label="Close metadata view"
+              >
+                Close
+              </button>
+            </header>
+            <div className="info-body">
+              {renderFrontmatterEntries(detail.frontmatter).length ? (
+                <dl className="info-grid">
+                  {renderFrontmatterEntries(detail.frontmatter).map(([key, value]) => (
+                    <div className="info-row" key={key}>
+                      <dt>{key}</dt>
+                      <dd>{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <p className="muted">No frontmatter metadata found.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="sidebar-scroll">
           <div className="brand">
@@ -2906,6 +2960,17 @@ function App() {
                   aria-label="Open table of contents"
                 >
                   TOC · {articleHeadings.length}
+                </button>
+              ) : null}
+              {detail ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => setInfoOpen(true)}
+                  title="Show document metadata"
+                  aria-label="Show document metadata"
+                >
+                  Info
                 </button>
               ) : null}
               <div className="settings-wrap" ref={settingsMenuRef}>
@@ -3357,6 +3422,59 @@ function stringifyError(error: unknown) {
     return error.message
   }
   return 'Unexpected error'
+}
+
+const FRONTMATTER_KEY_ORDER = [
+  'title',
+  'authors',
+  'author',
+  'label',
+  'doc_id',
+  'doi',
+  'arxiv_id',
+  'pmid',
+  'pmcid',
+  'url',
+  'canonical_url',
+  'source_site',
+  'publisher',
+  'journal',
+  'year',
+  'published',
+  'date',
+  'ingested_at',
+  'rating',
+  'type',
+  'doc_type',
+]
+
+function formatFrontmatterValue(value: FrontmatterValue): string {
+  if (value == null) return ''
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'number') return String(value)
+  if (Array.isArray(value)) {
+    return value.map((entry) => formatFrontmatterValue(entry as FrontmatterValue)).join(', ')
+  }
+  return String(value)
+}
+
+function renderFrontmatterEntries(
+  frontmatter: Record<string, FrontmatterValue> | undefined,
+): Array<[string, string]> {
+  if (!frontmatter) return []
+  const seen = new Set<string>()
+  const ordered: Array<[string, string]> = []
+  const push = (key: string) => {
+    if (seen.has(key)) return
+    if (!(key in frontmatter)) return
+    const formatted = formatFrontmatterValue(frontmatter[key])
+    if (!formatted) return
+    seen.add(key)
+    ordered.push([key, formatted])
+  }
+  for (const key of FRONTMATTER_KEY_ORDER) push(key)
+  for (const key of Object.keys(frontmatter)) push(key)
+  return ordered
 }
 
 function formatHighlightDate(value: string) {
