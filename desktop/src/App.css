@@ -156,8 +156,7 @@
   background: var(--color-sidebar-bg);
 }
 
-.sidebar-scroll,
-.notes-scroll {
+.sidebar-scroll {
   min-height: 0;
   height: 100%;
   display: flex;
@@ -165,6 +164,51 @@
   gap: 18px;
   overflow: auto;
   padding-right: 6px;
+}
+
+.notes-scroll {
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.notes-top-scroll {
+  flex: 0 0 auto;
+  height: var(--notes-top-height, 360px);
+  min-height: 180px;
+  overflow: auto;
+  padding-right: 6px;
+  display: flex;
+  flex-direction: column;
+}
+
+.notes-top-scroll > .info-card {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.notes-top-scroll .notes-mode-row {
+  flex: 0 0 auto;
+}
+
+.notes-top-scroll .notes-editor,
+.notes-top-scroll .notes-preview {
+  flex: 1 1 auto;
+  min-height: 180px;
+}
+
+.notes-bottom-scroll {
+  flex: 1 1 auto;
+  min-height: 180px;
+  overflow: auto;
+  padding-right: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
 
 .brand h1,
@@ -574,6 +618,7 @@ select {
   border-radius: 12px;
   display: block;
   margin: 1.25rem auto;
+  cursor: zoom-in;
 }
 
 .markdown-body code {
@@ -631,6 +676,44 @@ select {
     background: linear-gradient(180deg, rgba(255, 229, 153, 0.18), rgba(255, 229, 153, 0.72));
     box-shadow: none;
   }
+}
+
+.markdown-body .table-wrapper {
+  position: relative;
+  margin: 1.4rem 0;
+  overflow-x: auto;
+}
+
+.markdown-body .table-wrapper table {
+  margin: 0;
+}
+
+.table-copy-button {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 4px 10px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--color-panel-border);
+  border-radius: 8px;
+  background: var(--color-panel-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 140ms ease, color 140ms ease, background 140ms ease;
+  z-index: 1;
+}
+
+.table-wrapper:hover .table-copy-button,
+.table-copy-button:focus-visible {
+  opacity: 1;
+}
+
+.table-copy-button:hover {
+  color: var(--color-text-primary);
+  background: var(--color-ghost-bg);
 }
 
 .markdown-body table {
@@ -819,6 +902,59 @@ select {
   outline-offset: 2px;
 }
 
+.highlight-card.is-flashing {
+  animation: highlight-card-flash 1200ms ease;
+}
+
+@keyframes highlight-card-flash {
+  0% {
+    background: var(--color-highlight-card-hover-bg);
+    box-shadow: 0 0 0 3px var(--color-splitter-active);
+  }
+  100% {
+    background: var(--color-highlight-card-bg);
+    box-shadow: none;
+  }
+}
+
+.lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 12, 18, 0.88);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  cursor: zoom-out;
+}
+
+.lightbox-toolbar {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  gap: 8px;
+  z-index: 1001;
+}
+
+.lightbox-toolbar .ghost-button {
+  padding: 8px 14px;
+  font-size: 0.82rem;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.lightbox-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  cursor: default;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  border-radius: 8px;
+}
+
 .highlight-card p {
   margin: 0;
   color: var(--color-text-primary);
@@ -926,6 +1062,22 @@ body.is-resizing .splitter::before {
   background: var(--color-splitter-active);
 }
 
+.splitter.splitter-horizontal {
+  width: auto;
+  height: 12px;
+  cursor: row-resize;
+  flex: 0 0 auto;
+}
+
+.splitter.splitter-horizontal::before {
+  top: 5px;
+  bottom: auto;
+  left: 18px;
+  right: 18px;
+  width: auto;
+  height: 2px;
+}
+
 .empty-state {
   color: var(--color-text-muted);
   padding: 32px 10px;
@@ -968,13 +1120,23 @@ body.is-resizing .splitter::before {
 
   .sidebar-scroll,
   .notes-scroll,
+  .notes-top-scroll,
+  .notes-bottom-scroll,
   .markdown-card,
   .document-list {
     overflow: visible;
     height: auto;
+    min-height: auto;
   }
 
-  .splitter {
+  .notes-top-scroll,
+  .notes-bottom-scroll {
+    flex: 0 0 auto;
+    padding-right: 0;
+  }
+
+  .splitter,
+  .splitter.splitter-horizontal {
     display: none;
   }
 }

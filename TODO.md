@@ -12,6 +12,7 @@
 8. [~] Feature: search should prioritize highly ranked sources, affinity to the current document (rating priority done; affinity pending)
 9. [ ] Feature: In search use author, latex article id, date, etc.
 10. [ ] Feature: Add pubmed style search criteria (e.g. "((Tournier JD[Author]) AND (CSD[Title])) AND (GPU)")
+11. [ ] Persist UI state (label, font, mode, etc.)
 
 ## Reader
 
@@ -22,21 +23,21 @@
 5. [x] Feature: If the original source contained a code block - allow to copy
 6. [x] Feature: Allow to copy equations as latex
 7. [x] Feature: Allow to download the linked PDF
-8. [ ] Feature: Clicking on a highlight shows it in the Highlights panel
-9. [ ] Feature: Allow to copy table in a CSV format
+8. [x] Feature: Clicking on a highlight shows it in the Highlights panel
+9. [x] Feature: Allow to copy table in a CSV format
 10. [x] Feature: Make external links clickable (in a new tab)
 11. [x] Feature: Add link to the source webpage
 12. [x] Feature: Allow to close the current document
 13. [x] Feature: Persist the reading position
-14. [ ] Feature: Allow to display images in full resolution
-15. [ ] Feature: Allow to copy an image to a Clipboard
+14. [x] Feature: Allow to display images in full resolution
+15. [x] Feature: Allow to copy an image to a Clipboard
 16. [ ] Feature: Add a list of opened documents and allow to easily switch between them (tabs?)
 17. [x] Feature: Allow to change the font size
 
 ## Notes
 
 1. [ ] Feature: add Typora key bindings for quicker markdown edits (e.g. ctrl + 1 - is h1, etc. )
-2. [ ] Feature: Allow to resize the Notes panel
+2. [x] Feature: Allow to resize the Notes panel
 3. [ ] Idea (low priority): Add LLM chat panel. Drop current article, notes, highlights to the LLM context. LLM should always have the current version of the modified entities. The most recent context should be the first user message. Remove within article References to save tokens.
 
 ## Highlights

@@ -76,11 +76,21 @@ const persistedThemeKey = 'corpus-scribe.desktop.theme'
 const persistedFontSizeKey = 'corpus-scribe.desktop.readerFontSize'
 const persistedFocusKey = 'corpus-scribe.desktop.focusMode'
 const persistedScrollKeyPrefix = 'corpus-scribe.desktop.scroll.'
+const persistedLeftPaneKey = 'corpus-scribe.desktop.leftPaneWidth'
+const persistedRightPaneKey = 'corpus-scribe.desktop.rightPaneWidth'
+const persistedNotesTopKey = 'corpus-scribe.desktop.notesTopHeight'
 
 const MIN_FONT_SIZE = 0.85
 const MAX_FONT_SIZE = 1.5
 const DEFAULT_FONT_SIZE = 1.06
 const FONT_SIZE_STEP = 0.05
+const DEFAULT_LEFT_PANE = 320
+const DEFAULT_RIGHT_PANE = 400
+const MIN_LEFT_PANE = 260
+const MIN_RIGHT_PANE = 300
+const DEFAULT_NOTES_TOP_HEIGHT = 360
+const MIN_NOTES_TOP_HEIGHT = 180
+const MIN_NOTES_BOTTOM_HEIGHT = 180
 
 async function desktopCommand<T>(command: string, payload: Record<string, unknown> = {}) {
   switch (command) {
@@ -524,6 +534,8 @@ type ReaderContentProps = {
   sourceSite?: string | null
   fontSize: number
   onCopy: (text: string, label: string) => void
+  onHighlightClick?: (highlightId: string) => void
+  onImageOpen?: (src: string, alt: string) => void
 }
 
 function CodeBlock({
@@ -560,6 +572,82 @@ function CodeBlock({
   )
 }
 
+async function blobToPng(blob: Blob): Promise<Blob> {
+  const bitmap = await (typeof createImageBitmap === 'function'
+    ? createImageBitmap(blob)
+    : Promise.reject(new Error('ImageBitmap not supported')))
+  const canvas = document.createElement('canvas')
+  canvas.width = bitmap.width
+  canvas.height = bitmap.height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    throw new Error('Canvas 2D context unavailable')
+  }
+  ctx.drawImage(bitmap, 0, 0)
+  return await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (out) => (out ? resolve(out) : reject(new Error('Canvas toBlob failed'))),
+      'image/png',
+    )
+  })
+}
+
+function tableToCsv(table: HTMLTableElement | null): string {
+  if (!table) return ''
+  const rows: string[] = []
+  for (const row of Array.from(table.querySelectorAll('tr'))) {
+    const cells: string[] = []
+    for (const cell of Array.from(row.querySelectorAll('th, td'))) {
+      const text = (cell.textContent ?? '').replace(/\s+/g, ' ').trim()
+      if (/[",\n]/.test(text)) {
+        cells.push(`"${text.replace(/"/g, '""')}"`)
+      } else {
+        cells.push(text)
+      }
+    }
+    if (cells.length) {
+      rows.push(cells.join(','))
+    }
+  }
+  return rows.join('\n')
+}
+
+function TableBlock({
+  children,
+  onCopyText,
+  ...rest
+}: {
+  children?: React.ReactNode
+  onCopyText: (text: string, label: string) => void
+  [key: string]: unknown
+}) {
+  const tableRef = useRef<HTMLTableElement | null>(null)
+  return (
+    <div className="table-wrapper">
+      <button
+        type="button"
+        className="table-copy-button"
+        title="Copy table as CSV"
+        onClick={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const csv = tableToCsv(tableRef.current)
+          if (!csv) {
+            onCopyText('', 'table')
+            return
+          }
+          onCopyText(csv, 'table (CSV)')
+        }}
+      >
+        Copy CSV
+      </button>
+      <table ref={tableRef} {...rest}>
+        {children}
+      </table>
+    </div>
+  )
+}
+
 const ReaderContent = memo(function ReaderContent({
   loading,
   markdown,
@@ -568,6 +656,8 @@ const ReaderContent = memo(function ReaderContent({
   sourceSite,
   fontSize,
   onCopy,
+  onHighlightClick,
+  onImageOpen,
 }: ReaderContentProps) {
   const [visibleChunkCount, setVisibleChunkCount] = useState(1)
   const chunks = useMemo(() => splitMarkdownIntoChunks(markdown), [markdown])
@@ -590,9 +680,18 @@ const ReaderContent = memo(function ReaderContent({
     const handleClick = (event: MouseEvent) => {
       const target = event.target
       if (!(target instanceof Element)) return
+      if (target.closest('.code-copy-button, .table-copy-button')) {
+        return
+      }
+      const mark = target.closest('mark.inline-highlight')
+      if (mark instanceof HTMLElement) {
+        const id = mark.dataset.highlightId
+        if (id && onHighlightClick) {
+          onHighlightClick(id)
+        }
+      }
       const equation = target.closest('.katex-display, .katex')
       if (!equation) return
-      if (target.closest('.code-copy-button')) return
       const annotation = equation.querySelector('annotation[encoding="application/x-tex"]')
       const latex = annotation?.textContent?.trim()
       if (latex) {
@@ -602,7 +701,7 @@ const ReaderContent = memo(function ReaderContent({
     }
     root.addEventListener('click', handleClick)
     return () => root.removeEventListener('click', handleClick)
-  }, [onCopy, markdown, visibleChunkCount])
+  }, [onCopy, onHighlightClick, markdown, visibleChunkCount])
 
   if (loading) {
     return <div className="empty-state">Loading document…</div>
@@ -623,15 +722,28 @@ const ReaderContent = memo(function ReaderContent({
             rehypePlugins={[[rehypeKatex, { output: 'html', throwOnError: false, strict: 'ignore' }]]}
             urlTransform={(url) => url}
             components={{
-              img: ({ node: _node, src = '', alt = '', title, ...props }) => (
-                <img
-                  src={toAssetUrl(src, articlePath) ?? src}
-                  alt={alt}
-                  title={title}
-                  loading="lazy"
-                  decoding="async"
-                  {...props}
-                />
+              img: ({ node: _node, src = '', alt = '', title, ...props }) => {
+                const resolvedSrc = toAssetUrl(src, articlePath) ?? src
+                const displayAlt = alt ?? ''
+                return (
+                  <img
+                    src={resolvedSrc}
+                    alt={displayAlt}
+                    title={title ?? 'Click to view full size'}
+                    loading="lazy"
+                    decoding="async"
+                    onClick={(event) => {
+                      if (!onImageOpen) return
+                      event.preventDefault()
+                      event.stopPropagation()
+                      onImageOpen(resolvedSrc, displayAlt)
+                    }}
+                    {...props}
+                  />
+                )
+              },
+              table: ({ children }) => (
+                <TableBlock onCopyText={onCopy}>{children}</TableBlock>
               ),
               a: ({ node: _node, href = '', children, title, ...props }) => {
                 const resolvedHref = resolveExternalHref(href, sourceSite)
@@ -729,8 +841,24 @@ function App() {
   const [generatingNotes, setGeneratingNotes] = useState(false)
   const [savingHighlights, setSavingHighlights] = useState(false)
   const [status, setStatus] = useState('Loading library…')
-  const [leftPaneWidth, setLeftPaneWidth] = useState(320)
-  const [rightPaneWidth, setRightPaneWidth] = useState(400)
+  const [leftPaneWidth, setLeftPaneWidth] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_LEFT_PANE
+    const stored = Number(window.localStorage.getItem(persistedLeftPaneKey))
+    return Number.isFinite(stored) && stored >= MIN_LEFT_PANE ? stored : DEFAULT_LEFT_PANE
+  })
+  const [rightPaneWidth, setRightPaneWidth] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_RIGHT_PANE
+    const stored = Number(window.localStorage.getItem(persistedRightPaneKey))
+    return Number.isFinite(stored) && stored >= MIN_RIGHT_PANE ? stored : DEFAULT_RIGHT_PANE
+  })
+  const [notesTopHeight, setNotesTopHeight] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_NOTES_TOP_HEIGHT
+    const stored = Number(window.localStorage.getItem(persistedNotesTopKey))
+    return Number.isFinite(stored) && stored >= MIN_NOTES_TOP_HEIGHT ? stored : DEFAULT_NOTES_TOP_HEIGHT
+  })
+  const [focusedHighlight, setFocusedHighlight] = useState<{ id: string; ts: number } | null>(null)
+  const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null)
+  const highlightCardRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem(persistedThemeKey)
@@ -749,8 +877,9 @@ function App() {
   })
   const [highlightCommentDraft, setHighlightCommentDraft] = useState<{ id: string; value: string } | null>(null)
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
-  const dragStateRef = useRef<{ pane: 'left' | 'right'; pointerId: number } | null>(null)
+  const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
   const readerScrollRef = useRef<HTMLDivElement | null>(null)
+  const notesScrollRef = useRef<HTMLDivElement | null>(null)
   const activeDocIdRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -770,6 +899,39 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(persistedFontSizeKey, String(readerFontSize))
   }, [readerFontSize])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedLeftPaneKey, String(leftPaneWidth))
+  }, [leftPaneWidth])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedRightPaneKey, String(rightPaneWidth))
+  }, [rightPaneWidth])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedNotesTopKey, String(notesTopHeight))
+  }, [notesTopHeight])
+
+  useEffect(() => {
+    if (!focusedHighlight) return
+    const card = highlightCardRefs.current.get(focusedHighlight.id)
+    if (!card) return
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    card.classList.add('is-flashing')
+    const timer = window.setTimeout(() => {
+      card.classList.remove('is-flashing')
+    }, 1200)
+    return () => window.clearTimeout(timer)
+  }, [focusedHighlight])
+
+  useEffect(() => {
+    if (!lightbox) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setLightbox(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox])
 
   useEffect(() => {
     if (!activeId) {
@@ -1133,6 +1295,28 @@ function App() {
     }
   }
 
+  async function copyImageToClipboard(src: string) {
+    if (!src) {
+      setStatus('Nothing to copy')
+      return
+    }
+    try {
+      if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
+        throw new Error('Clipboard API unavailable in this browser')
+      }
+      const response = await fetch(src, { credentials: 'omit' })
+      if (!response.ok) {
+        throw new Error(`Failed to fetch image (${response.status})`)
+      }
+      const blob = await response.blob()
+      const pngBlob = blob.type === 'image/png' ? blob : await blobToPng(blob)
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })])
+      setStatus('Copied image to clipboard')
+    } catch (error) {
+      setStatus(stringifyError(error))
+    }
+  }
+
   function scrollToHighlight(highlightId: string) {
     const mark = document.querySelector(
       `.markdown-body mark.inline-highlight[data-highlight-id="${CSS.escape(highlightId)}"]`,
@@ -1221,7 +1405,7 @@ function App() {
     )
   }
 
-  function onSplitterPointerDown(pane: 'left' | 'right', event: React.PointerEvent<HTMLDivElement>) {
+  function onSplitterPointerDown(pane: 'left' | 'right' | 'notes', event: React.PointerEvent<HTMLDivElement>) {
     if (window.innerWidth <= 1080) {
       return
     }
@@ -1232,6 +1416,19 @@ function App() {
 
   function onSplitterPointerMove(event: React.PointerEvent<HTMLDivElement>) {
     if (!dragStateRef.current || dragStateRef.current.pointerId !== event.pointerId) {
+      return
+    }
+
+    if (dragStateRef.current.pane === 'notes') {
+      const container = notesScrollRef.current
+      if (!container) return
+      const rect = container.getBoundingClientRect()
+      const available = rect.height
+      const next = Math.max(
+        MIN_NOTES_TOP_HEIGHT,
+        Math.min(event.clientY - rect.top, available - MIN_NOTES_BOTTOM_HEIGHT),
+      )
+      setNotesTopHeight(next)
       return
     }
 
@@ -1278,7 +1475,8 @@ function App() {
   const shellStyle = {
     '--left-pane-width': `${leftPaneWidth}px`,
     '--right-pane-width': `${rightPaneWidth}px`,
-  } as CSSProperties & Record<'--left-pane-width' | '--right-pane-width', string>
+    '--notes-top-height': `${notesTopHeight}px`,
+  } as CSSProperties & Record<'--left-pane-width' | '--right-pane-width' | '--notes-top-height', string>
   const renderedMarkdown = useMemo(
     () => (detail ? normalizeReaderMarkdown(detail.markdown) : ''),
     [detail?.markdown],
@@ -1290,6 +1488,47 @@ function App() {
 
   return (
     <div className={`shell${focusMode ? ' focus-mode' : ''}`} style={shellStyle} data-theme={theme}>
+      {lightbox ? (
+        <div
+          className="lightbox-overlay"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setLightbox(null)}
+        >
+          <div className="lightbox-toolbar" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => void copyImageToClipboard(lightbox.src)}
+            >
+              Copy image
+            </button>
+            <a
+              className="ghost-button"
+              href={lightbox.src}
+              target="_blank"
+              rel="noopener noreferrer"
+              download
+            >
+              Open full size
+            </a>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => setLightbox(null)}
+              aria-label="Close image viewer"
+            >
+              Close
+            </button>
+          </div>
+          <img
+            className="lightbox-image"
+            src={lightbox.src}
+            alt={lightbox.alt}
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="sidebar-scroll">
           <div className="brand">
@@ -1528,6 +1767,8 @@ function App() {
             sourceSite={detail?.summary.sourceSite}
             fontSize={readerFontSize}
             onCopy={copyTextToClipboard}
+            onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
+            onImageOpen={(src, alt) => setLightbox({ src, alt })}
           />
         </section>
       </main>
@@ -1557,7 +1798,8 @@ function App() {
           </div>
         </header>
 
-        <div className="notes-scroll">
+        <div className="notes-scroll" ref={notesScrollRef}>
+          <div className="notes-top-scroll">
           <section className="info-card">
             <div className="notes-mode-row">
               <div className="notes-mode-toggle">
@@ -1632,7 +1874,19 @@ function App() {
               </div>
             )}
           </section>
+          </div>
 
+          <div
+            className="splitter splitter-horizontal"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize notes section"
+            onPointerDown={(event) => onSplitterPointerDown('notes', event)}
+            onPointerMove={onSplitterPointerMove}
+            onPointerUp={onSplitterPointerUp}
+          />
+
+          <div className="notes-bottom-scroll">
           <section className="info-card">
             <h3>Highlights</h3>
             {highlights.length ? (
@@ -1641,6 +1895,13 @@ function App() {
                   <article
                     className="highlight-card"
                     key={highlight.id}
+                    ref={(element) => {
+                      if (element) {
+                        highlightCardRefs.current.set(highlight.id, element)
+                      } else {
+                        highlightCardRefs.current.delete(highlight.id)
+                      }
+                    }}
                     onClick={() => scrollToHighlight(highlight.id)}
                     role="button"
                     tabIndex={0}
@@ -1751,6 +2012,7 @@ function App() {
             </div>
             <pre>{detail?.bibliography || 'No bibliography file available.'}</pre>
           </section>
+          </div>
         </div>
 
         <footer className="status-bar">{status}</footer>
