@@ -200,6 +200,7 @@ def _load_highlights(path: Path) -> list[dict]:
         start_offset = item.get("startOffset")
         end_offset = item.get("endOffset")
         comment = item.get("comment")
+        variant = item.get("variant")
         cleaned_item = {
             "id": str(highlight_id).strip() if highlight_id is not None else "",
             "text": text.strip(),
@@ -210,6 +211,8 @@ def _load_highlights(path: Path) -> list[dict]:
             cleaned_item["endOffset"] = end_offset
         if isinstance(comment, str) and comment.strip():
             cleaned_item["comment"] = comment.strip()
+        if isinstance(variant, str) and variant.strip():
+            cleaned_item["variant"] = variant.strip()
         cleaned.append(cleaned_item)
     return cleaned
 
@@ -744,6 +747,44 @@ def desktop_library():
     return jsonify(success=True, root=str(root), labels=labels, documents=documents)
 
 
+@app.route("/desktop/reindex", methods=["POST"])
+def desktop_reindex():
+    data = request.get_json(silent=True) or {}
+    root = _resolve_library_root(data.get("root"))
+    if not root.exists():
+        return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
+
+    records: list[dict] = []
+    scanned = 0
+    errors = 0
+    for path in root.rglob("*.md"):
+        if path.name.endswith(".notes.md"):
+            continue
+        try:
+            payload = _build_existing_article_payload(path)
+            records.extend(_build_index_records(payload, payload.get("label") or ""))
+            scanned += 1
+        except Exception as exc:
+            app.logger.warning("Re-index failed for %s: %s", path, exc)
+            errors += 1
+
+    index_path = _index_file_path()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(records, key=lambda item: (item.get("type", ""), item.get("path") or ""))
+    index_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in ordered) + ("\n" if ordered else ""),
+        encoding="utf-8",
+    )
+
+    return jsonify(
+        success=True,
+        scanned=scanned,
+        records=len(ordered),
+        errors=errors,
+        indexPath=str(index_path),
+    )
+
+
 @app.route("/desktop/search", methods=["POST"])
 def desktop_search():
     data = request.get_json(silent=True) or {}
@@ -939,6 +980,7 @@ def desktop_save_highlights():
         start_offset = item.get("startOffset")
         end_offset = item.get("endOffset")
         comment = str(item.get("comment") or "").strip()
+        variant = str(item.get("variant") or "").strip()
         if not text:
             continue
         cleaned_item = {
@@ -951,6 +993,8 @@ def desktop_save_highlights():
             cleaned_item["endOffset"] = end_offset
         if comment:
             cleaned_item["comment"] = comment
+        if variant:
+            cleaned_item["variant"] = variant
         cleaned.append(cleaned_item)
 
     highlights_path = _write_highlights(article_path, cleaned)

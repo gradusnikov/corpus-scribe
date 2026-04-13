@@ -4,13 +4,17 @@ Corpus Scribe turns web articles and PDFs into a **personalized, high-quality, L
 
 It captures messy publisher pages and source PDFs, normalizes them into **clean Markdown-first article bundles**, preserves local assets, generates citation metadata, and optionally writes companion notes. Reading PDFs are still supported, but they are a derived artifact rather than the primary output.
 
-Comes with a Chrome extension for one-click capture and a Dockerized Flask backend.
+Comes with:
+
+- a Chrome extension for one-click capture
+- a Dockerized Flask backend
+- a browser reader for search, reading, highlights, notes, and bibliography review
 
 ## At a glance
 
-![Corpus Scribe popup](docs/popup-demo.svg)
+![Corpus Scribe browser reader](docs/corpus-scribe.png)
 
-![Corpus Scribe bundle layout](docs/bundle-demo.svg)
+![Corpus Scribe clipper](docs/corpus-scribe-clipper.png)
 
 ## Why use it
 
@@ -29,6 +33,66 @@ Comes with a Chrome extension for one-click capture and a Dockerized Flask backe
 - Save papers into labeled folders like `ml`, `agents`, `biology`, or `ideas` and query them later with local tools.
 - Generate clean reading copies from difficult source PDFs without making the PDF workflow the center of the system.
 - Maintain a private markdown library with stable frontmatter, bibliography files, notes, and an index that can be processed by scripts or agents.
+
+## Core features
+
+### Capture and extraction
+
+- Save web articles and PDFs from Chrome into labeled bundles under `output/<label>/<article>/`
+- Normalize publisher HTML into readable Markdown with equations, tables, code, figures, metadata, and local assets
+- Preserve bibliography as a sibling `*.bib` file
+- For source PDFs:
+  - save the original file as `*.source.pdf`
+  - extract Markdown with Mistral OCR when configured
+  - fall back to `pdftotext` when OCR is unavailable or fails
+  - generate a separate `*.reading.pdf` from cleaned Markdown
+
+### Reader and library UI
+
+- Browser-based reader optimized for WSL + Windows Chrome
+- Library search with local indexing and article quality stars
+- Open-document switching, close current document, and persisted UI state
+- Focus mode, dark mode, adjustable font size, and persisted reading position
+- TOC popup for long documents
+- External links open in a new tab
+- Direct link to the original source page
+- Download linked PDFs from the reader
+
+### Highlights, noise, and notes
+
+- Select text in the article and save highlights without reloading the document
+- Inline visible highlights in the reader
+- Highlight panel with list mode and single-item mode with next/previous navigation
+- Click a highlight to center it in the reader
+- Add comments to highlights and copy them to the clipboard
+- Mark sections as `noise` with strikethrough styling and optionally hide them in the reader
+- Optional `References = noise` mode for cleaner reading and lower-token LLM workflows
+- Notes pane with two modes:
+  - `Markdown` editing
+  - `Preview` rich rendered view
+- Markdown syntax coloring in the notes editor
+- Typora-style keyboard shortcuts for fast markdown editing
+- Generate companion notes for an existing article bundle from the UI
+
+### Reader utilities
+
+- Copy code blocks
+- Copy equations as LaTeX
+- Copy tables as CSV
+- Open images in full resolution
+- Copy images to the clipboard
+
+### Corpus structure and indexing
+
+- Markdown is the canonical artifact
+- Stable YAML frontmatter for indexing and downstream processing
+- Generated `index.jsonl` at the corpus root
+- Companion artifacts around the main article:
+  - `*.notes.md`
+  - `*.bib`
+  - `*.highlights.json`
+  - `*.source.pdf`
+  - `*.reading.pdf`
 
 ## Project structure
 
@@ -49,14 +113,14 @@ corpus-scribe/
     background.js
     assets/
   desktop/
-    src/                      # browser reader UI
+    src/                      # browser reader + notes/highlights UI
     vite.config.ts
 ```
 
 ## Quick start
 
 ```bash
-docker compose up -d
+./scripts/compose-with-home-env.sh up -d --build backend
 ```
 
 The backend starts on `http://localhost:5000`. Saved files appear in `./output/<label>/<article>/`.
@@ -73,7 +137,7 @@ HOST_OUTPUT_DIR=/mnt/c/Users/<you>/Documents/corpus-scribe
 Then restart the backend with:
 
 ```bash
-docker compose up -d
+./scripts/compose-with-home-env.sh up -d --build backend
 ```
 
 Inside the container the backend still writes to `/output`, but Docker will map that to your configured host folder.
@@ -106,10 +170,12 @@ There is now a browser reader in [desktop/](desktop) aimed at a Zotero-meets-Typ
 
 - library browser on the left
 - markdown reader in the center
-- notes and bibliography on the right
-- local search over article and notes content
+- notes, highlights, and bibliography on the right
+- local indexed search over article, notes, and highlight text
+- article quality stars directly in the library
 - independently scrolling panes
 - draggable splitters for resizing the side panels
+- persisted UI state such as selected label, display mode, and view preferences
 
 It reads the existing Corpus Scribe bundle layout directly instead of introducing a new storage model. The reader runs as a normal web app and talks to the Flask backend through local `/desktop/*` endpoints.
 
@@ -128,9 +194,27 @@ Then open:
 http://localhost:1420/
 ```
 
-On WSL, opening that URL in Windows Chrome is the recommended path.
+On WSL, opening that URL in Windows Chrome is the recommended path. This is the primary supported reader workflow.
 
 The compose wrapper above sources `~/.env` first, so backend-only secrets such as `NOTES_LLM_API_KEY` and `MISTRAL_API_KEY` can stay in your home environment instead of the repo-local `.env`.
+
+### Reader workflow
+
+The current browser UI supports:
+
+- browse and search the corpus
+- open multiple documents and switch between them quickly
+- read the full article without an extra "load full article" step
+- create visible inline highlights
+- mark low-value sections as `noise`
+- write Markdown notes and switch to rich preview
+- generate notes from the current article on demand
+- inspect bibliography and copy citation data
+- jump through highlights and back to the relevant article location
+
+### Bundle layout
+
+![Corpus Scribe bundle layout](docs/bundle-demo.svg)
 
 ## API
 

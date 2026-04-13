@@ -109,3 +109,7 @@ Single-file React app. It fetches bundles through the `/desktop/*` endpoints and
 #### GIT
 
 1. IMPORTANT: Never reference Claude Code in the commit message
+
+## Lessons learned
+
+Update here lessons learned, mistakes,  bugs, anything that was problematic to avoid repeating the same pitfalls in a future.

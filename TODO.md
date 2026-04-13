@@ -12,7 +12,8 @@
 8. [~] Feature: search should prioritize highly ranked sources, affinity to the current document (rating priority done; affinity pending)
 9. [ ] Feature: In search use author, latex article id, date, etc.
 10. [ ] Feature: Add pubmed style search criteria (e.g. "((Tournier JD[Author]) AND (CSD[Title])) AND (GPU)")
-11. [ ] Persist UI state (label, font, mode, etc.)
+11. [x] Persist UI state (label, font, mode, etc.)
+12. [x] Feature: Add re-index db button
 
 ## Reader
 
@@ -31,18 +32,24 @@
 13. [x] Feature: Persist the reading position
 14. [x] Feature: Allow to display images in full resolution
 15. [x] Feature: Allow to copy an image to a Clipboard
-16. [ ] Feature: Add a list of opened documents and allow to easily switch between them (tabs?)
+16. [x] Feature: Add a list of opened documents and allow to easily switch between them (tabs?)
 17. [x] Feature: Allow to change the font size
+18. [x] Bug: Remove load full article button - always load full article
+19. [x] Feature: Add TOC (popup)
+20. [x] Feature: Add "Noise" button - allow to highlight some sections of the text, and set them as Noise (formatted as a crossed-out). Then you can choose to change the visibility of the document to remove noise (noise text blocks are removed). Then this can be also used for LLM to filter out the noise (less tokens).  User should also be able to "de-noise" the text (remove noise annotation). Internally noise should be stored the same way as highlights. Also in settings: Refrences = Noise (on/off)
+21. [ ] Bug: Highlighting/noise is broken when selecting ol/ul or hrefs (any formatted text?)
+22. [ ] Bug: The text extracted by the highlight tool should maintain formatting and line endings (displayed in Highlights)
 
 ## Notes
 
-1. [ ] Feature: add Typora key bindings for quicker markdown edits (e.g. ctrl + 1 - is h1, etc. )
+1. [x] Feature: add Typora key bindings for quicker markdown edits (e.g. ctrl + 1 - is h1, etc. )
 2. [x] Feature: Allow to resize the Notes panel
 3. [ ] Idea (low priority): Add LLM chat panel. Drop current article, notes, highlights to the LLM context. LLM should always have the current version of the modified entities. The most recent context should be the first user message. Remove within article References to save tokens.
+4. [x] Feature: Add Markdown syntax coloring in the note editor (headings, etc.)
 
 ## Highlights
 
-1. [ ] Feature: Display highlights in a single row with "next" / "previous" buttons
+1. [x] Feature: Display highlights in a single row with "next" / "previous" buttons
 2. [x] Feature: Clicking on the highlight scrolls the Reader to show it in the middle of the reading area
 3. [x] Feature: Allow to add a comment to the Highlight
 4. [x] Feature: Allow to copy the highlight to the Clipboard
@@ -65,7 +72,7 @@
 
 1. [ ] Feature: Tool - Search
 
-2. [ ] Feature: Tool - Get Currently Opened Document current article
+2. [ ] Feature: Tool - Get Currently Opened Document(s) current article
 
 3. [ ] Feature: Tool - Get Current Context - returns notes, highlights, links, etc.
 

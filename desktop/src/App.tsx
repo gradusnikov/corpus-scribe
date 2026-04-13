@@ -54,6 +54,7 @@ type Highlight = {
   startOffset?: number
   endOffset?: number
   comment?: string
+  variant?: 'noise'
 }
 
 type PendingSelection = {
@@ -64,6 +65,9 @@ type PendingSelection = {
 
 type NotesMode = 'markdown' | 'preview'
 type ThemeMode = 'light' | 'dark'
+type HighlightsView = 'list' | 'single'
+type NoiseVariant = 'highlight' | 'noise'
+type HeadingEntry = { level: number; text: string; index: number }
 
 const emptyLibrary: LibraryIndex = {
   root: '',
@@ -79,6 +83,12 @@ const persistedScrollKeyPrefix = 'corpus-scribe.desktop.scroll.'
 const persistedLeftPaneKey = 'corpus-scribe.desktop.leftPaneWidth'
 const persistedRightPaneKey = 'corpus-scribe.desktop.rightPaneWidth'
 const persistedNotesTopKey = 'corpus-scribe.desktop.notesTopHeight'
+const persistedLabelKey = 'corpus-scribe.desktop.selectedLabel'
+const persistedNotesModeKey = 'corpus-scribe.desktop.notesMode'
+const persistedHighlightsViewKey = 'corpus-scribe.desktop.highlightsView'
+const persistedOpenTabsKey = 'corpus-scribe.desktop.openTabs'
+const persistedHideNoiseKey = 'corpus-scribe.desktop.hideNoise'
+const persistedRefsAreNoiseKey = 'corpus-scribe.desktop.refsAreNoise'
 
 const MIN_FONT_SIZE = 0.85
 const MAX_FONT_SIZE = 1.5
@@ -211,6 +221,18 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return data as T
     }
+    case 'reindex_library': {
+      const response = await fetch(`${browserApiBase}/desktop/reindex`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root: payload.root ?? null }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to rebuild index')
+      }
+      return data as T
+    }
     default:
       throw new Error(`Unsupported desktop command in browser mode: ${command}`)
   }
@@ -294,6 +316,238 @@ function quoteMarkdown(text: string) {
     .join('\n')
 }
 
+function parseHeadings(markdown: string): HeadingEntry[] {
+  if (!markdown) return []
+  const lines = markdown.split('\n')
+  const headings: HeadingEntry[] = []
+  let inCodeBlock = false
+  let occurrence = 0
+  for (const line of lines) {
+    if (/^\s{0,3}```/.test(line)) {
+      inCodeBlock = !inCodeBlock
+      continue
+    }
+    if (inCodeBlock) continue
+    const match = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line)
+    if (!match) continue
+    const level = match[1].length
+    const text = match[2].trim()
+    if (!text) continue
+    headings.push({ level, text, index: occurrence })
+    occurrence += 1
+  }
+  return headings
+}
+
+type NotesTransformResult = { value: string; selStart: number; selEnd: number }
+type NotesTransform = (value: string, selStart: number, selEnd: number) => NotesTransformResult
+
+function wrapSelectionTransform(open: string, close: string, placeholder: string): NotesTransform {
+  return (value, selStart, selEnd) => {
+    const before = value.slice(0, selStart)
+    const selected = value.slice(selStart, selEnd)
+    const after = value.slice(selEnd)
+    if (
+      selected.length >= open.length + close.length &&
+      selected.startsWith(open) &&
+      selected.endsWith(close)
+    ) {
+      const inner = selected.slice(open.length, selected.length - close.length)
+      return {
+        value: before + inner + after,
+        selStart: before.length,
+        selEnd: before.length + inner.length,
+      }
+    }
+    const body = selected || placeholder
+    const next = before + open + body + close + after
+    const innerStart = before.length + open.length
+    return {
+      value: next,
+      selStart: innerStart,
+      selEnd: innerStart + body.length,
+    }
+  }
+}
+
+function setLineHeadingTransform(level: number): NotesTransform {
+  return (value, selStart, selEnd) => {
+    const lineStart = value.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1
+    const lineEndIdx = value.indexOf('\n', selStart)
+    const lineEnd = lineEndIdx === -1 ? value.length : lineEndIdx
+    const line = value.slice(lineStart, lineEnd)
+    const stripped = line.replace(/^\s{0,3}#{1,6}\s+/, '')
+    const newLine = level === 0 ? stripped : `${'#'.repeat(level)} ${stripped}`
+    const next = value.slice(0, lineStart) + newLine + value.slice(lineEnd)
+    const delta = newLine.length - line.length
+    return {
+      value: next,
+      selStart: Math.max(lineStart, selStart + delta),
+      selEnd: Math.max(lineStart, selEnd + delta),
+    }
+  }
+}
+
+function insertLinkTransform(): NotesTransform {
+  return (value, selStart, selEnd) => {
+    const before = value.slice(0, selStart)
+    const selected = value.slice(selStart, selEnd)
+    const after = value.slice(selEnd)
+    const label = selected || 'link text'
+    const inserted = `[${label}](url)`
+    const urlStart = before.length + 1 + label.length + 2
+    return {
+      value: before + inserted + after,
+      selStart: urlStart,
+      selEnd: urlStart + 3,
+    }
+  }
+}
+
+function insertCodeBlockTransform(): NotesTransform {
+  return (value, selStart, selEnd) => {
+    const before = value.slice(0, selStart)
+    const selected = value.slice(selStart, selEnd)
+    const after = value.slice(selEnd)
+    let prefix = ''
+    if (before.length && !before.endsWith('\n\n')) {
+      prefix = before.endsWith('\n') ? '\n' : '\n\n'
+    }
+    let suffix = ''
+    if (after.length && !after.startsWith('\n\n')) {
+      suffix = after.startsWith('\n') ? '\n' : '\n\n'
+    }
+    const content = selected
+    const block = `${prefix}\`\`\`\n${content}\n\`\`\`${suffix}`
+    const next = before + block + after
+    const innerStart = before.length + prefix.length + 4
+    return {
+      value: next,
+      selStart: innerStart,
+      selEnd: innerStart + content.length,
+    }
+  }
+}
+
+function insertBlockquoteTransform(): NotesTransform {
+  return (value, selStart, selEnd) => {
+    const lineStart = value.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1
+    const lineEndIdx = value.indexOf('\n', selEnd)
+    const lineEnd = lineEndIdx === -1 ? value.length : lineEndIdx
+    const block = value.slice(lineStart, lineEnd)
+    const lines = block.split('\n')
+    const allQuoted = lines.every((l) => l.startsWith('> ') || l === '')
+    const transformed = (allQuoted
+      ? lines.map((l) => (l.startsWith('> ') ? l.slice(2) : l))
+      : lines.map((l) => (l.trim() ? `> ${l}` : l))
+    ).join('\n')
+    const next = value.slice(0, lineStart) + transformed + value.slice(lineEnd)
+    return {
+      value: next,
+      selStart: lineStart,
+      selEnd: lineStart + transformed.length,
+    }
+  }
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function highlightNotesMarkdown(source: string) {
+  if (!source) {
+    return ''
+  }
+  const lines = source.split('\n')
+  const out: string[] = []
+  let inFence = false
+  for (const line of lines) {
+    const fenceMatch = /^(\s{0,3})(```+|~~~+)(.*)$/.exec(line)
+    if (fenceMatch) {
+      inFence = !inFence
+      out.push(`<span class="md-code">${escapeHtml(line)}</span>`)
+      continue
+    }
+    if (inFence) {
+      out.push(`<span class="md-code">${escapeHtml(line)}</span>`)
+      continue
+    }
+    const headingMatch = /^(\s{0,3})(#{1,6})(\s+)(.*)$/.exec(line)
+    if (headingMatch) {
+      const level = headingMatch[2].length
+      out.push(
+        `${escapeHtml(headingMatch[1])}<span class="md-heading md-h${level}">${escapeHtml(
+          headingMatch[2] + headingMatch[3] + headingMatch[4],
+        )}</span>`,
+      )
+      continue
+    }
+    const quoteMatch = /^(\s{0,3})(>\s?.*)$/.exec(line)
+    if (quoteMatch) {
+      out.push(`${escapeHtml(quoteMatch[1])}<span class="md-quote">${escapeHtml(quoteMatch[2])}</span>`)
+      continue
+    }
+    if (/^(\s{0,3})([-*_])\2{2,}\s*$/.test(line)) {
+      out.push(`<span class="md-hr">${escapeHtml(line)}</span>`)
+      continue
+    }
+    const listMatch = /^(\s*)([-*+]|\d+[.)])(\s+)/.exec(line)
+    let rest = line
+    let prefix = ''
+    if (listMatch) {
+      prefix = `${escapeHtml(listMatch[1])}<span class="md-list">${escapeHtml(listMatch[2])}</span>${escapeHtml(listMatch[3])}`
+      rest = line.slice(listMatch[0].length)
+    }
+    out.push(prefix + highlightInline(rest))
+  }
+  return out.join('\n')
+}
+
+function highlightInline(text: string) {
+  if (!text) return ''
+  const tokens: Array<{ start: number; end: number; cls: string }> = []
+  const patterns: Array<{ re: RegExp; cls: string }> = [
+    { re: /`[^`\n]+`/g, cls: 'md-code' },
+    { re: /\*\*[^*\n]+\*\*/g, cls: 'md-bold' },
+    { re: /(^|[^*])\*(?!\s)([^*\n]+?)\*(?!\*)/g, cls: 'md-italic' },
+    { re: /(^|[^_])_(?!\s)([^_\n]+?)_(?!_)/g, cls: 'md-italic' },
+    { re: /!?\[[^\]\n]*\]\([^)\n]*\)/g, cls: 'md-link' },
+  ]
+  for (const { re, cls } of patterns) {
+    re.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = re.exec(text)) !== null) {
+      let start = match.index
+      const end = match.index + match[0].length
+      if ((cls === 'md-italic') && match[1] !== undefined) {
+        start = match.index + match[1].length
+      }
+      if (tokens.some((t) => start < t.end && end > t.start)) {
+        continue
+      }
+      tokens.push({ start, end, cls })
+    }
+  }
+  tokens.sort((a, b) => a.start - b.start)
+  const parts: string[] = []
+  let cursor = 0
+  for (const token of tokens) {
+    if (token.start < cursor) continue
+    if (token.start > cursor) {
+      parts.push(escapeHtml(text.slice(cursor, token.start)))
+    }
+    parts.push(`<span class="${token.cls}">${escapeHtml(text.slice(token.start, token.end))}</span>`)
+    cursor = token.end
+  }
+  if (cursor < text.length) {
+    parts.push(escapeHtml(text.slice(cursor)))
+  }
+  return parts.join('')
+}
+
 function splitLongSection(section: string, maxLength = 12000) {
   if (section.length <= maxLength) {
     return [section]
@@ -362,7 +616,7 @@ function collectHighlightTextNodes(root: HTMLElement) {
       if (!parent) {
         return NodeFilter.FILTER_REJECT
       }
-      if (parent.closest('code, pre, script, style, .chunk-controls')) {
+      if (parent.closest('code, pre, script, style')) {
         return NodeFilter.FILTER_REJECT
       }
       return NodeFilter.FILTER_ACCEPT
@@ -473,8 +727,12 @@ function applyInlineHighlights(root: HTMLElement, highlights: Highlight[]) {
     }
 
     const mark = document.createElement('mark')
-    mark.className = 'inline-highlight'
+    const isNoise = entry.highlight.variant === 'noise'
+    mark.className = isNoise ? 'inline-highlight inline-noise' : 'inline-highlight'
     mark.dataset.highlightId = entry.highlight.id
+    if (isNoise) {
+      mark.dataset.variant = 'noise'
+    }
 
     const contents = range.extractContents()
     mark.appendChild(contents)
@@ -533,6 +791,9 @@ type ReaderContentProps = {
   articlePath?: string | null
   sourceSite?: string | null
   fontSize: number
+  scrollHeadingRequest?: { index: number; ts: number } | null
+  hideNoise?: boolean
+  referencesAreNoise?: boolean
   onCopy: (text: string, label: string) => void
   onHighlightClick?: (highlightId: string) => void
   onImageOpen?: (src: string, alt: string) => void
@@ -655,24 +916,81 @@ const ReaderContent = memo(function ReaderContent({
   articlePath,
   sourceSite,
   fontSize,
+  scrollHeadingRequest,
+  hideNoise,
+  referencesAreNoise,
   onCopy,
   onHighlightClick,
   onImageOpen,
 }: ReaderContentProps) {
-  const [visibleChunkCount, setVisibleChunkCount] = useState(1)
   const chunks = useMemo(() => splitMarkdownIntoChunks(markdown), [markdown])
   const articleRef = useRef<HTMLElement | null>(null)
+  const pendingHeadingIndexRef = useRef<number | null>(null)
 
   useEffect(() => {
-    setVisibleChunkCount(1)
-  }, [markdown])
+    if (!scrollHeadingRequest) return
+    pendingHeadingIndexRef.current = scrollHeadingRequest.index
+  }, [scrollHeadingRequest])
+
+  useEffect(() => {
+    const targetIndex = pendingHeadingIndexRef.current
+    if (targetIndex == null) return
+    const root = articleRef.current
+    if (!root) return
+    const headings = root.querySelectorAll('h1, h2, h3, h4, h5, h6')
+    const target = headings[targetIndex]
+    if (target instanceof HTMLElement) {
+      pendingHeadingIndexRef.current = null
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      target.classList.add('is-flashing')
+      window.setTimeout(() => target.classList.remove('is-flashing'), 1200)
+    }
+  }, [markdown, scrollHeadingRequest])
 
   useEffect(() => {
     if (!articleRef.current) {
       return
     }
     applyInlineHighlights(articleRef.current, highlights)
-  }, [highlights, markdown, visibleChunkCount])
+  }, [highlights, markdown])
+
+  useEffect(() => {
+    const root = articleRef.current
+    if (!root) return
+    root.querySelectorAll('.section-noise').forEach((element) => {
+      element.classList.remove('section-noise')
+    })
+    if (!referencesAreNoise) return
+    const flowElements: HTMLElement[] = []
+    for (const section of Array.from(root.children)) {
+      if (section instanceof HTMLElement) {
+        for (const child of Array.from(section.children)) {
+          if (child instanceof HTMLElement) {
+            flowElements.push(child)
+          }
+        }
+      }
+    }
+    const refHeadingIndex = flowElements.findIndex(
+      (element) =>
+        /^H[1-6]$/.test(element.tagName) &&
+        /^(references?|bibliography|works\s+cited|citations?)\s*$/i.test(
+          (element.textContent ?? '').trim(),
+        ),
+    )
+    if (refHeadingIndex < 0) return
+    const refHeading = flowElements[refHeadingIndex]
+    const headingLevel = Number.parseInt(refHeading.tagName.substring(1), 10)
+    refHeading.classList.add('section-noise')
+    for (let i = refHeadingIndex + 1; i < flowElements.length; i++) {
+      const element = flowElements[i]
+      if (/^H[1-6]$/.test(element.tagName)) {
+        const siblingLevel = Number.parseInt(element.tagName.substring(1), 10)
+        if (siblingLevel <= headingLevel) break
+      }
+      element.classList.add('section-noise')
+    }
+  }, [markdown, referencesAreNoise, highlights])
 
   useEffect(() => {
     const root = articleRef.current
@@ -701,7 +1019,7 @@ const ReaderContent = memo(function ReaderContent({
     }
     root.addEventListener('click', handleClick)
     return () => root.removeEventListener('click', handleClick)
-  }, [onCopy, onHighlightClick, markdown, visibleChunkCount])
+  }, [onCopy, onHighlightClick, markdown])
 
   if (loading) {
     return <div className="empty-state">Loading document…</div>
@@ -714,8 +1032,13 @@ const ReaderContent = memo(function ReaderContent({
   const inlineStyle: CSSProperties = { fontSize: `${fontSize}rem` }
 
   return (
-    <article className="markdown-body" ref={articleRef} style={inlineStyle}>
-      {chunks.slice(0, visibleChunkCount).map((chunk, index) => (
+    <article
+      className="markdown-body"
+      ref={articleRef}
+      style={inlineStyle}
+      data-hide-noise={hideNoise ? 'true' : 'false'}
+    >
+      {chunks.map((chunk, index) => (
         <section className="markdown-chunk" key={`${index}-${chunk.slice(0, 32)}`}>
           <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkMath]}
@@ -799,25 +1122,6 @@ const ReaderContent = memo(function ReaderContent({
           </ReactMarkdown>
         </section>
       ))}
-      {visibleChunkCount < chunks.length ? (
-        <div className="chunk-controls">
-          <button
-            className="ghost-button"
-            onClick={() => setVisibleChunkCount((current) => Math.min(current + 1, chunks.length))}
-          >
-            Load next section
-          </button>
-          <button
-            className="ghost-button"
-            onClick={() => setVisibleChunkCount(chunks.length)}
-          >
-            Load full article
-          </button>
-          <span className="chunk-hint">
-            Showing {visibleChunkCount} of {chunks.length} sections.
-          </span>
-        </div>
-      ) : null}
     </article>
   )
 })
@@ -825,16 +1129,24 @@ const ReaderContent = memo(function ReaderContent({
 function App() {
   const [rootPath, setRootPath] = useState('')
   const [library, setLibrary] = useState<LibraryIndex>(emptyLibrary)
-  const [selectedLabel, setSelectedLabel] = useState('all')
+  const [selectedLabel, setSelectedLabel] = useState<string>(() => {
+    if (typeof window === 'undefined') return 'all'
+    return window.localStorage.getItem(persistedLabelKey) || 'all'
+  })
   const [search, setSearch] = useState('')
   const [searchResults, setSearchResults] = useState<DocumentSummary[] | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [detail, setDetail] = useState<DocumentDetail | null>(null)
   const [notesDraft, setNotesDraft] = useState('')
-  const [notesMode, setNotesMode] = useState<NotesMode>('markdown')
+  const [notesMode, setNotesMode] = useState<NotesMode>(() => {
+    if (typeof window === 'undefined') return 'markdown'
+    const stored = window.localStorage.getItem(persistedNotesModeKey)
+    return stored === 'preview' ? 'preview' : 'markdown'
+  })
   const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const [highlights, setHighlights] = useState<Highlight[]>([])
   const [loadingLibrary, setLoadingLibrary] = useState(false)
+  const [reindexing, setReindexing] = useState(false)
   const [searching, setSearching] = useState(false)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [savingNotes, setSavingNotes] = useState(false)
@@ -876,11 +1188,50 @@ function App() {
       : DEFAULT_FONT_SIZE
   })
   const [highlightCommentDraft, setHighlightCommentDraft] = useState<{ id: string; value: string } | null>(null)
+  const [highlightsView, setHighlightsView] = useState<HighlightsView>(() => {
+    if (typeof window === 'undefined') return 'list'
+    return window.localStorage.getItem(persistedHighlightsViewKey) === 'single' ? 'single' : 'list'
+  })
+  const [highlightCursor, setHighlightCursor] = useState(0)
+  const [hideNoise, setHideNoise] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(persistedHideNoiseKey) === 'true'
+  })
+  const [referencesAreNoise, setReferencesAreNoise] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(persistedRefsAreNoiseKey) === 'true'
+  })
+  const [openDocIds, setOpenDocIds] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return []
+    try {
+      const raw = window.localStorage.getItem(persistedOpenTabsKey)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        return parsed.filter((value): value is string => typeof value === 'string')
+      }
+    } catch {
+      // ignore corrupted cache
+    }
+    return []
+  })
+  const [switcherOpen, setSwitcherOpen] = useState(false)
+  const [switcherQuery, setSwitcherQuery] = useState('')
+  const [switcherCursor, setSwitcherCursor] = useState(0)
+  const [tocOpen, setTocOpen] = useState(false)
+  const [tocQuery, setTocQuery] = useState('')
+  const [tocCursor, setTocCursor] = useState(0)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [scrollHeadingRequest, setScrollHeadingRequest] = useState<{ index: number; ts: number } | null>(null)
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
   const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
   const readerScrollRef = useRef<HTMLDivElement | null>(null)
   const notesScrollRef = useRef<HTMLDivElement | null>(null)
+  const notesTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const notesHighlightRef = useRef<HTMLDivElement | null>(null)
+  const pendingNotesSelectionRef = useRef<{ selStart: number; selEnd: number } | null>(null)
   const activeDocIdRef = useRef<string | null>(null)
+  const settingsMenuRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     void initializeLibrary()
@@ -895,6 +1246,25 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(persistedFocusKey, focusMode ? 'true' : 'false')
   }, [focusMode])
+
+  useEffect(() => {
+    if (!settingsOpen) return
+    const handler = (event: MouseEvent) => {
+      const menu = settingsMenuRef.current
+      if (!menu) return
+      if (menu.contains(event.target as Node)) return
+      setSettingsOpen(false)
+    }
+    const keyHandler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSettingsOpen(false)
+    }
+    window.addEventListener('mousedown', handler)
+    window.addEventListener('keydown', keyHandler)
+    return () => {
+      window.removeEventListener('mousedown', handler)
+      window.removeEventListener('keydown', keyHandler)
+    }
+  }, [settingsOpen])
 
   useEffect(() => {
     window.localStorage.setItem(persistedFontSizeKey, String(readerFontSize))
@@ -913,7 +1283,93 @@ function App() {
   }, [notesTopHeight])
 
   useEffect(() => {
+    window.localStorage.setItem(persistedLabelKey, selectedLabel)
+  }, [selectedLabel])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedNotesModeKey, notesMode)
+  }, [notesMode])
+
+  useEffect(() => {
+    const pending = pendingNotesSelectionRef.current
+    if (!pending) return
+    const textarea = notesTextareaRef.current
+    pendingNotesSelectionRef.current = null
+    if (!textarea) return
+    textarea.focus()
+    textarea.setSelectionRange(pending.selStart, pending.selEnd)
+  }, [notesDraft])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedHighlightsViewKey, highlightsView)
+  }, [highlightsView])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedHideNoiseKey, hideNoise ? 'true' : 'false')
+  }, [hideNoise])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedRefsAreNoiseKey, referencesAreNoise ? 'true' : 'false')
+  }, [referencesAreNoise])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedOpenTabsKey, JSON.stringify(openDocIds))
+  }, [openDocIds])
+
+  useEffect(() => {
+    if (!activeId) return
+    setOpenDocIds((current) => {
+      const filtered = current.filter((id) => id !== activeId)
+      return [activeId, ...filtered]
+    })
+  }, [activeId])
+
+  useEffect(() => {
+    const validIds = new Set(library.documents.map((doc) => doc.id))
+    setOpenDocIds((current) => {
+      if (!current.length) return current
+      const next = current.filter((id) => validIds.has(id))
+      return next.length === current.length ? current : next
+    })
+  }, [library.documents])
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      const withMod = (event.ctrlKey || event.metaKey) && !event.altKey
+      if (!withMod) return
+      const key = event.key.toLowerCase()
+      if (key === 'p' && !event.shiftKey) {
+        event.preventDefault()
+        setSwitcherQuery('')
+        setSwitcherCursor(0)
+        setSwitcherOpen((current) => !current)
+        return
+      }
+      if (key === 'o' && event.shiftKey) {
+        event.preventDefault()
+        setTocQuery('')
+        setTocCursor(0)
+        setTocOpen((current) => !current)
+        return
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  useEffect(() => {
+    setHighlightCursor((current) => {
+      if (!highlights.length) return 0
+      return Math.min(current, highlights.length - 1)
+    })
+  }, [highlights])
+
+  useEffect(() => {
     if (!focusedHighlight) return
+    const idx = highlights.findIndex((entry) => entry.id === focusedHighlight.id)
+    if (idx >= 0) {
+      setHighlightCursor(idx)
+    }
     const card = highlightCardRefs.current.get(focusedHighlight.id)
     if (!card) return
     card.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -922,7 +1378,7 @@ function App() {
       card.classList.remove('is-flashing')
     }, 1200)
     return () => window.clearTimeout(timer)
-  }, [focusedHighlight])
+  }, [focusedHighlight, highlights])
 
   useEffect(() => {
     if (!lightbox) return
@@ -940,6 +1396,9 @@ function App() {
       setHighlights([])
       setPendingSelection(null)
       activeDocIdRef.current = null
+      return
+    }
+    if (activeDocIdRef.current === activeId) {
       return
     }
     activeDocIdRef.current = activeId
@@ -1030,6 +1489,30 @@ function App() {
       setStatus(stringifyError(error))
     } finally {
       setLoadingLibrary(false)
+    }
+  }
+
+  async function handleReindex() {
+    if (reindexing) return
+    setReindexing(true)
+    setStatus('Rebuilding index…')
+    try {
+      const response = await desktopCommand<{ scanned: number; records: number; errors: number }>(
+        'reindex_library',
+        { root: rootPath || null },
+      )
+      const parts = [
+        `Index rebuilt: ${response.records} records from ${response.scanned} documents`,
+      ]
+      if (response.errors) {
+        parts.push(`${response.errors} error(s)`)
+      }
+      setStatus(parts.join(' — '))
+      await refreshLibrary()
+    } catch (error) {
+      setStatus(stringifyError(error))
+    } finally {
+      setReindexing(false)
     }
   }
 
@@ -1178,24 +1661,48 @@ function App() {
     }
   }
 
-  async function addHighlightFromSelection() {
+  async function addHighlightFromSelection(variant: NoiseVariant = 'highlight') {
     if (!detail || !pendingSelection?.text.trim()) {
       return
     }
     const createdAt = new Date().toISOString()
-    const nextHighlights: Highlight[] = [
-      {
-        id: `${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
-        text: pendingSelection.text.trim(),
-        createdAt,
-        startOffset: pendingSelection.startOffset,
-        endOffset: pendingSelection.endOffset,
-      },
-      ...highlights,
-    ]
+    const nextEntry: Highlight = {
+      id: `${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+      text: pendingSelection.text.trim(),
+      createdAt,
+      startOffset: pendingSelection.startOffset,
+      endOffset: pendingSelection.endOffset,
+    }
+    if (variant === 'noise') {
+      nextEntry.variant = 'noise'
+    }
+    const nextHighlights: Highlight[] = [nextEntry, ...highlights]
     setPendingSelection(null)
     window.getSelection()?.removeAllRanges()
-    await persistHighlights(nextHighlights, 'Saved highlight')
+    await persistHighlights(
+      nextHighlights,
+      variant === 'noise' ? 'Saved noise mark' : 'Saved highlight',
+    )
+  }
+
+  async function toggleHighlightNoise(highlightId: string) {
+    const target = highlights.find((entry) => entry.id === highlightId)
+    if (!target) return
+    const nextVariant: 'noise' | undefined = target.variant === 'noise' ? undefined : 'noise'
+    const nextHighlights: Highlight[] = highlights.map((entry) => {
+      if (entry.id !== highlightId) return entry
+      const updated: Highlight = { ...entry }
+      if (nextVariant) {
+        updated.variant = nextVariant
+      } else {
+        delete updated.variant
+      }
+      return updated
+    })
+    await persistHighlights(
+      nextHighlights,
+      nextVariant === 'noise' ? 'Marked as noise' : 'Removed noise mark',
+    )
   }
 
   async function deleteHighlight(highlightId: string) {
@@ -1229,8 +1736,24 @@ function App() {
   }
 
   function closeDocument() {
-    setActiveId(null)
+    const currentId = detail?.summary.id ?? activeId
+    if (currentId) {
+      const remainingBuffers = openDocIds.filter((id) => id !== currentId)
+      setOpenDocIds(remainingBuffers)
+      const nextActive = remainingBuffers[0] ?? null
+      setActiveId(nextActive)
+    } else {
+      setActiveId(null)
+    }
     setStatus('Closed document')
+  }
+
+  function closeBufferEntry(id: string) {
+    const remainingBuffers = openDocIds.filter((entry) => entry !== id)
+    setOpenDocIds(remainingBuffers)
+    if (activeId === id) {
+      setActiveId(remainingBuffers[0] ?? null)
+    }
   }
 
   async function deleteCurrentDocument() {
@@ -1248,6 +1771,7 @@ function App() {
       } catch {
         // ignore
       }
+      setOpenDocIds((current) => current.filter((id) => id !== detail.summary.id))
       setActiveId(null)
       await refreshLibrary()
       setStatus(`Removed ${title}`)
@@ -1330,6 +1854,135 @@ function App() {
     window.setTimeout(() => mark.classList.remove('is-flashing'), 1200)
   }
 
+  function goToHighlight(nextIndex: number) {
+    const list = highlights.filter((entry) => entry.variant !== 'noise')
+    if (!list.length) return
+    const total = list.length
+    const normalized = ((nextIndex % total) + total) % total
+    setHighlightCursor(normalized)
+    const target = list[normalized]
+    if (target) {
+      scrollToHighlight(target.id)
+    }
+  }
+
+  function renderHighlightCard(highlight: Highlight) {
+    const isNoise = highlight.variant === 'noise'
+    return (
+      <article
+        className={`highlight-card${isNoise ? ' is-noise' : ''}`}
+        key={highlight.id}
+        ref={(element) => {
+          if (element) {
+            highlightCardRefs.current.set(highlight.id, element)
+          } else {
+            highlightCardRefs.current.delete(highlight.id)
+          }
+        }}
+        onClick={() => scrollToHighlight(highlight.id)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            scrollToHighlight(highlight.id)
+          }
+        }}
+      >
+        {isNoise ? <span className="highlight-badge">NOISE</span> : null}
+        <p>{highlight.text}</p>
+        {highlightCommentDraft?.id === highlight.id ? (
+          <div
+            className="highlight-comment-editor"
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <textarea
+              className="highlight-comment-input"
+              value={highlightCommentDraft.value}
+              onChange={(event) =>
+                setHighlightCommentDraft({ id: highlight.id, value: event.target.value })
+              }
+              placeholder="Add a short comment or reminder for this highlight…"
+              rows={2}
+              autoFocus
+            />
+            <div className="inline-row">
+              <button
+                className="ghost-button highlight-button"
+                onClick={() => void saveHighlightComment()}
+                disabled={savingHighlights}
+              >
+                {savingHighlights ? 'Saving…' : 'Save comment'}
+              </button>
+              <button
+                className="ghost-button highlight-button"
+                onClick={() => setHighlightCommentDraft(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : highlight.comment ? (
+          <p className="highlight-comment">{highlight.comment}</p>
+        ) : null}
+        <div className="highlight-actions">
+          <span className="highlight-meta">{formatHighlightDate(highlight.createdAt)}</span>
+          <div className="inline-row">
+            <button
+              className="ghost-button highlight-button"
+              onClick={(event) => {
+                event.stopPropagation()
+                void copyTextToClipboard(highlight.text, 'highlight')
+              }}
+            >
+              Copy
+            </button>
+            <button
+              className="ghost-button highlight-button"
+              onClick={(event) => {
+                event.stopPropagation()
+                insertHighlightAsQuote(highlight)
+              }}
+            >
+              Quote
+            </button>
+            <button
+              className="ghost-button highlight-button"
+              onClick={(event) => {
+                event.stopPropagation()
+                openHighlightComment(highlight)
+              }}
+            >
+              {highlight.comment ? 'Edit note' : 'Add note'}
+            </button>
+            <button
+              className="ghost-button highlight-button"
+              onClick={(event) => {
+                event.stopPropagation()
+                void toggleHighlightNoise(highlight.id)
+              }}
+              disabled={savingHighlights}
+              title={isNoise ? 'Convert back to highlight' : 'Convert to noise (strikethrough, hidable)'}
+            >
+              {isNoise ? 'Un-noise' : 'Noise'}
+            </button>
+            <button
+              className="ghost-button highlight-button"
+              onClick={(event) => {
+                event.stopPropagation()
+                void deleteHighlight(highlight.id)
+              }}
+              disabled={savingHighlights}
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      </article>
+    )
+  }
+
   async function updateRating(nextRating: number) {
     if (!detail) {
       return
@@ -1390,6 +2043,62 @@ function App() {
     setNotesDraft((current) => `${current.trimEnd()}${separator}${quoted}\n`)
     setPendingSelection(null)
     window.getSelection()?.removeAllRanges()
+  }
+
+  function applyNotesTransform(transform: NotesTransform) {
+    const textarea = notesTextareaRef.current
+    if (!textarea) return
+    const { value, selectionStart, selectionEnd } = textarea
+    const result = transform(value, selectionStart ?? 0, selectionEnd ?? 0)
+    pendingNotesSelectionRef.current = { selStart: result.selStart, selEnd: result.selEnd }
+    setNotesDraft(result.value)
+  }
+
+  function onNotesKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (!(event.ctrlKey || event.metaKey)) return
+    if (event.altKey) return
+    const key = event.key.toLowerCase()
+    const shift = event.shiftKey
+
+    if (!shift) {
+      if (/^[0-6]$/.test(key)) {
+        event.preventDefault()
+        applyNotesTransform(setLineHeadingTransform(Number(key)))
+        return
+      }
+      if (key === 'b') {
+        event.preventDefault()
+        applyNotesTransform(wrapSelectionTransform('**', '**', 'bold text'))
+        return
+      }
+      if (key === 'i') {
+        event.preventDefault()
+        applyNotesTransform(wrapSelectionTransform('*', '*', 'italic text'))
+        return
+      }
+      if (key === 'k') {
+        event.preventDefault()
+        applyNotesTransform(insertLinkTransform())
+        return
+      }
+      return
+    }
+
+    if (key === 'k') {
+      event.preventDefault()
+      applyNotesTransform(insertCodeBlockTransform())
+      return
+    }
+    if (key === 'q') {
+      event.preventDefault()
+      applyNotesTransform(insertBlockquoteTransform())
+      return
+    }
+    if (key === 'c') {
+      event.preventDefault()
+      applyNotesTransform(wrapSelectionTransform('`', '`', 'code'))
+      return
+    }
   }
 
   function insertHighlightAsQuote(highlight: Highlight) {
@@ -1472,6 +2181,64 @@ function App() {
         return true
       })
 
+  const articleHeadings = useMemo(
+    () => parseHeadings(detail?.markdown ?? ''),
+    [detail?.markdown],
+  )
+
+  const tocCandidates = useMemo(() => {
+    const q = tocQuery.trim().toLowerCase()
+    if (!q) return articleHeadings
+    return articleHeadings.filter((entry) => entry.text.toLowerCase().includes(q))
+  }, [articleHeadings, tocQuery])
+
+  useEffect(() => {
+    if (!tocOpen) return
+    if (tocCursor >= tocCandidates.length) {
+      setTocCursor(Math.max(0, tocCandidates.length - 1))
+    }
+  }, [tocCandidates, tocOpen, tocCursor])
+
+  function selectTocEntry(entry: HeadingEntry) {
+    setTocOpen(false)
+    setTocQuery('')
+    setTocCursor(0)
+    setScrollHeadingRequest({ index: entry.index, ts: Date.now() })
+  }
+
+  const openDocsSet = useMemo(() => new Set(openDocIds), [openDocIds])
+  const switcherCandidates = useMemo(() => {
+    const idToDoc = new Map(library.documents.map((doc) => [doc.id, doc]))
+    const openDocs: DocumentSummary[] = []
+    for (const id of openDocIds) {
+      const doc = idToDoc.get(id)
+      if (doc) openDocs.push(doc)
+    }
+    const rest = library.documents.filter((doc) => !openDocsSet.has(doc.id))
+    const all = [...openDocs, ...rest]
+    const q = switcherQuery.trim().toLowerCase()
+    if (!q) return all
+    const tokens = q.split(/\s+/).filter(Boolean)
+    return all.filter((doc) => {
+      const hay = `${doc.title} ${doc.label ?? ''} ${doc.sourceSite ?? ''} ${doc.excerpt ?? ''}`.toLowerCase()
+      return tokens.every((token) => hay.includes(token))
+    })
+  }, [library.documents, openDocIds, openDocsSet, switcherQuery])
+
+  useEffect(() => {
+    if (!switcherOpen) return
+    if (switcherCursor >= switcherCandidates.length) {
+      setSwitcherCursor(Math.max(0, switcherCandidates.length - 1))
+    }
+  }, [switcherCandidates, switcherOpen, switcherCursor])
+
+  function selectSwitcherCandidate(id: string) {
+    setSwitcherOpen(false)
+    setSwitcherQuery('')
+    setSwitcherCursor(0)
+    startTransition(() => setActiveId(id))
+  }
+
   const shellStyle = {
     '--left-pane-width': `${leftPaneWidth}px`,
     '--right-pane-width': `${rightPaneWidth}px`,
@@ -1485,9 +2252,203 @@ function App() {
     () => normalizeReaderMarkdown(notesDraft),
     [notesDraft],
   )
+  const notesHighlightHtml = useMemo(() => {
+    const rendered = highlightNotesMarkdown(notesDraft)
+    return rendered + (notesDraft.endsWith('\n') || !notesDraft ? '\n ' : '')
+  }, [notesDraft])
+  const visibleHighlights = useMemo(
+    () => highlights.filter((entry) => entry.variant !== 'noise'),
+    [highlights],
+  )
 
   return (
     <div className={`shell${focusMode ? ' focus-mode' : ''}`} style={shellStyle} data-theme={theme}>
+      {switcherOpen ? (
+        <div
+          className="switcher-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Switch document"
+          onClick={() => setSwitcherOpen(false)}
+        >
+          <div className="switcher-dialog" onClick={(event) => event.stopPropagation()}>
+            <input
+              className="switcher-input"
+              type="text"
+              autoFocus
+              placeholder="Switch document… (open buffers first, then library)"
+              value={switcherQuery}
+              onChange={(event) => {
+                setSwitcherQuery(event.target.value)
+                setSwitcherCursor(0)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  setSwitcherOpen(false)
+                  return
+                }
+                if (event.key === 'ArrowDown') {
+                  event.preventDefault()
+                  setSwitcherCursor((current) =>
+                    Math.min(switcherCandidates.length - 1, current + 1),
+                  )
+                  return
+                }
+                if (event.key === 'ArrowUp') {
+                  event.preventDefault()
+                  setSwitcherCursor((current) => Math.max(0, current - 1))
+                  return
+                }
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  const target = switcherCandidates[switcherCursor]
+                  if (target) {
+                    selectSwitcherCandidate(target.id)
+                  }
+                }
+              }}
+            />
+            <div className="switcher-list" role="listbox">
+              {switcherCandidates.length === 0 ? (
+                <div className="switcher-empty">No matching documents.</div>
+              ) : (
+                switcherCandidates.slice(0, 50).map((doc, index) => {
+                  const isOpen = openDocsSet.has(doc.id)
+                  const isCursor = index === switcherCursor
+                  const isActive = doc.id === activeId
+                  return (
+                    <button
+                      key={doc.id}
+                      type="button"
+                      className={`switcher-item${isCursor ? ' is-cursor' : ''}${isActive ? ' is-active' : ''}`}
+                      role="option"
+                      aria-selected={isCursor}
+                      onMouseEnter={() => setSwitcherCursor(index)}
+                      onClick={() => selectSwitcherCandidate(doc.id)}
+                    >
+                      <span className={`switcher-dot${isOpen ? ' is-open' : ''}`} aria-hidden="true" />
+                      <span className="switcher-item-body">
+                        <span className="switcher-item-title">{doc.title}</span>
+                        <span className="switcher-item-meta">
+                          {doc.label ?? 'unlabeled'} · {doc.sourceSite ?? 'local'}
+                          {doc.rating > 0 ? ` · ${'★'.repeat(doc.rating)}` : ''}
+                        </span>
+                      </span>
+                      {isOpen ? (
+                        <span
+                          className="switcher-close"
+                          role="button"
+                          tabIndex={-1}
+                          aria-label={`Close ${doc.title}`}
+                          title="Remove from open buffers"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            closeBufferEntry(doc.id)
+                          }}
+                        >
+                          ×
+                        </span>
+                      ) : null}
+                    </button>
+                  )
+                })
+              )}
+            </div>
+            <div className="switcher-footer">
+              <span>↑↓ navigate · ↵ open · Esc close · Ctrl+P toggle</span>
+              <span>{openDocIds.length} open</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {tocOpen ? (
+        <div
+          className="switcher-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Jump to heading"
+          onClick={() => setTocOpen(false)}
+        >
+          <div className="switcher-dialog" onClick={(event) => event.stopPropagation()}>
+            <input
+              className="switcher-input"
+              type="text"
+              autoFocus
+              placeholder={
+                articleHeadings.length
+                  ? 'Jump to section…'
+                  : 'No headings in current document'
+              }
+              disabled={!articleHeadings.length}
+              value={tocQuery}
+              onChange={(event) => {
+                setTocQuery(event.target.value)
+                setTocCursor(0)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  setTocOpen(false)
+                  return
+                }
+                if (event.key === 'ArrowDown') {
+                  event.preventDefault()
+                  setTocCursor((current) =>
+                    Math.min(tocCandidates.length - 1, current + 1),
+                  )
+                  return
+                }
+                if (event.key === 'ArrowUp') {
+                  event.preventDefault()
+                  setTocCursor((current) => Math.max(0, current - 1))
+                  return
+                }
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  const target = tocCandidates[tocCursor]
+                  if (target) {
+                    selectTocEntry(target)
+                  }
+                }
+              }}
+            />
+            <div className="switcher-list" role="listbox">
+              {tocCandidates.length === 0 ? (
+                <div className="switcher-empty">
+                  {articleHeadings.length ? 'No matching headings.' : 'This document has no headings.'}
+                </div>
+              ) : (
+                tocCandidates.slice(0, 200).map((entry, index) => {
+                  const isCursor = index === tocCursor
+                  return (
+                    <button
+                      key={`${entry.index}-${entry.text}`}
+                      type="button"
+                      className={`switcher-item toc-item toc-level-${entry.level}${isCursor ? ' is-cursor' : ''}`}
+                      role="option"
+                      aria-selected={isCursor}
+                      onMouseEnter={() => setTocCursor(index)}
+                      onClick={() => selectTocEntry(entry)}
+                    >
+                      <span className="toc-bullet" aria-hidden="true">
+                        H{entry.level}
+                      </span>
+                      <span className="switcher-item-body">
+                        <span className="switcher-item-title">{entry.text}</span>
+                      </span>
+                    </button>
+                  )
+                })
+              )}
+            </div>
+            <div className="switcher-footer">
+              <span>↑↓ navigate · ↵ jump · Esc close · Ctrl+Shift+O toggle</span>
+              <span>{articleHeadings.length} headings</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {lightbox ? (
         <div
           className="lightbox-overlay"
@@ -1551,6 +2512,14 @@ function App() {
               />
               <button className="ghost-button" onClick={() => void refreshLibrary()} disabled={loadingLibrary}>
                 Reload
+              </button>
+              <button
+                className="ghost-button"
+                onClick={() => void handleReindex()}
+                disabled={reindexing || loadingLibrary}
+                title="Rebuild output/index.jsonl from the library bundles"
+              >
+                {reindexing ? 'Re-indexing…' : 'Re-index'}
               </button>
             </div>
           </div>
@@ -1669,58 +2638,126 @@ function App() {
                 Download source PDF
               </a>
             ) : null}
-            {detail?.summary.bibPath ? <Badge>bibliography</Badge> : null}
-            {detail?.summary.highlightCount ? <Badge>{detail.summary.highlightCount} highlights</Badge> : null}
             <div className="reader-toolbar" role="toolbar" aria-label="Reader controls">
-              <div className="font-size-controls" aria-label="Reader font size">
-                <button
-                  type="button"
-                  className="ghost-button reader-toolbar-button"
-                  onClick={() => adjustFontSize(-FONT_SIZE_STEP)}
-                  disabled={readerFontSize <= MIN_FONT_SIZE + 1e-6}
-                  aria-label="Decrease font size"
-                  title="Decrease font size"
-                >
-                  A−
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button reader-toolbar-button"
-                  onClick={resetFontSize}
-                  aria-label="Reset font size"
-                  title="Reset font size"
-                >
-                  A
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button reader-toolbar-button"
-                  onClick={() => adjustFontSize(FONT_SIZE_STEP)}
-                  disabled={readerFontSize >= MAX_FONT_SIZE - 1e-6}
-                  aria-label="Increase font size"
-                  title="Increase font size"
-                >
-                  A+
-                </button>
-              </div>
-              <button
-                type="button"
-                className={`ghost-button reader-toolbar-button${focusMode ? ' is-active' : ''}`}
-                onClick={toggleFocusMode}
-                aria-pressed={focusMode}
-                title={focusMode ? 'Exit focus mode' : 'Focus mode — hide side panels'}
-              >
-                {focusMode ? 'Exit focus' : 'Focus'}
-              </button>
               <button
                 type="button"
                 className="ghost-button reader-toolbar-button"
-                onClick={toggleTheme}
-                aria-label="Toggle dark mode"
-                title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+                onClick={() => {
+                  setSwitcherQuery('')
+                  setSwitcherCursor(0)
+                  setSwitcherOpen(true)
+                }}
+                title="Switch document (Ctrl+P)"
+                aria-label="Open document switcher"
               >
-                {theme === 'dark' ? 'Light' : 'Dark'}
+                Docs{openDocIds.length ? ` · ${openDocIds.length}` : ''}
               </button>
+              {detail && articleHeadings.length ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => {
+                    setTocQuery('')
+                    setTocCursor(0)
+                    setTocOpen(true)
+                  }}
+                  title="Jump to heading (Ctrl+Shift+O)"
+                  aria-label="Open table of contents"
+                >
+                  TOC · {articleHeadings.length}
+                </button>
+              ) : null}
+              <div className="settings-wrap" ref={settingsMenuRef}>
+                <button
+                  type="button"
+                  className={`ghost-button reader-toolbar-button${settingsOpen ? ' is-active' : ''}`}
+                  onClick={() => setSettingsOpen((current) => !current)}
+                  aria-haspopup="menu"
+                  aria-expanded={settingsOpen}
+                  title="Reader settings"
+                >
+                  Settings
+                </button>
+                {settingsOpen ? (
+                  <div className="settings-menu" role="menu">
+                    <div className="settings-row">
+                      <span className="settings-label">Font size</span>
+                      <div className="font-size-controls" aria-label="Reader font size">
+                        <button
+                          type="button"
+                          className="ghost-button reader-toolbar-button"
+                          onClick={() => adjustFontSize(-FONT_SIZE_STEP)}
+                          disabled={readerFontSize <= MIN_FONT_SIZE + 1e-6}
+                          aria-label="Decrease font size"
+                          title="Decrease font size"
+                        >
+                          A−
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button reader-toolbar-button"
+                          onClick={resetFontSize}
+                          aria-label="Reset font size"
+                          title="Reset font size"
+                        >
+                          A
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button reader-toolbar-button"
+                          onClick={() => adjustFontSize(FONT_SIZE_STEP)}
+                          disabled={readerFontSize >= MAX_FONT_SIZE - 1e-6}
+                          aria-label="Increase font size"
+                          title="Increase font size"
+                        >
+                          A+
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`settings-item${hideNoise ? ' is-active' : ''}`}
+                      onClick={() => setHideNoise((current) => !current)}
+                      role="menuitemcheckbox"
+                      aria-checked={hideNoise}
+                    >
+                      <span>Hide noise</span>
+                      <span className="settings-check">{hideNoise ? '✓' : ''}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-item${referencesAreNoise ? ' is-active' : ''}`}
+                      onClick={() => setReferencesAreNoise((current) => !current)}
+                      role="menuitemcheckbox"
+                      aria-checked={referencesAreNoise}
+                      title="Treat the References/Bibliography section as noise"
+                    >
+                      <span>References = noise</span>
+                      <span className="settings-check">{referencesAreNoise ? '✓' : ''}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-item${focusMode ? ' is-active' : ''}`}
+                      onClick={toggleFocusMode}
+                      role="menuitemcheckbox"
+                      aria-checked={focusMode}
+                    >
+                      <span>Focus mode</span>
+                      <span className="settings-check">{focusMode ? '✓' : ''}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-item${theme === 'dark' ? ' is-active' : ''}`}
+                      onClick={toggleTheme}
+                      role="menuitemcheckbox"
+                      aria-checked={theme === 'dark'}
+                    >
+                      <span>Dark theme</span>
+                      <span className="settings-check">{theme === 'dark' ? '✓' : ''}</span>
+                    </button>
+                  </div>
+                ) : null}
+              </div>
               {detail ? (
                 <button
                   type="button"
@@ -1748,8 +2785,16 @@ function App() {
           <div className="selection-banner">
             <span>Selection ready to save or quote.</span>
             <div className="inline-row">
-              <button className="ghost-button" onClick={() => void addHighlightFromSelection()} disabled={savingHighlights}>
+              <button className="ghost-button" onClick={() => void addHighlightFromSelection('highlight')} disabled={savingHighlights}>
                 {savingHighlights ? 'Saving…' : 'Add highlight'}
+              </button>
+              <button
+                className="ghost-button"
+                onClick={() => void addHighlightFromSelection('noise')}
+                disabled={savingHighlights}
+                title="Mark selection as noise (strikethrough, hidden when noise is hidden)"
+              >
+                Mark as noise
               </button>
               <button className="ghost-button" onClick={insertSelectionAsQuote}>
                 Quote selection
@@ -1766,6 +2811,9 @@ function App() {
             articlePath={detail?.summary.articlePath}
             sourceSite={detail?.summary.sourceSite}
             fontSize={readerFontSize}
+            scrollHeadingRequest={scrollHeadingRequest}
+            hideNoise={hideNoise}
+            referencesAreNoise={referencesAreNoise}
             onCopy={copyTextToClipboard}
             onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
             onImageOpen={(src, alt) => setLightbox({ src, alt })}
@@ -1820,12 +2868,31 @@ function App() {
             </div>
 
             {notesMode === 'markdown' ? (
-              <textarea
-                className="notes-editor"
-                value={notesDraft}
-                onChange={(event) => setNotesDraft(event.target.value)}
-                placeholder="Write notes here. Use markdown. Select text in the article and quote it into this pane."
-              />
+              <div className="notes-editor-wrap">
+                <div
+                  ref={notesHighlightRef}
+                  className="notes-editor-highlights"
+                  aria-hidden="true"
+                  dangerouslySetInnerHTML={{ __html: notesHighlightHtml }}
+                />
+                <textarea
+                  ref={notesTextareaRef}
+                  className="notes-editor"
+                  value={notesDraft}
+                  onChange={(event) => setNotesDraft(event.target.value)}
+                  onKeyDown={onNotesKeyDown}
+                  onScroll={(event) => {
+                    const target = event.currentTarget
+                    const overlay = notesHighlightRef.current
+                    if (overlay) {
+                      overlay.scrollTop = target.scrollTop
+                      overlay.scrollLeft = target.scrollLeft
+                    }
+                  }}
+                  spellCheck={false}
+                  placeholder="Write notes here. Markdown shortcuts: Ctrl+1..6 headings, Ctrl+B bold, Ctrl+I italic, Ctrl+K link, Ctrl+Shift+K code block, Ctrl+Shift+Q quote, Ctrl+Shift+C inline code."
+                />
+              </div>
             ) : (
               <div className="notes-preview markdown-card">
                 {notesDraft.trim() ? (
@@ -1888,111 +2955,69 @@ function App() {
 
           <div className="notes-bottom-scroll">
           <section className="info-card">
-            <h3>Highlights</h3>
-            {highlights.length ? (
-              <div className="highlight-list">
-                {highlights.map((highlight) => (
-                  <article
-                    className="highlight-card"
-                    key={highlight.id}
-                    ref={(element) => {
-                      if (element) {
-                        highlightCardRefs.current.set(highlight.id, element)
-                      } else {
-                        highlightCardRefs.current.delete(highlight.id)
-                      }
-                    }}
-                    onClick={() => scrollToHighlight(highlight.id)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault()
-                        scrollToHighlight(highlight.id)
-                      }
-                    }}
+            <div className="highlights-header">
+              <h3>Highlights</h3>
+              {visibleHighlights.length ? (
+                <div className="notes-mode-toggle">
+                  <button
+                    className={`ghost-button ${highlightsView === 'list' ? 'is-active' : ''}`}
+                    onClick={() => setHighlightsView('list')}
+                    title="Show all highlights as a list"
                   >
-                    <p>{highlight.text}</p>
-                    {highlightCommentDraft?.id === highlight.id ? (
-                      <div
-                        className="highlight-comment-editor"
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <textarea
-                          className="highlight-comment-input"
-                          value={highlightCommentDraft.value}
-                          onChange={(event) =>
-                            setHighlightCommentDraft({ id: highlight.id, value: event.target.value })
-                          }
-                          placeholder="Add a short comment or reminder for this highlight…"
-                          rows={2}
-                          autoFocus
-                        />
-                        <div className="inline-row">
-                          <button
-                            className="ghost-button highlight-button"
-                            onClick={() => void saveHighlightComment()}
-                            disabled={savingHighlights}
-                          >
-                            {savingHighlights ? 'Saving…' : 'Save comment'}
-                          </button>
-                          <button
-                            className="ghost-button highlight-button"
-                            onClick={() => setHighlightCommentDraft(null)}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    ) : highlight.comment ? (
-                      <p className="highlight-comment">{highlight.comment}</p>
-                    ) : null}
-                    <div className="highlight-actions">
-                      <span className="highlight-meta">{formatHighlightDate(highlight.createdAt)}</span>
-                      <div className="inline-row">
+                    List
+                  </button>
+                  <button
+                    className={`ghost-button ${highlightsView === 'single' ? 'is-active' : ''}`}
+                    onClick={() => setHighlightsView('single')}
+                    title="Show one highlight at a time"
+                  >
+                    Single
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {visibleHighlights.length ? (
+              highlightsView === 'single' ? (
+                (() => {
+                  const total = visibleHighlights.length
+                  const safeIndex = Math.min(Math.max(0, highlightCursor), total - 1)
+                  const highlight = visibleHighlights[safeIndex]
+                  return (
+                    <div className="highlight-single">
+                      <div className="highlight-pager">
                         <button
+                          type="button"
                           className="ghost-button highlight-button"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void copyTextToClipboard(highlight.text, 'highlight')
-                          }}
+                          onClick={() => goToHighlight(safeIndex - 1)}
+                          disabled={total <= 1}
+                          aria-label="Previous highlight"
+                          title="Previous highlight"
                         >
-                          Copy
+                          ‹ Prev
                         </button>
+                        <span className="highlight-pager-count">
+                          {safeIndex + 1} / {total}
+                        </span>
                         <button
+                          type="button"
                           className="ghost-button highlight-button"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            insertHighlightAsQuote(highlight)
-                          }}
+                          onClick={() => goToHighlight(safeIndex + 1)}
+                          disabled={total <= 1}
+                          aria-label="Next highlight"
+                          title="Next highlight"
                         >
-                          Quote
-                        </button>
-                        <button
-                          className="ghost-button highlight-button"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            openHighlightComment(highlight)
-                          }}
-                        >
-                          {highlight.comment ? 'Edit note' : 'Add note'}
-                        </button>
-                        <button
-                          className="ghost-button highlight-button"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void deleteHighlight(highlight.id)
-                          }}
-                          disabled={savingHighlights}
-                        >
-                          Delete
+                          Next ›
                         </button>
                       </div>
+                      {renderHighlightCard(highlight)}
                     </div>
-                  </article>
-                ))}
-              </div>
+                  )
+                })()
+              ) : (
+                <div className="highlight-list">
+                  {visibleHighlights.map((highlight) => renderHighlightCard(highlight))}
+                </div>
+              )
             ) : (
               <p className="search-hint">Select text in the article, then add it as a highlight.</p>
             )}
@@ -2019,10 +3044,6 @@ function App() {
       </aside>
     </div>
   )
-}
-
-function Badge({ children }: { children: React.ReactNode }) {
-  return <span className="badge">{children}</span>
 }
 
 type StarRatingProps = {
