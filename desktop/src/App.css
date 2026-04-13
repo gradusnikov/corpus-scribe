@@ -1099,18 +1099,6 @@ select {
   color: var(--color-heading);
 }
 
-.bibliography-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.bibliography-header h3 {
-  margin: 0;
-}
-
 .info-card pre,
 .status-bar {
   margin: 0;

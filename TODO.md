@@ -63,7 +63,7 @@
 ## Bibliography
 
 1. [x] Feature: Allow to copy to the Clipboard
-1. [ ] Feature: Remove Bibliography. Instead add a button in Reader "Cite". When pressed copy citation to clipboard. Toast confirmation.
+1. [x] Feature: Remove Bibliography. Instead add a button in Reader "Cite". When pressed copy citation to clipboard. Toast confirmation.
 
 ## Related
 

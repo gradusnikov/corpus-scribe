@@ -3013,6 +3013,17 @@ function App() {
                   Info
                 </button>
               ) : null}
+              {detail?.bibliography ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => void copyTextToClipboard(detail.bibliography, 'citation')}
+                  title="Copy citation (BibTeX) to clipboard"
+                  aria-label="Copy citation to clipboard"
+                >
+                  Cite
+                </button>
+              ) : null}
               <div className="settings-wrap" ref={settingsMenuRef}>
                 <button
                   type="button"
@@ -3371,20 +3382,6 @@ function App() {
             )}
           </section>
 
-          <section className="info-card">
-            <div className="bibliography-header">
-              <h3>Bibliography</h3>
-              {detail?.bibliography ? (
-                <button
-                  className="ghost-button highlight-button"
-                  onClick={() => void copyTextToClipboard(detail.bibliography, 'bibliography')}
-                >
-                  Copy
-                </button>
-              ) : null}
-            </div>
-            <pre>{detail?.bibliography || 'No bibliography file available.'}</pre>
-          </section>
           </div>
         </div>
 
