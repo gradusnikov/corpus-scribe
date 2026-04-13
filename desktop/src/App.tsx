@@ -328,6 +328,79 @@ function quoteMarkdown(text: string) {
     .join('\n')
 }
 
+function collectFindRanges(root: HTMLElement, needle: string): Range[] {
+  const matches: Range[] = []
+  if (!needle) return matches
+  const lowered = needle.toLowerCase()
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.textContent || !node.textContent.trim()) {
+        return NodeFilter.FILTER_REJECT
+      }
+      const parent = node.parentElement
+      if (!parent) return NodeFilter.FILTER_REJECT
+      if (parent.closest('script, style, .katex-html, .code-copy-button, .table-copy-button')) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  let current = walker.nextNode() as Text | null
+  while (current) {
+    const text = current.textContent ?? ''
+    const lowerText = text.toLowerCase()
+    let index = 0
+    while (index < lowerText.length) {
+      const found = lowerText.indexOf(lowered, index)
+      if (found < 0) break
+      const range = document.createRange()
+      range.setStart(current, found)
+      range.setEnd(current, found + needle.length)
+      matches.push(range)
+      index = found + Math.max(1, needle.length)
+    }
+    current = walker.nextNode() as Text | null
+  }
+  return matches
+}
+
+type HighlightConstructor = new (...ranges: Range[]) => object
+
+function supportsCssHighlights(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof (window as unknown as { Highlight?: unknown }).Highlight === 'function' &&
+    typeof CSS !== 'undefined' &&
+    'highlights' in CSS
+  )
+}
+
+function setFindHighlights(matches: Range[], activeIndex: number) {
+  if (!supportsCssHighlights()) return
+  const HighlightCtor = (window as unknown as { Highlight: HighlightConstructor }).Highlight
+  const registry = (CSS as unknown as { highlights: Map<string, object> }).highlights
+  if (!matches.length) {
+    registry.delete('find-match')
+    registry.delete('find-active')
+    return
+  }
+  const activeRange = matches[activeIndex]
+  const others = matches.filter((_, index) => index !== activeIndex)
+  registry.set('find-match', new HighlightCtor(...others))
+  if (activeRange) {
+    registry.set('find-active', new HighlightCtor(activeRange))
+  } else {
+    registry.delete('find-active')
+  }
+}
+
+function clearFindHighlights() {
+  if (!supportsCssHighlights()) return
+  const registry = (CSS as unknown as { highlights: Map<string, object> }).highlights
+  registry.delete('find-match')
+  registry.delete('find-active')
+}
+
 function parseHeadings(markdown: string): HeadingEntry[] {
   if (!markdown) return []
   const lines = markdown.split('\n')
@@ -1330,6 +1403,12 @@ function App() {
   const [focusedHighlight, setFocusedHighlight] = useState<{ id: string; ts: number } | null>(null)
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null)
   const [infoOpen, setInfoOpen] = useState(false)
+  const [findOpen, setFindOpen] = useState(false)
+  const [findQuery, setFindQuery] = useState('')
+  const [findMatchCount, setFindMatchCount] = useState(0)
+  const [findCursor, setFindCursor] = useState(0)
+  const findMatchesRef = useRef<Range[]>([])
+  const findInputRef = useRef<HTMLInputElement | null>(null)
   const highlightCardRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -1614,8 +1693,79 @@ function App() {
   }, [infoOpen])
 
   useEffect(() => {
-    if (!detail) setInfoOpen(false)
+    if (!detail) {
+      setInfoOpen(false)
+      setFindOpen(false)
+      setFindQuery('')
+    }
   }, [detail?.summary.id])
+
+  useEffect(() => {
+    if (!findOpen) {
+      findMatchesRef.current = []
+      setFindMatchCount(0)
+      setFindCursor(0)
+      clearFindHighlights()
+      return
+    }
+    const root = document.querySelector('.markdown-body')
+    if (!(root instanceof HTMLElement)) return
+    const needle = findQuery.trim()
+    if (!needle) {
+      findMatchesRef.current = []
+      setFindMatchCount(0)
+      setFindCursor(0)
+      clearFindHighlights()
+      return
+    }
+    const matches = collectFindRanges(root, needle)
+    findMatchesRef.current = matches
+    setFindMatchCount(matches.length)
+    setFindCursor((current) => {
+      if (!matches.length) return 0
+      return Math.min(current, matches.length - 1)
+    })
+  }, [findOpen, findQuery, detail?.markdown, highlights, referencesAreNoise])
+
+  useEffect(() => {
+    if (!findOpen) return
+    const matches = findMatchesRef.current
+    if (!matches.length) {
+      setFindHighlights([], 0)
+      return
+    }
+    setFindHighlights(matches, findCursor)
+    const active = matches[findCursor]
+    const activeNode = active?.startContainer.parentElement
+    if (activeNode) {
+      activeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [findOpen, findMatchCount, findCursor])
+
+  useEffect(() => {
+    if (!findOpen) return
+    if (findInputRef.current) {
+      findInputRef.current.focus()
+      findInputRef.current.select()
+    }
+  }, [findOpen])
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'f') return
+      if (!detail) return
+      event.preventDefault()
+      setFindOpen(true)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [detail])
+
+  useEffect(() => {
+    return () => {
+      clearFindHighlights()
+    }
+  }, [])
 
   useEffect(() => {
     if (!activeId) {
@@ -3006,6 +3156,18 @@ function App() {
                 <button
                   type="button"
                   className="ghost-button reader-toolbar-button"
+                  onClick={() => setFindOpen((current) => !current)}
+                  title="Find in document (Ctrl+F)"
+                  aria-label="Find in document"
+                  aria-pressed={findOpen}
+                >
+                  Find
+                </button>
+              ) : null}
+              {detail ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
                   onClick={() => setInfoOpen(true)}
                   title="Show document metadata"
                   aria-label="Show document metadata"
@@ -3157,6 +3319,75 @@ function App() {
                 Quote selection
               </button>
             </div>
+          </div>
+        ) : null}
+
+        {findOpen && detail ? (
+          <div className="find-bar" role="search" aria-label="Find in document">
+            <input
+              ref={findInputRef}
+              type="text"
+              className="find-input"
+              placeholder="Find in document…"
+              value={findQuery}
+              onChange={(event) => setFindQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  setFindOpen(false)
+                  return
+                }
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  if (!findMatchCount) return
+                  const step = event.shiftKey ? -1 : 1
+                  setFindCursor((current) => (current + step + findMatchCount) % findMatchCount)
+                }
+              }}
+              aria-label="Search term"
+            />
+            <span className="find-count" aria-live="polite">
+              {findQuery.trim()
+                ? findMatchCount
+                  ? `${findCursor + 1} / ${findMatchCount}`
+                  : '0 / 0'
+                : ''}
+            </span>
+            <button
+              type="button"
+              className="ghost-button reader-toolbar-button"
+              onClick={() => {
+                if (!findMatchCount) return
+                setFindCursor((current) => (current - 1 + findMatchCount) % findMatchCount)
+              }}
+              disabled={!findMatchCount}
+              aria-label="Previous match"
+              title="Previous match (Shift+Enter)"
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              className="ghost-button reader-toolbar-button"
+              onClick={() => {
+                if (!findMatchCount) return
+                setFindCursor((current) => (current + 1) % findMatchCount)
+              }}
+              disabled={!findMatchCount}
+              aria-label="Next match"
+              title="Next match (Enter)"
+            >
+              ↓
+            </button>
+            <button
+              type="button"
+              className="ghost-button reader-toolbar-button"
+              onClick={() => setFindOpen(false)}
+              aria-label="Close find bar"
+              title="Close (Esc)"
+            >
+              ✕
+            </button>
           </div>
         ) : null}
 

@@ -41,7 +41,7 @@
 22. [x] Bug: The text extracted by the highlight tool should maintain formatting and line endings (displayed in Highlights)
 23. [x] Feature: In settings change checkboxes to on/off switches
 24. [x] Feature: Allow to treat images / tables as noise
-25. [ ] Feature: Add search within a document
+25. [x] Feature: Add search within a document
 26. [x] Feature: Add "Info" button to display the frontmatter in a popup
 27. [ ] Feature: Change how the Readable PDFs are generated. Do not generate them automatically - instead lazy generate upon request. The generated pdfs should exclude noise, and include highlights. No need to regenerate the PDF if highlights, or noise is not changed. Default page size should be in settings.
 28. [x] Feature: Exclude Noise from TOC
