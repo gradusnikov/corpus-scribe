@@ -53,6 +53,7 @@ type Highlight = {
   createdAt: string
   startOffset?: number
   endOffset?: number
+  comment?: string
 }
 
 type PendingSelection = {
@@ -62,6 +63,7 @@ type PendingSelection = {
 }
 
 type NotesMode = 'markdown' | 'preview'
+type ThemeMode = 'light' | 'dark'
 
 const emptyLibrary: LibraryIndex = {
   root: '',
@@ -70,6 +72,15 @@ const emptyLibrary: LibraryIndex = {
 }
 
 const persistedRootKey = 'corpus-scribe.desktop.root'
+const persistedThemeKey = 'corpus-scribe.desktop.theme'
+const persistedFontSizeKey = 'corpus-scribe.desktop.readerFontSize'
+const persistedFocusKey = 'corpus-scribe.desktop.focusMode'
+const persistedScrollKeyPrefix = 'corpus-scribe.desktop.scroll.'
+
+const MIN_FONT_SIZE = 0.85
+const MAX_FONT_SIZE = 1.5
+const DEFAULT_FONT_SIZE = 1.06
+const FONT_SIZE_STEP = 0.05
 
 async function desktopCommand<T>(command: string, payload: Record<string, unknown> = {}) {
   switch (command) {
@@ -173,6 +184,20 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       const data = await response.json()
       if (!response.ok || !data.success) {
         throw new Error(data.message ?? 'Failed to update rating')
+      }
+      return data as T
+    }
+    case 'delete_document': {
+      const response = await fetch(`${browserApiBase}/desktop/document/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to delete document')
       }
       return data as T
     }
@@ -497,6 +522,42 @@ type ReaderContentProps = {
   highlights: Highlight[]
   articlePath?: string | null
   sourceSite?: string | null
+  fontSize: number
+  onCopy: (text: string, label: string) => void
+}
+
+function CodeBlock({
+  children,
+  className,
+  onCopyText,
+  ...rest
+}: {
+  children?: React.ReactNode
+  className?: string
+  onCopyText: (text: string, label: string) => void
+  [key: string]: unknown
+}) {
+  const codeRef = useRef<HTMLElement | null>(null)
+  return (
+    <pre className="code-block-wrapper">
+      <button
+        type="button"
+        className="code-copy-button"
+        title="Copy code"
+        onClick={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const text = codeRef.current?.innerText ?? ''
+          onCopyText(text, 'code block')
+        }}
+      >
+        Copy
+      </button>
+      <code ref={codeRef} className={className} {...rest}>
+        {children}
+      </code>
+    </pre>
+  )
 }
 
 const ReaderContent = memo(function ReaderContent({
@@ -505,6 +566,8 @@ const ReaderContent = memo(function ReaderContent({
   highlights,
   articlePath,
   sourceSite,
+  fontSize,
+  onCopy,
 }: ReaderContentProps) {
   const [visibleChunkCount, setVisibleChunkCount] = useState(1)
   const chunks = useMemo(() => splitMarkdownIntoChunks(markdown), [markdown])
@@ -521,6 +584,26 @@ const ReaderContent = memo(function ReaderContent({
     applyInlineHighlights(articleRef.current, highlights)
   }, [highlights, markdown, visibleChunkCount])
 
+  useEffect(() => {
+    const root = articleRef.current
+    if (!root) return
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const equation = target.closest('.katex-display, .katex')
+      if (!equation) return
+      if (target.closest('.code-copy-button')) return
+      const annotation = equation.querySelector('annotation[encoding="application/x-tex"]')
+      const latex = annotation?.textContent?.trim()
+      if (latex) {
+        event.preventDefault()
+        onCopy(latex, 'LaTeX')
+      }
+    }
+    root.addEventListener('click', handleClick)
+    return () => root.removeEventListener('click', handleClick)
+  }, [onCopy, markdown, visibleChunkCount])
+
   if (loading) {
     return <div className="empty-state">Loading document…</div>
   }
@@ -529,8 +612,10 @@ const ReaderContent = memo(function ReaderContent({
     return <div className="empty-state">Choose a document from the library.</div>
   }
 
+  const inlineStyle: CSSProperties = { fontSize: `${fontSize}rem` }
+
   return (
-    <article className="markdown-body" ref={articleRef}>
+    <article className="markdown-body" ref={articleRef} style={inlineStyle}>
       {chunks.slice(0, visibleChunkCount).map((chunk, index) => (
         <section className="markdown-chunk" key={`${index}-${chunk.slice(0, 32)}`}>
           <ReactMarkdown
@@ -548,24 +633,54 @@ const ReaderContent = memo(function ReaderContent({
                   {...props}
                 />
               ),
-              a: ({ node: _node, href = '', children, title, ...props }) => (
-                <a
-                  href={resolveExternalHref(href, sourceSite) ?? '#'}
-                  title={title}
-                  onClick={(event) => {
-                    const target = resolveExternalHref(href, sourceSite)
-                    if (!target) {
+              a: ({ node: _node, href = '', children, title, ...props }) => {
+                const resolvedHref = resolveExternalHref(href, sourceSite)
+                const finalHref = resolvedHref ?? href ?? '#'
+                return (
+                  <a
+                    href={finalHref}
+                    title={title}
+                    target={resolvedHref ? '_blank' : undefined}
+                    rel={resolvedHref ? 'noopener noreferrer' : undefined}
+                    onClick={(event) => {
+                      if (!resolvedHref) {
+                        event.preventDefault()
+                        return
+                      }
                       event.preventDefault()
-                      return
-                    }
-                    event.preventDefault()
-                    window.open(target, '_blank', 'noopener,noreferrer')
-                  }}
-                  {...props}
-                >
-                  {children}
-                </a>
-              ),
+                      window.open(resolvedHref, '_blank', 'noopener,noreferrer')
+                    }}
+                    {...props}
+                  >
+                    {children}
+                  </a>
+                )
+              },
+              pre: ({ children }) => <>{children}</>,
+              code: ({ className, children, ...codeProps }) => {
+                const content = children
+                const asString =
+                  typeof content === 'string'
+                    ? content
+                    : Array.isArray(content)
+                    ? content.map((part) => (typeof part === 'string' ? part : '')).join('')
+                    : ''
+                const isBlock =
+                  (className && className.includes('language-')) ||
+                  asString.includes('\n')
+                if (!isBlock) {
+                  return (
+                    <code className={className} {...codeProps}>
+                      {children}
+                    </code>
+                  )
+                }
+                return (
+                  <CodeBlock className={className} onCopyText={onCopy} {...codeProps}>
+                    {children}
+                  </CodeBlock>
+                )
+              },
             }}
           >
             {chunk}
@@ -616,12 +731,45 @@ function App() {
   const [status, setStatus] = useState('Loading library…')
   const [leftPaneWidth, setLeftPaneWidth] = useState(320)
   const [rightPaneWidth, setRightPaneWidth] = useState(400)
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    if (typeof window === 'undefined') return 'light'
+    const stored = window.localStorage.getItem(persistedThemeKey)
+    return stored === 'dark' ? 'dark' : 'light'
+  })
+  const [focusMode, setFocusMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(persistedFocusKey) === 'true'
+  })
+  const [readerFontSize, setReaderFontSize] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_FONT_SIZE
+    const stored = Number(window.localStorage.getItem(persistedFontSizeKey))
+    return Number.isFinite(stored) && stored >= MIN_FONT_SIZE && stored <= MAX_FONT_SIZE
+      ? stored
+      : DEFAULT_FONT_SIZE
+  })
+  const [highlightCommentDraft, setHighlightCommentDraft] = useState<{ id: string; value: string } | null>(null)
   const deferredSearch = useDeferredValue(search.trim().toLowerCase())
   const dragStateRef = useRef<{ pane: 'left' | 'right'; pointerId: number } | null>(null)
+  const readerScrollRef = useRef<HTMLDivElement | null>(null)
+  const activeDocIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     void initializeLibrary()
   }, [])
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    document.documentElement.dataset.theme = theme
+    window.localStorage.setItem(persistedThemeKey, theme)
+  }, [theme])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedFocusKey, focusMode ? 'true' : 'false')
+  }, [focusMode])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedFontSizeKey, String(readerFontSize))
+  }, [readerFontSize])
 
   useEffect(() => {
     if (!activeId) {
@@ -629,13 +777,43 @@ function App() {
       setNotesDraft('')
       setHighlights([])
       setPendingSelection(null)
+      activeDocIdRef.current = null
       return
     }
+    activeDocIdRef.current = activeId
     const summary = resolveDocumentSummary(activeId)
     if (summary) {
       void loadDocument(summary)
     }
   }, [activeId, library.documents, searchResults])
+
+  const activeDocumentId = detail?.summary.id ?? null
+
+  useEffect(() => {
+    if (!activeDocumentId || !readerScrollRef.current) return
+    const key = `${persistedScrollKeyPrefix}${activeDocumentId}`
+    const stored = Number(window.localStorage.getItem(key))
+    const container = readerScrollRef.current
+    const raf = window.requestAnimationFrame(() => {
+      container.scrollTop = Number.isFinite(stored) && stored > 0 ? stored : 0
+    })
+    return () => window.cancelAnimationFrame(raf)
+  }, [activeDocumentId])
+
+  useEffect(() => {
+    const container = readerScrollRef.current
+    if (!container) return
+    const handleScroll = () => {
+      const currentId = activeDocIdRef.current
+      if (!currentId) return
+      window.localStorage.setItem(
+        `${persistedScrollKeyPrefix}${currentId}`,
+        String(Math.max(0, Math.round(container.scrollTop))),
+      )
+    }
+    container.addEventListener('scroll', handleScroll, { passive: true })
+    return () => container.removeEventListener('scroll', handleScroll)
+  }, [activeDocumentId])
 
   useEffect(() => {
     const handleMouseUp = () => {
@@ -860,12 +1038,81 @@ function App() {
 
   async function deleteHighlight(highlightId: string) {
     const nextHighlights = highlights.filter((entry) => entry.id !== highlightId)
+    if (highlightCommentDraft?.id === highlightId) {
+      setHighlightCommentDraft(null)
+    }
     await persistHighlights(nextHighlights, 'Deleted highlight')
+  }
+
+  function openHighlightComment(highlight: Highlight) {
+    setHighlightCommentDraft({ id: highlight.id, value: highlight.comment ?? '' })
+  }
+
+  async function saveHighlightComment() {
+    if (!highlightCommentDraft) return
+    const target = highlights.find((entry) => entry.id === highlightCommentDraft.id)
+    if (!target) {
+      setHighlightCommentDraft(null)
+      return
+    }
+    const trimmed = highlightCommentDraft.value.trim()
+    const nextHighlights = highlights.map((entry) =>
+      entry.id === highlightCommentDraft.id ? { ...entry, comment: trimmed || undefined } : entry,
+    )
+    setHighlightCommentDraft(null)
+    await persistHighlights(
+      nextHighlights,
+      trimmed ? 'Saved highlight comment' : 'Cleared highlight comment',
+    )
   }
 
   function closeDocument() {
     setActiveId(null)
     setStatus('Closed document')
+  }
+
+  async function deleteCurrentDocument() {
+    if (!detail) return
+    const title = detail.summary.title || 'this article'
+    const confirmed = window.confirm(
+      `Permanently delete "${title}" and all its sibling files? This cannot be undone.`,
+    )
+    if (!confirmed) return
+    setStatus(`Deleting ${title}…`)
+    try {
+      await desktopCommand('delete_document', { articlePath: detail.summary.articlePath })
+      try {
+        window.localStorage.removeItem(`${persistedScrollKeyPrefix}${detail.summary.id}`)
+      } catch {
+        // ignore
+      }
+      setActiveId(null)
+      await refreshLibrary()
+      setStatus(`Removed ${title}`)
+    } catch (error) {
+      setStatus(stringifyError(error))
+    }
+  }
+
+  function adjustFontSize(delta: number) {
+    setReaderFontSize((current) => {
+      const next = Number((current + delta).toFixed(3))
+      if (next < MIN_FONT_SIZE) return MIN_FONT_SIZE
+      if (next > MAX_FONT_SIZE) return MAX_FONT_SIZE
+      return next
+    })
+  }
+
+  function resetFontSize() {
+    setReaderFontSize(DEFAULT_FONT_SIZE)
+  }
+
+  function toggleTheme() {
+    setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
+  }
+
+  function toggleFocusMode() {
+    setFocusMode((current) => !current)
   }
 
   function buildDownloadUrl(path: string) {
@@ -1042,7 +1289,7 @@ function App() {
   )
 
   return (
-    <div className="shell" style={shellStyle}>
+    <div className={`shell${focusMode ? ' focus-mode' : ''}`} style={shellStyle} data-theme={theme}>
       <aside className="sidebar">
         <div className="sidebar-scroll">
           <div className="brand">
@@ -1185,15 +1432,76 @@ function App() {
             ) : null}
             {detail?.summary.bibPath ? <Badge>bibliography</Badge> : null}
             {detail?.summary.highlightCount ? <Badge>{detail.summary.highlightCount} highlights</Badge> : null}
-            {detail ? (
+            <div className="reader-toolbar" role="toolbar" aria-label="Reader controls">
+              <div className="font-size-controls" aria-label="Reader font size">
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => adjustFontSize(-FONT_SIZE_STEP)}
+                  disabled={readerFontSize <= MIN_FONT_SIZE + 1e-6}
+                  aria-label="Decrease font size"
+                  title="Decrease font size"
+                >
+                  A−
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={resetFontSize}
+                  aria-label="Reset font size"
+                  title="Reset font size"
+                >
+                  A
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => adjustFontSize(FONT_SIZE_STEP)}
+                  disabled={readerFontSize >= MAX_FONT_SIZE - 1e-6}
+                  aria-label="Increase font size"
+                  title="Increase font size"
+                >
+                  A+
+                </button>
+              </div>
               <button
-                className="ghost-button reader-close-button"
-                onClick={closeDocument}
-                aria-label="Close document"
+                type="button"
+                className={`ghost-button reader-toolbar-button${focusMode ? ' is-active' : ''}`}
+                onClick={toggleFocusMode}
+                aria-pressed={focusMode}
+                title={focusMode ? 'Exit focus mode' : 'Focus mode — hide side panels'}
               >
-                Close
+                {focusMode ? 'Exit focus' : 'Focus'}
               </button>
-            ) : null}
+              <button
+                type="button"
+                className="ghost-button reader-toolbar-button"
+                onClick={toggleTheme}
+                aria-label="Toggle dark mode"
+                title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              >
+                {theme === 'dark' ? 'Light' : 'Dark'}
+              </button>
+              {detail ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button danger-button"
+                  onClick={() => void deleteCurrentDocument()}
+                  title="Delete this article bundle"
+                >
+                  Delete
+                </button>
+              ) : null}
+              {detail ? (
+                <button
+                  className="ghost-button reader-close-button"
+                  onClick={closeDocument}
+                  aria-label="Close document"
+                >
+                  Close
+                </button>
+              ) : null}
+            </div>
           </div>
         </header>
 
@@ -1211,13 +1519,15 @@ function App() {
           </div>
         ) : null}
 
-        <section className="markdown-card">
+        <section className="markdown-card" ref={readerScrollRef}>
           <ReaderContent
             loading={loadingDetail}
             markdown={renderedMarkdown}
             highlights={highlights}
             articlePath={detail?.summary.articlePath}
             sourceSite={detail?.summary.sourceSite}
+            fontSize={readerFontSize}
+            onCopy={copyTextToClipboard}
           />
         </section>
       </main>
@@ -1342,6 +1652,41 @@ function App() {
                     }}
                   >
                     <p>{highlight.text}</p>
+                    {highlightCommentDraft?.id === highlight.id ? (
+                      <div
+                        className="highlight-comment-editor"
+                        onClick={(event) => event.stopPropagation()}
+                        onKeyDown={(event) => event.stopPropagation()}
+                      >
+                        <textarea
+                          className="highlight-comment-input"
+                          value={highlightCommentDraft.value}
+                          onChange={(event) =>
+                            setHighlightCommentDraft({ id: highlight.id, value: event.target.value })
+                          }
+                          placeholder="Add a short comment or reminder for this highlight…"
+                          rows={2}
+                          autoFocus
+                        />
+                        <div className="inline-row">
+                          <button
+                            className="ghost-button highlight-button"
+                            onClick={() => void saveHighlightComment()}
+                            disabled={savingHighlights}
+                          >
+                            {savingHighlights ? 'Saving…' : 'Save comment'}
+                          </button>
+                          <button
+                            className="ghost-button highlight-button"
+                            onClick={() => setHighlightCommentDraft(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : highlight.comment ? (
+                      <p className="highlight-comment">{highlight.comment}</p>
+                    ) : null}
                     <div className="highlight-actions">
                       <span className="highlight-meta">{formatHighlightDate(highlight.createdAt)}</span>
                       <div className="inline-row">
@@ -1362,6 +1707,15 @@ function App() {
                           }}
                         >
                           Quote
+                        </button>
+                        <button
+                          className="ghost-button highlight-button"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            openHighlightComment(highlight)
+                          }}
+                        >
+                          {highlight.comment ? 'Edit note' : 'Add note'}
                         </button>
                         <button
                           className="ghost-button highlight-button"

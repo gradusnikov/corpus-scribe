@@ -2058,7 +2058,49 @@ def _postprocess_markdown(markdown_text: str) -> str:
     # Drop Pandoc raw HTML comment artifacts, e.g. `<!-- -->`{=html}, which can
     # appear when inline MathML touches adjacent text in the source HTML.
     markdown_text = re.sub(r"`<!--\s*-->`\{=html\}", "", markdown_text)
+    markdown_text = _isolate_display_math_blocks(markdown_text)
     return markdown_text
+
+
+def _isolate_display_math_blocks(markdown_text: str) -> str:
+    """Ensure ``$$...$$`` display math sits on its own block.
+
+    Single-line display math inline with prose (e.g. ``foo $$bar$$ baz``) is
+    rewritten with blank lines around the equation so markdown renderers treat
+    it as a display block. Already block-level equations are left intact.
+    """
+    pattern = re.compile(r"\$\$[\s\S]+?\$\$")
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in pattern.finditer(markdown_text):
+        before = markdown_text[cursor:match.start()]
+        between = before.strip("\n")
+        stripped = between.strip(" \t")
+
+        if cursor == 0:
+            if stripped:
+                pieces.append(stripped)
+                pieces.append("\n\n")
+        else:
+            pieces.append("\n\n")
+            if stripped:
+                pieces.append(stripped)
+                pieces.append("\n\n")
+
+        pieces.append(match.group(0))
+        cursor = match.end()
+
+    if cursor == 0:
+        return markdown_text
+
+    tail = markdown_text[cursor:].strip("\n")
+    tail_stripped = tail.strip(" \t")
+    if tail_stripped:
+        pieces.append("\n\n")
+        pieces.append(tail_stripped)
+
+    return "".join(pieces)
 
 
 def _postprocess_pdf_markdown(markdown_text: str) -> str:

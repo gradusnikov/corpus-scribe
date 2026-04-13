@@ -199,6 +199,7 @@ def _load_highlights(path: Path) -> list[dict]:
         created_at = item.get("createdAt")
         start_offset = item.get("startOffset")
         end_offset = item.get("endOffset")
+        comment = item.get("comment")
         cleaned_item = {
             "id": str(highlight_id).strip() if highlight_id is not None else "",
             "text": text.strip(),
@@ -207,6 +208,8 @@ def _load_highlights(path: Path) -> list[dict]:
         if isinstance(start_offset, int) and isinstance(end_offset, int) and end_offset > start_offset:
             cleaned_item["startOffset"] = start_offset
             cleaned_item["endOffset"] = end_offset
+        if isinstance(comment, str) and comment.strip():
+            cleaned_item["comment"] = comment.strip()
         cleaned.append(cleaned_item)
     return cleaned
 
@@ -310,6 +313,95 @@ def _upsert_index_records(records: list[dict]) -> None:
         "\n".join(json.dumps(item, ensure_ascii=False) for item in ordered) + "\n",
         encoding="utf-8",
     )
+
+
+def _remove_index_records_for_paths(paths: set[str]) -> int:
+    """Drop any index.jsonl records whose `path` matches one of the given paths."""
+    index_path = _index_file_path()
+    if not index_path.exists():
+        return 0
+    surviving: list[dict] = []
+    removed = 0
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("path") in paths:
+            removed += 1
+            continue
+        surviving.append(record)
+    if removed:
+        ordered = sorted(surviving, key=lambda item: (item.get("type", ""), item.get("path", "")))
+        content = "\n".join(json.dumps(item, ensure_ascii=False) for item in ordered)
+        index_path.write_text(content + ("\n" if content else ""), encoding="utf-8")
+    return removed
+
+
+def _delete_article_bundle(article_path: Path) -> dict:
+    """Remove an article and all sibling artefacts that belong to the same bundle.
+
+    Deletes the article's parent directory when it contains nothing but the
+    article's sibling files (the canonical "bundle" layout). Otherwise only the
+    .md plus recognisable sibling artefacts are removed, leaving unrelated
+    content alone.
+    """
+    import shutil
+
+    article_path = article_path.resolve()
+    article_dir = article_path.parent
+    stem = article_path.stem
+
+    sibling_names: set[str] = {
+        article_path.name,
+        f"{stem}.bib",
+        f"{stem}.notes.md",
+        f"{stem}.reading.pdf",
+        f"{stem}.source.pdf",
+        f"{stem}.pdf",
+        f"{stem}.highlights.json",
+        f"{stem}.html",
+        "ocr_response.json",
+    }
+
+    removed_files: list[str] = []
+    removed_dirs: list[str] = []
+
+    dir_entries = [entry for entry in article_dir.iterdir()] if article_dir.exists() else []
+    non_sibling_entries = [
+        entry
+        for entry in dir_entries
+        if entry.name not in sibling_names and entry.name != "assets"
+    ]
+
+    if article_dir.exists() and not non_sibling_entries:
+        shutil.rmtree(article_dir)
+        removed_dirs.append(str(article_dir))
+    else:
+        for name in sibling_names:
+            target = article_dir / name
+            if target.exists() and target.is_file():
+                target.unlink()
+                removed_files.append(str(target))
+        assets_dir = article_dir / "assets"
+        if assets_dir.exists() and assets_dir.is_dir():
+            shutil.rmtree(assets_dir)
+            removed_dirs.append(str(assets_dir))
+
+    relative_paths: set[str] = set()
+    for path in (article_path, article_path.with_name(f"{stem}.notes.md")):
+        rel = _relative_to_output(str(path))
+        if rel:
+            relative_paths.add(rel)
+    removed_index = _remove_index_records_for_paths(relative_paths)
+
+    return {
+        "removedFiles": removed_files,
+        "removedDirs": removed_dirs,
+        "removedIndexRecords": removed_index,
+    }
 
 
 def _build_index_records(metadata: dict, label: str) -> list[dict]:
@@ -846,6 +938,7 @@ def desktop_save_highlights():
         created_at = str(item.get("createdAt") or "").strip()
         start_offset = item.get("startOffset")
         end_offset = item.get("endOffset")
+        comment = str(item.get("comment") or "").strip()
         if not text:
             continue
         cleaned_item = {
@@ -856,6 +949,8 @@ def desktop_save_highlights():
         if isinstance(start_offset, int) and isinstance(end_offset, int) and end_offset > start_offset:
             cleaned_item["startOffset"] = start_offset
             cleaned_item["endOffset"] = end_offset
+        if comment:
+            cleaned_item["comment"] = comment
         cleaned.append(cleaned_item)
 
     highlights_path = _write_highlights(article_path, cleaned)
@@ -887,6 +982,24 @@ def desktop_save_rating():
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
     return jsonify(success=True, articlePath=str(article_path), rating=rating)
+
+
+@app.route("/desktop/document/delete", methods=["POST"])
+def desktop_delete_document():
+    data = request.get_json(silent=True) or {}
+    raw_path = (data.get("articlePath") or "").strip()
+    if not raw_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    article_path = Path(raw_path)
+    if not article_path.exists() or not article_path.is_file():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+
+    try:
+        result = _delete_article_bundle(article_path)
+    except Exception as error:
+        return jsonify(success=False, message=str(error)), 500
+
+    return jsonify(success=True, articlePath=str(article_path), **result)
 
 
 @app.route("/desktop/file", methods=["GET"])

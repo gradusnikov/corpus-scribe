@@ -248,6 +248,18 @@ class ArticleExtractorTests(unittest.TestCase):
         self.assertIn("number = {2}", citation["bibtex"])
         self.assertIn("pages = {101454}", citation["bibtex"])
 
+    def test_markdown_postprocess_isolates_single_line_display_math(self):
+        source = (
+            "Paragraph before $$a = b^2$$ with trailing prose.\n\n"
+            "Next paragraph $$c = d$$ split inline.\n\n"
+            "Already padded:\n\n$$e = f$$\n\nAfter."
+        )
+        cleaned = _postprocess_markdown(source)
+        self.assertIn("Paragraph before\n\n$$a = b^2$$\n\nwith trailing prose.", cleaned)
+        self.assertIn("Next paragraph\n\n$$c = d$$\n\nsplit inline.", cleaned)
+        self.assertIn("$$e = f$$", cleaned)
+        self.assertNotIn("$$a = b^2$$ with", cleaned)
+
     def test_pdf_markdown_postprocess_normalizes_ocr_latex_and_entities(self):
         text = (
             "At timestep  $t$ , draw  $k _ {\\mathrm {i n i t}}$ . "

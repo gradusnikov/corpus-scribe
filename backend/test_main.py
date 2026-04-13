@@ -558,6 +558,67 @@ class MainApiTests(unittest.TestCase):
         summary = response.get_json()["detail"]["summary"]
         self.assertEqual(summary["rating"], 3)
 
+    def test_desktop_delete_document_removes_bundle_and_index_records(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            bundle_dir = Path(tmpdir) / "Label" / "Fixture"
+            bundle_dir.mkdir(parents=True)
+            article_path = bundle_dir / "Fixture.md"
+            notes_path = bundle_dir / "Fixture.notes.md"
+            bib_path = bundle_dir / "Fixture.bib"
+            reading_pdf = bundle_dir / "Fixture.reading.pdf"
+            highlights_path = bundle_dir / "Fixture.highlights.json"
+            assets_dir = bundle_dir / "assets"
+            assets_dir.mkdir()
+            (assets_dir / "image.png").write_bytes(b"\x89PNG\r\n")
+
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'label: "Label"\n'
+                "---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            notes_path.write_text("# Notes\n", encoding="utf-8")
+            bib_path.write_text("@article{fixture,}\n", encoding="utf-8")
+            reading_pdf.write_bytes(b"%PDF-1.4\n")
+            highlights_path.write_text("{}\n", encoding="utf-8")
+
+            index_path = Path(tmpdir) / "index.jsonl"
+            index_path.write_text(
+                "\n".join(
+                    json.dumps(item, ensure_ascii=False)
+                    for item in [
+                        {"type": "article", "path": "Label/Fixture/Fixture.md", "title": "Fixture"},
+                        {"type": "notes", "path": "Label/Fixture/Fixture.notes.md", "title": "Fixture Notes"},
+                        {"type": "article", "path": "Other/Other.md", "title": "Other"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/document/delete",
+                json={"articlePath": str(article_path)},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertFalse(article_path.exists())
+            self.assertFalse(bundle_dir.exists())
+            surviving = index_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(surviving), 1)
+            self.assertIn("Other/Other.md", surviving[0])
+
+    def test_desktop_delete_document_returns_404_for_missing_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = self.client.post(
+                "/desktop/document/delete",
+                json={"articlePath": str(Path(tmpdir) / "Missing.md")},
+            )
+        self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()
