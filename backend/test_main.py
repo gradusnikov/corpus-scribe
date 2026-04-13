@@ -65,6 +65,7 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(extract_article_mock.call_args.kwargs["output_dir"], f"{tmpdir}/Deep Learning")
         self.assertEqual(extract_article_mock.call_args.kwargs["label"], "Deep Learning")
         self.assertFalse(extract_article_mock.call_args.kwargs["pdf_required"])
+        self.assertFalse(extract_article_mock.call_args.kwargs["render_pdf"])
         self.assertTrue(extract_article_mock.call_args.kwargs["generate_notes"])
         self.assertEqual(
             extract_article_mock.call_args.kwargs["notes_config"]["provider"],
@@ -918,6 +919,85 @@ class MainApiTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["success"])
+
+    def test_desktop_reading_pdf_generates_and_then_serves_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article = Path(tmpdir) / "Article.md"
+            article.write_text(
+                "---\ntitle: \"Article\"\n---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            reading_pdf = article.with_name(article.stem + ".reading.pdf")
+
+            def fake_regen(article_path, page_size="a5", highlights=None):
+                reading_pdf.write_bytes(b"%PDF-1.4\nfake\n")
+                return reading_pdf
+
+            with patch.object(main, "regenerate_reading_pdf", side_effect=fake_regen) as regen_mock:
+                response = self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article), "pageSize": "a4"},
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()
+                self.assertTrue(payload["success"])
+                self.assertFalse(payload["cached"])
+                self.assertEqual(payload["readingPdfPath"], str(reading_pdf))
+                self.assertEqual(regen_mock.call_count, 1)
+                self.assertEqual(regen_mock.call_args.kwargs["page_size"], "a4")
+
+                # Ensure reading PDF is newer than the markdown so cache hits.
+                import os
+                future = reading_pdf.stat().st_mtime + 60
+                os.utime(reading_pdf, (future, future))
+
+                response2 = self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article)},
+                )
+                self.assertEqual(response2.status_code, 200)
+                payload2 = response2.get_json()
+                self.assertTrue(payload2["success"])
+                self.assertTrue(payload2["cached"])
+                self.assertEqual(regen_mock.call_count, 1)
+
+    def test_desktop_reading_pdf_invalidates_on_highlight_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article = Path(tmpdir) / "Article.md"
+            article.write_text(
+                "---\ntitle: \"Article\"\n---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            reading_pdf = article.with_name(article.stem + ".reading.pdf")
+            reading_pdf.write_bytes(b"%PDF-1.4\ncached\n")
+            # Pretend the reading PDF is newer than the markdown.
+            import os
+            future = article.stat().st_mtime + 60
+            os.utime(reading_pdf, (future, future))
+
+            # Highlights newer than the PDF — should bust the cache.
+            highlights = article.with_name(article.stem + ".highlights.json")
+            highlights.write_text('{"highlights": []}\n', encoding="utf-8")
+            even_later = future + 60
+            os.utime(highlights, (even_later, even_later))
+
+            with patch.object(main, "regenerate_reading_pdf", return_value=reading_pdf) as regen_mock:
+                response = self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article)},
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()
+                self.assertFalse(payload["cached"])
+                self.assertEqual(regen_mock.call_count, 1)
+
+    def test_desktop_reading_pdf_missing_article_returns_404(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = self.client.post(
+                "/desktop/reading_pdf",
+                json={"articlePath": str(Path(tmpdir) / "Missing.md")},
+            )
+        self.assertEqual(response.status_code, 404)
 
     def test_desktop_delete_document_removes_bundle_and_index_records(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):

@@ -19,6 +19,7 @@ from article_extractor import (
     _notes_doc_id,
     extract_article,
     extract_pdf_url,
+    regenerate_reading_pdf,
 )
 from send_email_gmail import send_to_kindle
 
@@ -817,7 +818,7 @@ def save_local():
         url=url,
         page_size=page_size,
         label=_clean_label(label),
-        render_pdf=True,
+        render_pdf=False,
         pdf_required=False,
         generate_notes=True,
         notes_config=notes_config,
@@ -1700,6 +1701,68 @@ def desktop_save_related():
 
     related_path = _write_related(article_path, cleaned)
     return jsonify(success=True, relatedPath=str(related_path), items=cleaned)
+
+
+def _reading_pdf_is_fresh(article_path: Path, reading_pdf: Path) -> bool:
+    """Return True if the reading PDF is newer than the md + highlights sources."""
+    if not reading_pdf.exists():
+        return False
+    try:
+        pdf_mtime = reading_pdf.stat().st_mtime
+    except OSError:
+        return False
+    try:
+        if article_path.stat().st_mtime > pdf_mtime:
+            return False
+    except OSError:
+        return False
+    highlights_path = _highlights_path(article_path)
+    if highlights_path.exists():
+        try:
+            if highlights_path.stat().st_mtime > pdf_mtime:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+@app.route("/desktop/reading_pdf", methods=["POST"])
+def desktop_reading_pdf():
+    """Generate (or return cached) reading PDF for a markdown article."""
+    data = request.get_json(silent=True) or {}
+    raw_path = (data.get("articlePath") or "").strip()
+    if not raw_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    article_path = Path(raw_path)
+    if not article_path.exists() or not article_path.is_file():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+
+    page_size = (data.get("pageSize") or "a5").strip().lower()
+    reading_pdf_path = article_path.with_name(article_path.stem + ".reading.pdf")
+
+    if _reading_pdf_is_fresh(article_path, reading_pdf_path):
+        return jsonify(
+            success=True,
+            readingPdfPath=str(reading_pdf_path),
+            cached=True,
+        )
+
+    highlights = _load_highlights(article_path)
+    try:
+        generated_path = regenerate_reading_pdf(
+            article_path=article_path,
+            page_size=page_size,
+            highlights=highlights,
+        )
+    except Exception as error:
+        app.logger.exception("Reading PDF generation failed for %s", article_path)
+        return jsonify(success=False, message=str(error)), 500
+
+    return jsonify(
+        success=True,
+        readingPdfPath=str(generated_path),
+        cached=False,
+    )
 
 
 @app.route("/desktop/rating", methods=["POST"])

@@ -110,6 +110,7 @@ const persistedHighlightsViewKey = 'corpus-scribe.desktop.highlightsView'
 const persistedOpenTabsKey = 'corpus-scribe.desktop.openTabs'
 const persistedHideNoiseKey = 'corpus-scribe.desktop.hideNoise'
 const persistedRefsAreNoiseKey = 'corpus-scribe.desktop.refsAreNoise'
+const persistedReadingPdfPageSizeKey = 'corpus-scribe.desktop.readingPdfPageSize'
 
 const MIN_FONT_SIZE = 0.85
 const MAX_FONT_SIZE = 1.5
@@ -294,6 +295,24 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
         path: data.path as string,
         parent: (data.parent ?? null) as string | null,
         directories: (data.directories ?? []) as { name: string; path: string }[],
+      } as T
+    }
+    case 'generate_reading_pdf': {
+      const response = await fetch(`${browserApiBase}/desktop/reading_pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+          pageSize: payload.pageSize,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to generate reading PDF')
+      }
+      return {
+        readingPdfPath: data.readingPdfPath as string,
+        cached: Boolean(data.cached),
       } as T
     }
     default:
@@ -1505,6 +1524,12 @@ function App() {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(persistedRefsAreNoiseKey) === 'true'
   })
+  const [readingPdfPageSize, setReadingPdfPageSize] = useState<'a4' | 'a5'>(() => {
+    if (typeof window === 'undefined') return 'a5'
+    const stored = window.localStorage.getItem(persistedReadingPdfPageSizeKey)
+    return stored === 'a4' ? 'a4' : 'a5'
+  })
+  const [generatingReadingPdf, setGeneratingReadingPdf] = useState(false)
   const [openDocIds, setOpenDocIds] = useState<string[]>(() => {
     if (typeof window === 'undefined') return []
     try {
@@ -1670,6 +1695,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(persistedRefsAreNoiseKey, referencesAreNoise ? 'true' : 'false')
   }, [referencesAreNoise])
+
+  useEffect(() => {
+    window.localStorage.setItem(persistedReadingPdfPageSizeKey, readingPdfPageSize)
+  }, [readingPdfPageSize])
 
   useEffect(() => {
     window.localStorage.setItem(persistedOpenTabsKey, JSON.stringify(openDocIds))
@@ -2219,6 +2248,35 @@ function App() {
 
   async function commitRelatedNote(_targetPath: string) {
     await persistRelated(relatedLinks, 'Updated related note')
+  }
+
+  async function handleGenerateReadingPdf() {
+    if (!detail || generatingReadingPdf) return
+    setGeneratingReadingPdf(true)
+    setStatus('Generating reading PDF…')
+    try {
+      const response = await desktopCommand<{ readingPdfPath: string; cached: boolean }>(
+        'generate_reading_pdf',
+        {
+          articlePath: detail.summary.articlePath,
+          pageSize: readingPdfPageSize,
+        },
+      )
+      setDetail((current) =>
+        current
+          ? {
+              ...current,
+              summary: { ...current.summary, readingPdfPath: response.readingPdfPath },
+            }
+          : current,
+      )
+      window.open(buildDownloadUrl(response.readingPdfPath), '_blank', 'noopener,noreferrer')
+      setStatus(response.cached ? 'Reading PDF ready (cached)' : 'Reading PDF generated')
+    } catch (error) {
+      setStatus(`Failed to generate reading PDF: ${(error as Error).message}`)
+    } finally {
+      setGeneratingReadingPdf(false)
+    }
   }
 
   async function addHighlightFromSelection(variant: NoiseVariant = 'highlight') {
@@ -3385,15 +3443,16 @@ function App() {
             ) : null}
           </div>
           <div className="reader-meta">
-            {detail?.summary.readingPdfPath ? (
-              <a
+            {detail ? (
+              <button
+                type="button"
                 className="badge badge-link"
-                href={buildDownloadUrl(detail.summary.readingPdfPath)}
-                target="_blank"
-                rel="noopener noreferrer"
+                onClick={() => void handleGenerateReadingPdf()}
+                disabled={generatingReadingPdf}
+                title={`Render a reading-friendly PDF (${readingPdfPageSize.toUpperCase()})`}
               >
-                Download reading PDF
-              </a>
+                {generatingReadingPdf ? 'Generating reading PDF…' : 'Reading PDF'}
+              </button>
             ) : null}
             {detail?.summary.sourcePdfPath ? (
               <a
@@ -3556,6 +3615,29 @@ function App() {
                       <span>Dark theme</span>
                       <span className={`settings-switch${theme === 'dark' ? ' is-on' : ''}`} aria-hidden="true" />
                     </button>
+                    <div className="settings-row">
+                      <span className="settings-label">Reading PDF page size</span>
+                      <div className="inline-row" role="radiogroup" aria-label="Reading PDF page size">
+                        <button
+                          type="button"
+                          className={`ghost-button reader-toolbar-button${readingPdfPageSize === 'a4' ? ' is-active' : ''}`}
+                          onClick={() => setReadingPdfPageSize('a4')}
+                          role="radio"
+                          aria-checked={readingPdfPageSize === 'a4'}
+                        >
+                          A4
+                        </button>
+                        <button
+                          type="button"
+                          className={`ghost-button reader-toolbar-button${readingPdfPageSize === 'a5' ? ' is-active' : ''}`}
+                          onClick={() => setReadingPdfPageSize('a5')}
+                          role="radio"
+                          aria-checked={readingPdfPageSize === 'a5'}
+                        >
+                          A5
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 ) : null}
               </div>

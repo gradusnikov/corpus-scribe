@@ -324,7 +324,8 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
 
 def extract_pdf_url(url: str, output_dir: str = "/tmp", cookies: dict | None = None,
                     source_name: str = "", label: str = "", page_size: str = "a5",
-                    generate_notes: bool = False, notes_config: dict | None = None) -> dict:
+                    generate_notes: bool = False, notes_config: dict | None = None,
+                    render_pdf: bool = False) -> dict:
     """Download a source PDF and extract it into markdown-first local output."""
     session = _make_session(cookies)
     response = session.get(url, timeout=120)
@@ -343,12 +344,14 @@ def extract_pdf_url(url: str, output_dir: str = "/tmp", cookies: dict | None = N
         page_size=page_size,
         generate_notes=generate_notes,
         notes_config=notes_config,
+        render_pdf=render_pdf,
     )
 
 
 def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
                       source_name: str = "", label: str = "", page_size: str = "a5",
-                      generate_notes: bool = False, notes_config: dict | None = None) -> dict:
+                      generate_notes: bool = False, notes_config: dict | None = None,
+                      render_pdf: bool = False) -> dict:
     """Extract markdown and notes from a source PDF."""
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     with tempfile.TemporaryDirectory(prefix="scribe-pdf-src-") as tmpdir:
@@ -430,14 +433,15 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         md_file.write_text(md_text, encoding="utf-8")
 
         reading_pdf = None
-        try:
-            _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
-            generated_pdf = _generate_pdf(md_text, title, article_dir, page_cfg["papersize"])
-            reading_pdf = article_dir / f"{safe_name}.reading.pdf"
-            if generated_pdf != reading_pdf:
-                generated_pdf.replace(reading_pdf)
-        except Exception:
-            log.exception("Reading PDF generation failed for source PDF %s; source PDF was still saved", title)
+        if render_pdf:
+            try:
+                _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
+                generated_pdf = _generate_pdf(md_text, title, article_dir, page_cfg["papersize"])
+                reading_pdf = article_dir / f"{safe_name}.reading.pdf"
+                if generated_pdf != reading_pdf:
+                    generated_pdf.replace(reading_pdf)
+            except Exception:
+                log.exception("Reading PDF generation failed for source PDF %s; source PDF was still saved", title)
 
         notes_file = None
         notes_doc_id = None
@@ -2596,6 +2600,76 @@ def _generate_pdf(
             stage_pdf.unlink(missing_ok=True)
 
 
+def _apply_reader_annotations(md_text: str, highlights: list[dict]) -> str:
+    """Strip noise and wrap highlights in markdown for reading-PDF rendering.
+
+    Applied as text-based find/replace against the markdown body. Offsets stored
+    on highlights are DOM-based and don't map cleanly to markdown positions, so
+    the simpler text search is used here. In practice this is good enough for a
+    reading PDF export.
+    """
+    if not highlights:
+        return md_text
+
+    result = md_text
+
+    for item in highlights:
+        if not isinstance(item, dict):
+            continue
+        if item.get("variant") != "noise":
+            continue
+        if item.get("kind") == "element":
+            continue
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        if text in result:
+            result = result.replace(text, "", 1)
+
+    for item in highlights:
+        if not isinstance(item, dict):
+            continue
+        if item.get("variant") == "noise":
+            continue
+        if item.get("kind") == "element":
+            continue
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        wrapped = f"<mark class=\"reading-highlight\">{html.escape(text)}</mark>"
+        if text in result:
+            result = result.replace(text, wrapped, 1)
+
+    return result
+
+
+def regenerate_reading_pdf(
+    article_path: Path,
+    page_size: str = "a5",
+    highlights: list[dict] | None = None,
+) -> Path:
+    """Regenerate the reading PDF for an existing markdown article.
+
+    Applies noise removal and highlight wrapping before rendering.
+    """
+    page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
+    md_raw = article_path.read_text(encoding="utf-8")
+    match = re.match(r"^---\n.*?\n---\n\n?", md_raw, re.DOTALL)
+    body = md_raw[match.end():] if match else md_raw
+    title = article_path.stem
+    article_dir = article_path.parent
+    safe_name = article_path.stem
+    body = _apply_reader_annotations(body, highlights or [])
+    assets_dir = article_dir / "assets"
+    if assets_dir.exists():
+        _resize_images_for_pdf(assets_dir, max_width=page_cfg["max_img_width"])
+    generated_pdf = _generate_pdf(body, title, article_dir, page_cfg["papersize"])
+    reading_pdf = article_dir / f"{safe_name}.reading.pdf"
+    if generated_pdf != reading_pdf:
+        generated_pdf.replace(reading_pdf)
+    return reading_pdf
+
+
 def _render_markdown_to_html(md_text: str) -> str:
     """Convert final markdown into HTML with native MathML output."""
     return pypandoc.convert_text(
@@ -2737,6 +2811,12 @@ def _wrap_html_for_browser_pdf(html_fragment: str, title: str, papersize: str) -
         display: block;
         overflow-x: auto;
         margin: 1rem 0;
+      }}
+      mark.reading-highlight {{
+        background: #fff6a8;
+        color: inherit;
+        padding: 0 0.1em;
+        border-radius: 2px;
       }}
       .title-block-header,
       header {{
