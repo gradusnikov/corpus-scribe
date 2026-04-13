@@ -1,4 +1,4 @@
-import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
@@ -10,7 +10,7 @@ const browserApiBase = import.meta.env.VITE_DESKTOP_API_BASE ?? 'http://127.0.0.
 
 const markdownRemarkPlugins = [remarkGfm, remarkMath]
 const markdownRehypePlugins: [typeof rehypeKatex, { output: string; throwOnError: boolean; strict: string }][] = [
-  [rehypeKatex, { output: 'html', throwOnError: false, strict: 'ignore' }],
+  [rehypeKatex, { output: 'htmlAndMathml', throwOnError: false, strict: 'ignore' }],
 ]
 const markdownUrlTransform = (url: string) => url
 
@@ -31,6 +31,7 @@ type DocumentSummary = {
   url: string | null
   canonicalUrl: string | null
   excerpt: string
+  affinityScore?: number
 }
 
 type LibraryIndex = {
@@ -63,6 +64,7 @@ type SearchRequest = {
   root: string | null
   query: string
   label: string | null
+  activeArticlePath: string | null
 }
 
 type Highlight = {
@@ -313,6 +315,36 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       return {
         readingPdfPath: data.readingPdfPath as string,
         cached: Boolean(data.cached),
+      } as T
+    }
+    case 'reveal_location': {
+      const response = await fetch(`${browserApiBase}/desktop/reveal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: payload.path }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to reveal location')
+      }
+      return {
+        directoryPath: (data.directoryPath ?? '') as string,
+        launched: Boolean(data.launched),
+      } as T
+    }
+    case 'open_external_file': {
+      const response = await fetch(`${browserApiBase}/desktop/open_external`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: payload.path }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to open file')
+      }
+      return {
+        path: (data.path ?? '') as string,
+        launched: Boolean(data.launched),
       } as T
     }
     default:
@@ -1033,7 +1065,7 @@ type ReaderContentProps = {
   referencesAreNoise?: boolean
   onCopy: (text: string, label: string) => void
   onHighlightClick?: (highlightId: string) => void
-  onImageOpen?: (src: string, alt: string) => void
+  onImageOpen?: (src: string, alt: string, imageIndex: number | null) => void
   onDeleteNoise?: (highlightId: string) => void
   onToggleElementNoise?: (type: 'img' | 'table', index: number) => void
 }
@@ -1185,8 +1217,8 @@ const ReaderContent = memo(function ReaderContent({
   const stableCopy = useCallback((text: string, label: string) => {
     onCopyRef.current(text, label)
   }, [])
-  const stableImageOpen = useCallback((src: string, alt: string) => {
-    onImageOpenRef.current?.(src, alt)
+  const stableImageOpen = useCallback((src: string, alt: string, imageIndex: number | null) => {
+    onImageOpenRef.current?.(src, alt, imageIndex)
   }, [])
 
   useEffect(() => {
@@ -1328,7 +1360,14 @@ const ReaderContent = memo(function ReaderContent({
             onClick={(event) => {
               event.preventDefault()
               event.stopPropagation()
-              stableImageOpen(typeof resolvedSrc === 'string' ? resolvedSrc : '', displayAlt)
+              const root = articleRef.current
+              let idx: number | null = null
+              if (root && event.currentTarget instanceof HTMLImageElement) {
+                const list = Array.from(root.querySelectorAll('img'))
+                const found = list.indexOf(event.currentTarget)
+                if (found >= 0) idx = found
+              }
+              stableImageOpen(typeof resolvedSrc === 'string' ? resolvedSrc : '', displayAlt, idx)
             }}
             {...props}
           />
@@ -1479,7 +1518,11 @@ function App() {
     return Number.isFinite(stored) && stored >= MIN_NOTES_TOP_HEIGHT ? stored : DEFAULT_NOTES_TOP_HEIGHT
   })
   const [focusedHighlight, setFocusedHighlight] = useState<{ id: string; ts: number } | null>(null)
-  const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null)
+  const [lightbox, setLightbox] = useState<{
+    src: string
+    alt: string
+    imageIndex: number | null
+  } | null>(null)
   const [infoOpen, setInfoOpen] = useState(false)
   const [rootPickerOpen, setRootPickerOpen] = useState(false)
   const [rootPickerPath, setRootPickerPath] = useState('')
@@ -1924,7 +1967,7 @@ function App() {
 
   useEffect(() => {
     void runSearch()
-  }, [deferredSearch, selectedLabel, library.root])
+  }, [deferredSearch, selectedLabel, library.root, detail?.summary.articlePath])
 
   async function initializeLibrary() {
     try {
@@ -2063,6 +2106,7 @@ function App() {
         root: library.root || null,
         query: deferredSearch,
         label: selectedLabel === 'all' ? null : selectedLabel,
+        activeArticlePath: detail?.summary.articlePath ?? null,
       }
       const results = await desktopCommand<DocumentSummary[]>('search_documents', { request })
       setSearchResults(results)
@@ -2458,6 +2502,45 @@ function App() {
     try {
       await navigator.clipboard.writeText(value)
       setStatus(`Copied ${label}`)
+    } catch (error) {
+      setStatus(stringifyError(error))
+    }
+  }
+
+  async function handleRevealLocation() {
+    if (!detail) return
+    try {
+      const response = await desktopCommand<{ directoryPath: string; launched: boolean }>(
+        'reveal_location',
+        { path: detail.summary.articlePath },
+      )
+      if (response.launched) {
+        setStatus(`Opened ${response.directoryPath}`)
+        return
+      }
+      try {
+        await navigator.clipboard.writeText(response.directoryPath)
+        setStatus(`Copied location: ${response.directoryPath}`)
+      } catch {
+        setStatus(`Location: ${response.directoryPath}`)
+      }
+    } catch (error) {
+      setStatus(stringifyError(error))
+    }
+  }
+
+  async function handleOpenExternalFile(path: string, label: string) {
+    if (!path) return
+    try {
+      const response = await desktopCommand<{ path: string; launched: boolean }>(
+        'open_external_file',
+        { path },
+      )
+      if (response.launched) {
+        setStatus(`Opened ${label}`)
+        return
+      }
+      window.open(buildDownloadUrl(path), '_blank', 'noopener,noreferrer')
     } catch (error) {
       setStatus(stringifyError(error))
     }
@@ -3157,6 +3240,29 @@ function App() {
             >
               Open full size
             </a>
+            {lightbox.imageIndex != null ? (
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => {
+                  const idx = lightbox.imageIndex
+                  if (idx == null) return
+                  void toggleElementNoise('img', idx)
+                  setLightbox(null)
+                }}
+                title="Toggle image noise mark"
+              >
+                {highlights.some(
+                  (h) =>
+                    h.kind === 'element' &&
+                    h.elementType === 'img' &&
+                    h.elementIndex === lightbox.imageIndex &&
+                    h.variant === 'noise',
+                )
+                  ? 'Unmark noise'
+                  : 'Mark as noise'}
+              </button>
+            ) : null}
             <button
               type="button"
               className="ghost-button"
@@ -3195,18 +3301,52 @@ function App() {
               </button>
             </header>
             <div className="info-body">
-              {renderFrontmatterEntries(detail.frontmatter).length ? (
-                <dl className="info-grid">
-                  {renderFrontmatterEntries(detail.frontmatter).map(([key, value]) => (
-                    <div className="info-row" key={key}>
-                      <dt>{key}</dt>
-                      <dd>{value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              ) : (
-                <p className="muted">No frontmatter metadata found.</p>
-              )}
+              {(() => {
+                const entries = renderFrontmatterEntries(detail.frontmatter)
+                const citationEntries = buildCitationEntries(
+                  detail.bibliography ?? '',
+                  detail.frontmatter,
+                )
+                const frontmatterKeys = new Set(entries.map(([k]) => k))
+                const citationOnly = citationEntries.filter(([k]) => !frontmatterKeys.has(k))
+                return (
+                  <>
+                    {entries.length ? (
+                      <dl className="info-grid">
+                        {entries.map(([key, value]) => (
+                          <div className="info-row" key={key}>
+                            <dt>{key}</dt>
+                            <dd>{renderInfoValue(key, value, {
+                              onOpenExternalFile: (path, label) =>
+                                void handleOpenExternalFile(path, label),
+                              onCopy: (text, label) => void copyTextToClipboard(text, label),
+                            })}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    ) : (
+                      <p className="muted">No frontmatter metadata found.</p>
+                    )}
+                    {citationOnly.length ? (
+                      <>
+                        <h3 className="info-section-title">Citation</h3>
+                        <dl className="info-grid">
+                          {citationOnly.map(([key, value]) => (
+                            <div className="info-row" key={`cite-${key}`}>
+                              <dt>{key}</dt>
+                              <dd>{renderInfoValue(key, value, {
+                                onOpenExternalFile: (path, label) =>
+                                  void handleOpenExternalFile(path, label),
+                                onCopy: (text, label) => void copyTextToClipboard(text, label),
+                              })}</dd>
+                            </div>
+                          ))}
+                        </dl>
+                      </>
+                    ) : null}
+                  </>
+                )
+              })()}
             </div>
           </div>
         </div>
@@ -3393,6 +3533,14 @@ function App() {
                 <div className="document-card-header">
                   <span className="document-label">{doc.label ?? 'unlabeled'}</span>
                   {doc.rating > 0 ? <StarRating value={doc.rating} /> : null}
+                  {typeof doc.affinityScore === 'number' && doc.affinityScore > 0 ? (
+                    <span
+                      className="document-affinity"
+                      title="Related to the currently open document"
+                    >
+                      related
+                    </span>
+                  ) : null}
                 </div>
                 <strong>{doc.title}</strong>
                 <span className="document-meta">{doc.sourceSite ?? 'local'} {doc.ingestedAt ? `• ${doc.ingestedAt.slice(0, 10)}` : ''}</span>
@@ -3514,6 +3662,17 @@ function App() {
                   aria-label="Show document metadata"
                 >
                   Info
+                </button>
+              ) : null}
+              {detail ? (
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => void handleRevealLocation()}
+                  title="Reveal article bundle directory"
+                  aria-label="Open bundle location"
+                >
+                  Location
                 </button>
               ) : null}
               {detail?.bibliography ? (
@@ -3768,7 +3927,7 @@ function App() {
             referencesAreNoise={referencesAreNoise}
             onCopy={copyTextToClipboard}
             onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
-            onImageOpen={(src, alt) => setLightbox({ src, alt })}
+            onImageOpen={(src, alt, imageIndex) => setLightbox({ src, alt, imageIndex })}
             onDeleteNoise={(id) => void deleteHighlight(id)}
             onToggleElementNoise={(type, index) => void toggleElementNoise(type, index)}
           />
@@ -3853,7 +4012,7 @@ function App() {
                   <div className="markdown-body notes-preview-body">
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm, remarkMath]}
-                      rehypePlugins={[[rehypeKatex, { output: 'html', throwOnError: false, strict: 'ignore' }]]}
+                      rehypePlugins={[[rehypeKatex, { output: 'htmlAndMathml', throwOnError: false, strict: 'ignore' }]]}
                       urlTransform={(url) => url}
                       components={{
                         img: ({ node: _node, src = '', alt = '', title, ...props }) => (
@@ -4237,21 +4396,201 @@ function formatFrontmatterValue(value: FrontmatterValue): string {
 
 function renderFrontmatterEntries(
   frontmatter: Record<string, FrontmatterValue> | undefined,
-): Array<[string, string]> {
+): Array<[string, string, FrontmatterValue]> {
   if (!frontmatter) return []
   const seen = new Set<string>()
-  const ordered: Array<[string, string]> = []
+  const ordered: Array<[string, string, FrontmatterValue]> = []
   const push = (key: string) => {
     if (seen.has(key)) return
     if (!(key in frontmatter)) return
-    const formatted = formatFrontmatterValue(frontmatter[key])
+    const raw = frontmatter[key]
+    const formatted = formatFrontmatterValue(raw)
     if (!formatted) return
     seen.add(key)
-    ordered.push([key, formatted])
+    ordered.push([key, formatted, raw])
   }
   for (const key of FRONTMATTER_KEY_ORDER) push(key)
   for (const key of Object.keys(frontmatter)) push(key)
   return ordered
+}
+
+function parseBibTeX(bib: string): { entryType: string; fields: Record<string, string> } | null {
+  if (!bib || !bib.trim()) return null
+  const match = bib.match(/@(\w+)\s*\{\s*[^,]*,([\s\S]*)\}\s*$/m)
+  if (!match) return null
+  const entryType = match[1].toLowerCase()
+  const body = match[2]
+  const fields: Record<string, string> = {}
+  const fieldRegex = /(\w+)\s*=\s*(\{((?:[^{}]|\{[^{}]*\})*)\}|"([^"]*)"|(\d+))/g
+  let fm: RegExpExecArray | null
+  while ((fm = fieldRegex.exec(body)) !== null) {
+    const key = fm[1].toLowerCase()
+    const braced = fm[3]
+    const quoted = fm[4]
+    const bareNum = fm[5]
+    const raw = braced ?? quoted ?? bareNum ?? ''
+    fields[key] = raw.replace(/\s+/g, ' ').replace(/[{}]/g, '').trim()
+  }
+  return { entryType, fields }
+}
+
+function splitBibAuthors(raw: string): string[] {
+  if (!raw) return []
+  return raw
+    .split(/\s+and\s+/i)
+    .map((name) => {
+      const clean = name.trim()
+      if (!clean) return ''
+      if (clean.includes(',')) {
+        const [last, first] = clean.split(',', 2)
+        return `${first.trim()} ${last.trim()}`.trim()
+      }
+      return clean
+    })
+    .filter(Boolean)
+}
+
+function buildCitationEntries(
+  bib: string,
+  frontmatter: Record<string, FrontmatterValue> | undefined,
+): Array<[string, string]> {
+  const parsed = parseBibTeX(bib)
+  const entries: Array<[string, string]> = []
+  const pushed = new Set<string>()
+  const push = (key: string, value: string) => {
+    const clean = (value ?? '').trim()
+    if (!clean) return
+    if (pushed.has(key)) return
+    pushed.add(key)
+    entries.push([key, clean])
+  }
+  if (parsed) {
+    const f = parsed.fields
+    const authorList = splitBibAuthors(f.author ?? '')
+    if (authorList.length) push('authors', authorList.join(', '))
+    if (f.title) push('title', f.title)
+    if (f.journal) push('journal', f.journal)
+    if (f.booktitle) push('booktitle', f.booktitle)
+    if (f.publisher) push('publisher', f.publisher)
+    if (f.year) push('year', f.year)
+    if (f.volume) push('volume', f.volume)
+    if (f.number) push('number', f.number)
+    if (f.pages) push('pages', f.pages)
+    if (f.doi) push('doi', f.doi)
+    if (f.url) push('url', f.url)
+  }
+  if (frontmatter) {
+    const authors = frontmatter.authors ?? frontmatter.author
+    if (authors) push('authors', formatFrontmatterValue(authors))
+    if (frontmatter.journal) push('journal', formatFrontmatterValue(frontmatter.journal))
+    if (frontmatter.publisher) push('publisher', formatFrontmatterValue(frontmatter.publisher))
+    if (frontmatter.year) push('year', formatFrontmatterValue(frontmatter.year))
+    if (frontmatter.published) push('published', formatFrontmatterValue(frontmatter.published))
+  }
+  return entries
+}
+
+const FRONTMATTER_LINK_KEYS: Record<string, (value: string) => string | null> = {
+  doi: (value) => {
+    const clean = value.replace(/^https?:\/\/(dx\.)?doi\.org\//i, '').trim()
+    return clean ? `https://doi.org/${clean}` : null
+  },
+  arxiv_id: (value) => {
+    const clean = value.replace(/^arxiv:/i, '').trim()
+    return clean ? `https://arxiv.org/abs/${clean}` : null
+  },
+  pmid: (value) => {
+    const clean = value.trim()
+    return clean ? `https://pubmed.ncbi.nlm.nih.gov/${clean}/` : null
+  },
+  pmcid: (value) => {
+    const clean = value.replace(/^pmc/i, '').trim()
+    return clean ? `https://www.ncbi.nlm.nih.gov/pmc/articles/PMC${clean}/` : null
+  },
+  url: (value) => (/^https?:\/\//i.test(value) ? value : null),
+  canonical_url: (value) => (/^https?:\/\//i.test(value) ? value : null),
+  source_url: (value) => (/^https?:\/\//i.test(value) ? value : null),
+}
+
+const FRONTMATTER_FILE_KEYS = new Set([
+  'article_path',
+  'reading_pdf_path',
+  'source_pdf_path',
+  'notes_path',
+  'path',
+  'md_path',
+])
+
+function renderInfoValue(
+  key: string,
+  value: string,
+  handlers: {
+    onOpenExternalFile: (path: string, label: string) => void
+    onCopy: (text: string, label: string) => void
+  },
+): ReactNode {
+  if (!value) return value
+  const linker = FRONTMATTER_LINK_KEYS[key]
+  if (linker) {
+    const href = linker(value)
+    if (href) {
+      return (
+        <a
+          className="info-link"
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(event) => {
+            event.preventDefault()
+            window.open(href, '_blank', 'noopener,noreferrer')
+          }}
+        >
+          {value}
+        </a>
+      )
+    }
+  }
+  if (FRONTMATTER_FILE_KEYS.has(key) || /\.(md|pdf|json|txt|bib|html?)$/i.test(value)) {
+    const looksLikePath = value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)
+    if (looksLikePath) {
+      return (
+        <button
+          type="button"
+          className="info-link info-link-button"
+          onClick={() => handlers.onOpenExternalFile(value, key)}
+          title="Open with system default"
+        >
+          {value}
+        </button>
+      )
+    }
+  }
+  if (/^https?:\/\//i.test(value)) {
+    return (
+      <a
+        className="info-link"
+        href={value}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={(event) => {
+          event.preventDefault()
+          window.open(value, '_blank', 'noopener,noreferrer')
+        }}
+      >
+        {value}
+      </a>
+    )
+  }
+  return (
+    <button
+      type="button"
+      className="info-link info-link-button info-link-subtle"
+      onClick={() => handlers.onCopy(value, key)}
+      title="Copy to clipboard"
+    >
+      {value}
+    </button>
+  )
 }
 
 function formatHighlightDate(value: string) {

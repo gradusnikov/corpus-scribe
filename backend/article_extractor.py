@@ -2573,11 +2573,15 @@ def _generate_pdf(
     title: str,
     article_dir: Path,
     papersize: str = "a5",
+    highlights: list[dict] | None = None,
 ) -> Path:
     """Generate PDF from final markdown via Pandoc -> HTML -> Chromium.
 
     Images in the bundle's assets/ are left at full resolution. A staged copy
-    is resized to fit the target page width just for the PDF render.
+    is resized to fit the target page width just for the PDF render. When
+    highlights are provided, element-level noise is removed and inline
+    highlights/noise annotations are applied to the rendered HTML before the
+    Chromium step.
     """
     pdf_file = article_dir / f"{article_dir.name}.pdf"
     assets_src = article_dir / "assets"
@@ -2594,6 +2598,8 @@ def _generate_pdf(
             shutil.copytree(assets_src, staged_assets)
             _resize_images_for_pdf(staged_assets, max_width=page_cfg["max_img_width"])
         html_fragment = _render_markdown_to_html(md_text)
+        if highlights:
+            html_fragment = _apply_html_annotations(html_fragment, highlights)
         stage_html.write_text(
             _wrap_html_for_browser_pdf(html_fragment, title, papersize),
             encoding="utf-8",
@@ -2607,47 +2613,124 @@ def _generate_pdf(
             stage_pdf.unlink(missing_ok=True)
 
 
-def _apply_reader_annotations(md_text: str, highlights: list[dict]) -> str:
-    """Strip noise and wrap highlights in markdown for reading-PDF rendering.
+def _apply_html_annotations(html_fragment: str, highlights: list[dict]) -> str:
+    """Apply noise removal and highlight wrapping to rendered HTML.
 
-    Applied as text-based find/replace against the markdown body. Offsets stored
-    on highlights are DOM-based and don't map cleanly to markdown positions, so
-    the simpler text search is used here. In practice this is good enough for a
-    reading PDF export.
+    Inline text highlights are matched against text nodes (ignoring script /
+    style / math content) and wrapped in ``<mark class="reading-highlight">``.
+    Inline noise is matched the same way and stripped. Element-level noise
+    (kind == "element") drops the N-th matching img/table from the DOM.
+
+    Matching is text-based so frontmatter escapes and pandoc-inserted wrappers
+    don't matter. When a highlight text spans multiple nodes, the first
+    contiguous match wins — good enough for a reading PDF export.
     """
     if not highlights:
-        return md_text
+        return html_fragment
 
-    result = md_text
+    soup = BeautifulSoup(html_fragment, "html.parser")
+
+    for element_type in ("img", "table"):
+        elements = soup.find_all(element_type)
+        remove_indices: set[int] = set()
+        for item in highlights:
+            if not isinstance(item, dict):
+                continue
+            if item.get("variant") != "noise":
+                continue
+            if item.get("kind") != "element":
+                continue
+            if item.get("elementType") != element_type:
+                continue
+            idx = item.get("elementIndex")
+            if isinstance(idx, int) and 0 <= idx < len(elements):
+                remove_indices.add(idx)
+        for idx in sorted(remove_indices, reverse=True):
+            target = elements[idx]
+            wrapper = target.find_parent("figure")
+            if wrapper is None:
+                parent = target.parent
+                if (
+                    parent is not None
+                    and parent.name == "p"
+                    and not parent.get_text(strip=True)
+                ):
+                    wrapper = parent
+            (wrapper or target).decompose()
 
     for item in highlights:
         if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "element":
             continue
         if item.get("variant") != "noise":
             continue
-        if item.get("kind") == "element":
-            continue
         text = (item.get("text") or "").strip()
         if not text:
             continue
-        if text in result:
-            result = result.replace(text, "", 1)
+        _replace_text_in_html(soup, text, mode="remove")
 
     for item in highlights:
         if not isinstance(item, dict):
             continue
-        if item.get("variant") == "noise":
-            continue
         if item.get("kind") == "element":
+            continue
+        if item.get("variant") == "noise":
             continue
         text = (item.get("text") or "").strip()
         if not text:
             continue
-        wrapped = f"<mark class=\"reading-highlight\">{html.escape(text)}</mark>"
-        if text in result:
-            result = result.replace(text, wrapped, 1)
+        _replace_text_in_html(soup, text, mode="mark")
 
-    return result
+    return str(soup)
+
+
+_HTML_ANNOTATION_SKIP_PARENTS = {
+    "script",
+    "style",
+    "math",
+    "semantics",
+    "annotation",
+    "mrow",
+    "mi",
+    "mn",
+    "mo",
+    "ms",
+    "mtext",
+}
+
+
+def _replace_text_in_html(soup: BeautifulSoup, needle: str, mode: str) -> None:
+    """Locate ``needle`` inside a text node and either remove or wrap it."""
+    for node in list(soup.find_all(string=True)):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.name in _HTML_ANNOTATION_SKIP_PARENTS:
+            continue
+        current = str(node)
+        idx = current.find(needle)
+        if idx < 0:
+            continue
+        before = current[:idx]
+        after = current[idx + len(needle):]
+        replacements: list = []
+        if before:
+            replacements.append(NavigableString(before))
+        if mode == "mark":
+            mark_tag = soup.new_tag("mark")
+            mark_tag["class"] = "reading-highlight"
+            mark_tag.string = needle
+            replacements.append(mark_tag)
+        if after:
+            replacements.append(NavigableString(after))
+        if replacements:
+            node.replace_with(*replacements)
+        else:
+            node.extract()
+        return
 
 
 def regenerate_reading_pdf(
@@ -2657,8 +2740,9 @@ def regenerate_reading_pdf(
 ) -> Path:
     """Regenerate the reading PDF for an existing markdown article.
 
-    Applies noise removal and highlight wrapping before rendering.
-    Bundle assets are never mutated — _generate_pdf resizes a staged copy.
+    Applies noise removal and highlight wrapping via ``_apply_html_annotations``
+    inside ``_generate_pdf``. Bundle assets are never mutated — the PDF render
+    uses a staged copy of the assets directory.
     """
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     md_raw = article_path.read_text(encoding="utf-8")
@@ -2667,8 +2751,13 @@ def regenerate_reading_pdf(
     title = article_path.stem
     article_dir = article_path.parent
     safe_name = article_path.stem
-    body = _apply_reader_annotations(body, highlights or [])
-    generated_pdf = _generate_pdf(body, title, article_dir, page_cfg["papersize"])
+    generated_pdf = _generate_pdf(
+        body,
+        title,
+        article_dir,
+        page_cfg["papersize"],
+        highlights=highlights,
+    )
     reading_pdf = article_dir / f"{safe_name}.reading.pdf"
     if generated_pdf != reading_pdf:
         generated_pdf.replace(reading_pdf)

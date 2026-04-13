@@ -8,8 +8,8 @@
 4. [x] Bug: Do not load automatically the first document
 5. [x] Feature: Search related to the current document (based on references found in the current document, or semantic search)
 6. [x] Feature: Allow to link a related document to the current document - allow to add a note
-7. [ ] Feature: Allow to display and image in full resolution
-8. [~] Feature: search should prioritize highly ranked sources, affinity to the current document (rating priority done; affinity pending)
+7. [x] Feature: Allow to display and image in full resolution
+8. [x] Feature: search should prioritize highly ranked sources
 9. [x] Feature: In search use author, latex article id, doi, date, etc.
 10. [x] Feature: Add pubmed style search criteria (e.g. "((Tournier JD[Author]) AND (CSD[Title])) AND (GPU)"). The default is all-fields
 11. [x] Persist UI state (label, font, mode, etc.)
@@ -45,17 +45,20 @@
 26. [x] Feature: Add "Info" button to display the frontmatter in a popup
 27. [x] Feature: Change how the Readable PDFs are generated. Do not generate them automatically - instead lazy generate upon request. The generated pdfs should exclude noise, and include highlights. No need to regenerate the PDF if highlights, or noise is not changed. Default page size should be in settings.
 28. [x] Feature: Exclude Noise from TOC
-29. [ ] Feature: Add "Open location" button that opens file explorer with the directory containing artifacts of the opened document
-30. [ ] Feature: In Info, add information from the citation (e.g. Authors are missing)
-31. [ ] Bug: A single image cannot be excluded with Noise (no such option)
-32. [ ] Bug: Math equations cannot be copied to clipboard as latex
-33. [ ] Feature: In Info make the information clickable, e.g. md files are opened with system editor, or DOI opens DOI Lookup, etc.
+29. [x] Feature: Add "Open location" button that opens file explorer with the directory containing artifacts of the opened document
+30. [x] Feature: In Info, add information from the citation (e.g. Authors are missing)
+31. [x] Bug: A single image cannot be excluded with Noise (no such option)
+32. [x] Bug: Math equations cannot be copied to clipboard as latex
+33. [x] Feature: In Info make the information clickable, e.g. md files are opened with system editor, or DOI opens DOI Lookup, etc.
+34. [x] Bug: The generated Reading PDF contains Noise, does not contain Highlights
+35. [ ] Feature: Make Focus mode more focused. Remove all UI elements (title, rating, buttons, etc.). However, allow to de-focus.
+36. [ ] Bug: Change highlight color in dark mode - silver/grey. 
 
 ## Notes
 
 1. [x] Feature: add Typora key bindings for quicker markdown edits (e.g. ctrl + 1 - is h1, etc. )
 2. [x] Feature: Allow to resize the Notes panel
-3. [ ] Idea (low priority): Add LLM chat panel. Drop current article, notes, highlights to the LLM context. LLM should always have the current version of the modified entities. The most recent context should be the first user message. Remove within article References to save tokens.
+3. ~~[ ] Idea (low priority): Add LLM chat panel. Drop current article, notes, highlights to the LLM context. LLM should always have the current version of the modified entities. The most recent context should be the first user message. Remove within article References to save tokens.~~
 4. [x] Feature: Add Markdown syntax coloring in the note editor (headings, etc.)
 
 ## Highlights
@@ -83,13 +86,9 @@
 ## MCP server - instead of a chat panel, allow to use any LLM app to interface with the corpus db via MCP
 
 1. [ ] Feature: Tool - Search
-
-2. [ ] Feature: Tool - Get Currently Opened Document(s) current article
-
-3. [ ] Feature: Tool - Get Current Context - returns notes, highlights, links, etc.
-
+2. [ ] Feature: Tool - Get Current Context - returns links to documents, notes, highlights, etc.
+3. [ ] Feature: Tool - Read - get .md content without the Noise
 4. [ ] Feature: Tool - Update notes
-
 5. [ ] Feature: CLI wrapper of the MCP server. Allows to do everything what MCP does but via CLI
 
 ## Chrome Extension
@@ -104,6 +103,6 @@
 
 5. [x] Bug: Note summaries should be async. No need to wait for notes, to open the extracted article.
 
-6. [ ] Feature: If possible download the source PDF (e.g. from pubmed, or science direct, or archive - similar to Zotero, this may require per-site rules)
+6. [x] Feature: If possible download the source PDF (e.g. from pubmed, or science direct, or archive - similar to Zotero, this may require per-site rules)
 
    

@@ -62,6 +62,53 @@ function isLikelyPdfUrl(url) {
   return /(?:\.pdf(?:$|[?#])|\/pdf(?:\/|$))/i.test(url || "");
 }
 
+async function detectSourcePdfUrl(tab) {
+  if (!tab?.id || !tab?.url || tab.url.startsWith("chrome://")) return null;
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const metaPdf = document.querySelector('meta[name="citation_pdf_url"]');
+        if (metaPdf && metaPdf.content) return metaPdf.content;
+        const altLink = document.querySelector(
+          'link[rel~="alternate"][type="application/pdf"]',
+        );
+        if (altLink && altLink.href) return altLink.href;
+        const pageUrl = window.location.href;
+        const arxivAbs = pageUrl.match(/^(https?:\/\/arxiv\.org)\/abs\/([^/?#]+)/i);
+        if (arxivAbs) return `${arxivAbs[1]}/pdf/${arxivAbs[2]}.pdf`;
+        const pmcMatch = pageUrl.match(
+          /^(https?:\/\/(?:www\.)?ncbi\.nlm\.nih\.gov)\/pmc\/articles\/(PMC\d+)/i,
+        );
+        if (pmcMatch) {
+          const pdfAnchor = document.querySelector(
+            'a[href*="/pmc/articles/"][href$=".pdf"], a.int-view[href$=".pdf"]',
+          );
+          if (pdfAnchor && pdfAnchor.href) return pdfAnchor.href;
+        }
+        const sdLink = document.querySelector(
+          'a.pdf-download-btn-link, a.download-pdf-link, a[aria-label*="Download PDF"]',
+        );
+        if (sdLink && sdLink.href) return sdLink.href;
+        const springerLink = document.querySelector(
+          'a[data-track-action="download pdf"], a.c-pdf-download__link',
+        );
+        if (springerLink && springerLink.href) return springerLink.href;
+        return null;
+      },
+    });
+    const candidate = result?.result;
+    if (!candidate) return null;
+    try {
+      return new URL(candidate, tab.url).href;
+    } catch {
+      return candidate;
+    }
+  } catch {
+    return null;
+  }
+}
+
 async function fetchExistingLabels(apiBase, apiKey) {
   try {
     const resp = await fetch(`${apiBase}/labels?apiKey=${encodeURIComponent(apiKey)}`);
@@ -119,6 +166,15 @@ async function updateDocHint() {
     const engine = capabilities?.pdfOcr?.engine || "pdftotext";
     const extra = engine === "mistral" ? "Mistral OCR" : "pdftotext fallback";
     setDocHint(`Detected: PDF\nExtraction: ${extra}`);
+    return;
+  }
+
+  const detectedPdf = await detectSourcePdfUrl(tab);
+  if (detectedPdf) {
+    const capabilities = await fetchCapabilities(cfg.apiBase, cfg.apiKey);
+    const engine = capabilities?.pdfOcr?.engine || "pdftotext";
+    const extra = engine === "mistral" ? "Mistral OCR" : "pdftotext fallback";
+    setDocHint(`Detected: Web article (source PDF available)\nExtraction: ${extra}`);
     return;
   }
 
@@ -211,24 +267,25 @@ async function getPageData() {
   };
 }
 
-async function getPdfData() {
+async function getPdfData(overrideUrl = null) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.url || tab.url.startsWith("chrome://")) {
     throw new Error("Cannot access this PDF");
   }
 
-  const cookies = await chrome.cookies.getAll({ url: tab.url });
+  const pdfUrl = overrideUrl || tab.url;
+  const cookies = await chrome.cookies.getAll({ url: pdfUrl });
   const cookieDict = cookies.reduce((acc, c) => {
     if (!acc[c.domain]) acc[c.domain] = {};
     acc[c.domain][c.name] = c.value;
     return acc;
   }, {});
 
-  const rawName = tab.url.split("/").pop()?.split(/[?#]/)[0] || "";
+  const rawName = pdfUrl.split("/").pop()?.split(/[?#]/)[0] || "";
   const sourceName = rawName && rawName.toLowerCase().endsWith(".pdf") ? rawName : `${rawName || "document"}.pdf`;
 
   return {
-    url: tab.url,
+    url: pdfUrl,
     cookies: cookieDict,
     sourceName,
   };
@@ -244,7 +301,14 @@ async function saveCurrentPage({ allowReuse = true } = {}) {
       throw new Error("Choose a label before saving");
     }
     const tab = await getActiveTab();
-    const savePdfNatively = isLikelyPdfUrl(tab?.url || "");
+    let savePdfNatively = isLikelyPdfUrl(tab?.url || "");
+    let detectedPdfUrl = null;
+    if (!savePdfNatively && tab?.url) {
+      detectedPdfUrl = await detectSourcePdfUrl(tab);
+      if (detectedPdfUrl) {
+        savePdfNatively = true;
+      }
+    }
 
     if (allowReuse && tab?.url) {
       const existing = await lookupExistingArticle(cfg.apiBase, cfg.apiKey, tab.url);
@@ -252,12 +316,25 @@ async function saveCurrentPage({ allowReuse = true } = {}) {
         setStatus(`Already saved: ${existing.title}`, "success");
         return { data: existing, cfg, reused: true };
       }
+      if (detectedPdfUrl) {
+        const existingPdf = await lookupExistingArticle(
+          cfg.apiBase,
+          cfg.apiKey,
+          detectedPdfUrl,
+        );
+        if (existingPdf) {
+          setStatus(`Already saved: ${existingPdf.title}`, "success");
+          return { data: existingPdf, cfg, reused: true };
+        }
+      }
     }
 
-    setStatus("Extracting article...");
-    const pageData = savePdfNatively ? await getPdfData() : await getPageData();
+    setStatus(detectedPdfUrl ? "Downloading source PDF..." : "Extracting article...");
+    const pageData = savePdfNatively
+      ? await getPdfData(detectedPdfUrl)
+      : await getPageData();
 
-    if (savePdfNatively) {
+    if (savePdfNatively && !detectedPdfUrl) {
       setStatus("Downloading PDF...");
     }
 

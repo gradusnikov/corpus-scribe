@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from article_extractor import (
+    _apply_html_annotations,
     _convert_html_to_markdown,
     _derive_citation_metadata,
     _download_image,
@@ -431,6 +432,42 @@ class ArticleExtractorTests(unittest.TestCase):
                 self.assertEqual(im.format, "PNG")
                 self.assertEqual(im.width, 240)
                 self.assertEqual(im.mode, "RGBA")
+
+    def test_apply_html_annotations_wraps_highlights_and_strips_noise(self):
+        """Reading-PDF noise filtering operates on HTML, not raw markdown."""
+        html = (
+            "<p>Keep this. Remove this sentence. Keep that "
+            "<em>highlighted phrase</em> inside.</p>"
+            "<figure><img src='a.png'/></figure>"
+            "<figure><img src='b.png'/></figure>"
+            "<table><tr><td>one</td></tr></table>"
+        )
+        highlights = [
+            {"text": "Remove this sentence.", "variant": "noise"},
+            {"text": "highlighted phrase"},
+            {
+                "kind": "element",
+                "variant": "noise",
+                "elementType": "img",
+                "elementIndex": 1,
+            },
+            {
+                "kind": "element",
+                "variant": "noise",
+                "elementType": "table",
+                "elementIndex": 0,
+            },
+        ]
+        out = _apply_html_annotations(html, highlights)
+
+        self.assertNotIn("Remove this sentence.", out)
+        self.assertIn(
+            '<mark class="reading-highlight">highlighted phrase</mark>',
+            out,
+        )
+        self.assertIn("a.png", out)
+        self.assertNotIn("b.png", out)
+        self.assertNotIn("<table", out)
 
     def test_generate_pdf_keeps_bundle_assets_at_full_resolution(self):
         """Bundle assets must not be destructively resized by PDF generation."""

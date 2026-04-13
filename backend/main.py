@@ -4,6 +4,9 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1339,6 +1342,7 @@ def desktop_search():
     root = _resolve_library_root(data.get("root"))
     query = (data.get("query") or "").strip()
     label = (data.get("label") or "").strip()
+    active_path_raw = (data.get("activeArticlePath") or "").strip()
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
     if not query:
@@ -1349,13 +1353,34 @@ def desktop_search():
     except _SearchQueryError as exc:
         return jsonify(success=False, message=f"Invalid query: {exc}"), 400
 
+    affinity_context: dict | None = None
+    if active_path_raw:
+        active_path = Path(active_path_raw)
+        if active_path.exists() and active_path.is_file():
+            try:
+                affinity_context = _load_affinity_context(active_path)
+            except Exception:
+                affinity_context = None
+
     results: list[dict] = []
     for doc in _scan_library_documents(root):
         if label and label != "all" and (doc.get("label") or "") != label:
             continue
         haystack = _DocSearchHaystack(doc)
         if _evaluate_search_query(tree, haystack):
+            if affinity_context is not None:
+                doc["affinityScore"] = _compute_affinity_score(doc, affinity_context)
             results.append(doc)
+
+    if affinity_context is not None:
+        results.sort(
+            key=lambda item: (
+                -int(item.get("affinityScore") or 0),
+                -int(item.get("rating") or 0),
+                item.get("ingestedAt") or "",
+                (item.get("title") or "").casefold(),
+            ),
+        )
 
     return jsonify(success=True, documents=results[:200])
 
@@ -1591,6 +1616,89 @@ def _title_tokens(title: str) -> set[str]:
         "using", "based", "toward", "towards", "among", "also",
     }
     return {token for token in tokens if token not in stopwords}
+
+
+def _load_affinity_context(article_path: Path) -> dict:
+    """Collect reference IDs, title tokens, and user-linked related paths.
+
+    Returned dict is consumed by ``_compute_affinity_score`` to boost search
+    results that relate to a currently opened document.
+    """
+    try:
+        body = _read_markdown_body(article_path)
+    except Exception:
+        body = ""
+    frontmatter, _ = _split_frontmatter(article_path.read_text(encoding="utf-8"))
+    title = _frontmatter_string(frontmatter, "title") or article_path.stem
+    related_paths: set[str] = set()
+    for item in _load_related(article_path):
+        raw = item.get("articlePath")
+        if isinstance(raw, str) and raw:
+            try:
+                related_paths.add(str(Path(raw).resolve()))
+            except Exception:
+                related_paths.add(raw)
+    try:
+        self_path = str(article_path.resolve())
+    except Exception:
+        self_path = str(article_path)
+    return {
+        "reference_ids": _extract_reference_ids(body),
+        "title_tokens": _title_tokens(title),
+        "related_paths": related_paths,
+        "self_path": self_path,
+    }
+
+
+def _compute_affinity_score(doc: dict, context: dict) -> int:
+    """Return an affinity score between ``doc`` and the active article.
+
+    Higher means more relevant. Scoring prioritizes hard references (shared
+    DOI/arxiv/pmid/pmcid), then user-saved related links, then soft title
+    token overlap.
+    """
+    try:
+        doc_resolved = str(Path(doc.get("articlePath") or "").resolve())
+    except Exception:
+        doc_resolved = doc.get("articlePath") or ""
+    if doc_resolved == context.get("self_path"):
+        return 0
+
+    meta = doc.get("metadataText") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    references = context.get("reference_ids") or {
+        "doi": set(),
+        "arxiv": set(),
+        "pmid": set(),
+        "pmcid": set(),
+    }
+
+    score = 0
+    doc_doi = _normalize_reference_id(meta.get("doi") or "")
+    if doc_doi and doc_doi in references["doi"]:
+        score += 20
+    doc_arxiv = _normalize_reference_id(meta.get("arxiv_id") or "")
+    if doc_arxiv:
+        bare = doc_arxiv.split("v", 1)[0]
+        if doc_arxiv in references["arxiv"] or bare in references["arxiv"]:
+            score += 20
+    doc_pmid = _normalize_reference_id(meta.get("pmid") or "")
+    if doc_pmid and doc_pmid in references["pmid"]:
+        score += 20
+    doc_pmcid = _normalize_reference_id(meta.get("pmcid") or "")
+    if doc_pmcid and doc_pmcid in references["pmcid"]:
+        score += 20
+
+    related_paths = context.get("related_paths") or set()
+    if doc_resolved in related_paths:
+        score += 15
+
+    title_tokens = context.get("title_tokens") or set()
+    overlap = title_tokens & _title_tokens(doc.get("title") or "")
+    score += len(overlap)
+
+    return score
 
 
 @app.route("/desktop/related/suggest", methods=["GET"])
@@ -1839,6 +1947,84 @@ def desktop_file():
         return jsonify(success=False, message=f"File not found: {path}"), 404
     download_flag = request.args.get("download", "").strip().lower() in {"1", "true", "yes"}
     return send_file(path, as_attachment=download_flag, download_name=path.name if download_flag else None)
+
+
+def _try_open_with_host_tool(target: str) -> bool:
+    """Attempt to hand ``target`` to the host's file manager / default opener.
+
+    Returns True if a launcher was found and executed without raising. The
+    backend may be running inside a container with no desktop session, in
+    which case every launcher will be absent and this returns False — callers
+    should fall back to surfacing the path directly.
+    """
+    candidates: list[list[str]] = []
+    if sys.platform == "darwin":
+        candidates.append(["open", target])
+    elif sys.platform.startswith("win"):
+        candidates.append(["explorer", target])
+    else:
+        for cmd in ("wslview", "xdg-open", "gio", "gnome-open", "kde-open"):
+            if cmd == "gio":
+                candidates.append([cmd, "open", target])
+            else:
+                candidates.append([cmd, target])
+        candidates.append(["explorer.exe", target])
+    for argv in candidates:
+        if not shutil.which(argv[0]):
+            continue
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+@app.route("/desktop/reveal", methods=["POST"])
+def desktop_reveal():
+    """Reveal the bundle directory for a document in the host's file manager.
+
+    When the backend is running inside Docker no GUI opener is available, so
+    the endpoint also returns ``directoryPath`` and ``launched=False`` for the
+    caller to display to the user (e.g. copy-to-clipboard fallback).
+    """
+    data = request.get_json(silent=True) or {}
+    raw_path = (data.get("path") or data.get("articlePath") or "").strip()
+    if not raw_path:
+        return jsonify(success=False, message="Missing path"), 400
+    target = Path(raw_path)
+    if not target.exists():
+        return jsonify(success=False, message=f"Path not found: {target}"), 404
+    directory = target if target.is_dir() else target.parent
+    launched = _try_open_with_host_tool(str(directory))
+    return jsonify(
+        success=True,
+        directoryPath=str(directory),
+        launched=launched,
+    )
+
+
+@app.route("/desktop/open_external", methods=["POST"])
+def desktop_open_external():
+    """Open a local file or a web URL via the host's default handler.
+
+    Mirrors ``/desktop/reveal`` but targets a file instead of its parent
+    directory. For web URLs the frontend is expected to open a new tab
+    directly — this endpoint only handles filesystem targets.
+    """
+    data = request.get_json(silent=True) or {}
+    raw_path = (data.get("path") or "").strip()
+    if not raw_path:
+        return jsonify(success=False, message="Missing path"), 400
+    target = Path(raw_path)
+    if not target.exists():
+        return jsonify(success=False, message=f"Path not found: {target}"), 404
+    launched = _try_open_with_host_tool(str(target))
+    return jsonify(
+        success=True,
+        path=str(target),
+        launched=launched,
+    )
 
 
 if __name__ == "__main__":
