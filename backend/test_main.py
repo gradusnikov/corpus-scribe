@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -37,7 +38,9 @@ class MainApiTests(unittest.TestCase):
                     "ingested_at": "2026-04-12T10:00:00+00:00",
                 },
             }
-            with patch.object(main, "_upsert_index_records") as upsert_mock:
+            with patch.object(main, "_upsert_index_records") as upsert_mock, patch.object(
+                main, "_spawn_async_notes_generation"
+            ) as spawn_mock:
                 response = self.client.post(
                     "/save_local",
                     json={
@@ -66,9 +69,18 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(extract_article_mock.call_args.kwargs["label"], "Deep Learning")
         self.assertFalse(extract_article_mock.call_args.kwargs["pdf_required"])
         self.assertFalse(extract_article_mock.call_args.kwargs["render_pdf"])
-        self.assertTrue(extract_article_mock.call_args.kwargs["generate_notes"])
+        self.assertFalse(extract_article_mock.call_args.kwargs["generate_notes"])
         self.assertEqual(
             extract_article_mock.call_args.kwargs["notes_config"]["provider"],
+            "openai",
+        )
+        spawn_mock.assert_called_once()
+        self.assertEqual(
+            str(spawn_mock.call_args.args[0]),
+            f"{tmpdir}/Deep Learning/Fixture/Fixture.md",
+        )
+        self.assertEqual(
+            spawn_mock.call_args.args[1]["provider"],
             "openai",
         )
         upsert_records = upsert_mock.call_args.args[0]
@@ -109,7 +121,9 @@ class MainApiTests(unittest.TestCase):
                     "ingested_at": "2026-04-12T10:00:00+00:00",
                 },
             }
-            with patch.object(main, "_upsert_index_records") as upsert_mock:
+            with patch.object(main, "_upsert_index_records") as upsert_mock, patch.object(
+                main, "_spawn_async_notes_generation"
+            ) as spawn_mock:
                 response = self.client.post(
                     "/save_pdf",
                     json={
@@ -133,11 +147,17 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["metadata"]["page_count"], 12)
         self.assertEqual(extract_pdf_url_mock.call_args.kwargs["output_dir"], f"{tmpdir}/Papers")
         self.assertEqual(extract_pdf_url_mock.call_args.kwargs["label"], "Papers")
+        self.assertFalse(extract_pdf_url_mock.call_args.kwargs["generate_notes"])
         upsert_records = upsert_mock.call_args.args[0]
         article_record = next(item for item in upsert_records if item["type"] == "article")
         self.assertEqual(article_record["source_format"], "pdf")
         self.assertEqual(article_record["citation_key"], "doe2026fixturepdf")
         self.assertEqual(article_record["page_count"], 12)
+        spawn_mock.assert_called_once()
+        self.assertEqual(
+            str(spawn_mock.call_args.args[0]),
+            f"{tmpdir}/Papers/Fixture PDF/Fixture PDF.md",
+        )
 
     def test_labels_returns_existing_output_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -340,6 +360,44 @@ class MainApiTests(unittest.TestCase):
         self.assertIn("- Generated.", payload["notesMarkdown"])
         self.assertIn('notes_file: "Article.notes.md"', article_text)
         self.assertIn('notes_doc_id: "fixture-article:notes"', article_text)
+
+    def test_spawn_async_notes_generation_runs_in_background_thread(self):
+        article_path = Path("/tmp/async-fixture.md")
+        notes_config = {"provider": "openai"}
+
+        captured = {}
+        completion = threading.Event()
+
+        def fake_generate(path, config):
+            captured["path"] = path
+            captured["config"] = config
+            completion.set()
+
+        with patch.object(main, "_generate_existing_notes", side_effect=fake_generate):
+            main._spawn_async_notes_generation(article_path, notes_config)
+            self.assertTrue(completion.wait(timeout=2.0))
+
+        self.assertEqual(captured["path"], article_path)
+        self.assertEqual(captured["config"], notes_config)
+
+    def test_spawn_async_notes_generation_swallows_errors(self):
+        article_path = Path("/tmp/async-fixture.md")
+
+        completion = threading.Event()
+
+        def boom(path, config):
+            completion.set()
+            raise RuntimeError("LLM down")
+
+        with patch.object(main, "_generate_existing_notes", side_effect=boom), patch.object(
+            main.app.logger, "exception"
+        ) as logger_mock:
+            main._spawn_async_notes_generation(article_path, None)
+            self.assertTrue(completion.wait(timeout=2.0))
+            for thread in threading.enumerate():
+                if thread.name == "scribe-notes-async":
+                    thread.join(timeout=2.0)
+            logger_mock.assert_called_once()
 
     def test_desktop_save_notes_preserves_existing_frontmatter(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):

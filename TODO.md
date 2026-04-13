@@ -47,6 +47,9 @@
 28. [x] Feature: Exclude Noise from TOC
 29. [ ] Feature: Add "Open location" button that opens file explorer with the directory containing artifacts of the opened document
 30. [ ] Feature: In Info, add information from the citation (e.g. Authors are missing)
+31. [ ] Bug: A single image cannot be excluded with Noise (no such option)
+32. [ ] Bug: Math equations cannot be copied to clipboard as latex
+33. [ ] Feature: In Info make the information clickable, e.g. md files are opened with system editor, or DOI opens DOI Lookup, etc.
 
 ## Notes
 
@@ -99,6 +102,8 @@
 
 4. [x] Bug: When user tries to re-download already existing article, do not re-download
 
-5. [ ] Bug: Note summaries should be async. No need to wait for notes, to open the extracted article.
+5. [x] Bug: Note summaries should be async. No need to wait for notes, to open the extracted article.
+
+6. [ ] Feature: If possible download the source PDF (e.g. from pubmed, or science direct, or archive - similar to Zotero, this may require per-site rules)
 
    

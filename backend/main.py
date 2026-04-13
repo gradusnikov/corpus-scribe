@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -637,7 +638,7 @@ def _build_existing_article_payload(article_path: Path) -> dict:
     return payload
 
 
-def _generate_existing_notes(article_path: Path) -> dict:
+def _generate_existing_notes(article_path: Path, notes_config: dict | None = None) -> dict:
     article_text = article_path.read_text(encoding="utf-8")
     article_frontmatter, article_body = _split_frontmatter(article_text)
     notes_file = _generate_companion_notes(
@@ -653,7 +654,7 @@ def _generate_existing_notes(article_path: Path) -> dict:
             "label": _frontmatter_string(article_frontmatter, "label"),
             "language": _frontmatter_string(article_frontmatter, "language"),
             "ingested_at": _frontmatter_string(article_frontmatter, "ingested_at"),
-            "notes_config": {},
+            "notes_config": notes_config or {},
         },
     )
     article_frontmatter["notes_file"] = notes_file.name
@@ -664,6 +665,18 @@ def _generate_existing_notes(article_path: Path) -> dict:
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
     return payload
+
+
+def _spawn_async_notes_generation(article_path: Path, notes_config: dict | None = None) -> None:
+    """Kick off companion-notes generation in a background thread."""
+    def _run():
+        try:
+            _generate_existing_notes(article_path, notes_config)
+        except Exception:
+            app.logger.exception("Async notes generation failed for %s", article_path)
+
+    thread = threading.Thread(target=_run, name="scribe-notes-async", daemon=True)
+    thread.start()
 
 
 def _notes_markdown_to_html(notes_markdown: str) -> str:
@@ -820,7 +833,7 @@ def save_local():
         label=_clean_label(label),
         render_pdf=False,
         pdf_required=False,
-        generate_notes=True,
+        generate_notes=False,
         notes_config=notes_config,
     )
 
@@ -842,6 +855,9 @@ def save_local():
         "metadata": metadata.get("metadata", {}),
     }
     _upsert_index_records(_build_index_records(payload, _clean_label(label)))
+
+    if metadata.get("md-path"):
+        _spawn_async_notes_generation(Path(metadata["md-path"]), notes_config)
 
     return jsonify(**payload)
 
@@ -866,7 +882,7 @@ def save_pdf():
         source_name=data.get("sourceName", ""),
         page_size=data.get("pageSize", "a5"),
         label=_clean_label(label),
-        generate_notes=True,
+        generate_notes=False,
         notes_config=notes_config,
     )
 
@@ -890,6 +906,9 @@ def save_pdf():
         "metadata": metadata.get("metadata", {}),
     }
     _upsert_index_records(_build_index_records(payload, _clean_label(label)))
+
+    if metadata.get("md-path"):
+        _spawn_async_notes_generation(Path(metadata["md-path"]), notes_config)
 
     return jsonify(**payload)
 
