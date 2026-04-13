@@ -1727,6 +1727,16 @@ select {
   padding: 6px 8px;
 }
 
+.related-suggestion {
+  border-style: dashed;
+  background: transparent;
+}
+
+.related-reason {
+  margin: 0;
+  font-size: 0.75rem;
+}
+
 .highlight-card p {
   margin: 0;
   color: var(--color-text-primary);

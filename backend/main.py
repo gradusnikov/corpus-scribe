@@ -1533,6 +1533,128 @@ def desktop_save_highlights():
     return jsonify(success=True, highlightsPath=str(highlights_path), highlights=cleaned)
 
 
+_DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/[\w.\-;()/:]+", re.IGNORECASE)
+_ARXIV_PATTERN = re.compile(r"\b(?:arxiv[:\s]*)?(\d{4}\.\d{4,5})(?:v\d+)?\b", re.IGNORECASE)
+_PMID_PATTERN = re.compile(r"\bpmid[:\s]*(\d{4,9})\b", re.IGNORECASE)
+_PMCID_PATTERN = re.compile(r"\bPMC\d{4,9}\b", re.IGNORECASE)
+
+
+def _normalize_reference_id(value: str) -> str:
+    return value.strip().lower().rstrip(".,);:")
+
+
+def _extract_reference_ids(body: str) -> dict[str, set[str]]:
+    found = {
+        "doi": set(),
+        "arxiv": set(),
+        "pmid": set(),
+        "pmcid": set(),
+    }
+    for match in _DOI_PATTERN.finditer(body):
+        found["doi"].add(_normalize_reference_id(match.group(0)))
+    for match in _ARXIV_PATTERN.finditer(body):
+        found["arxiv"].add(_normalize_reference_id(match.group(1)))
+    for match in _PMID_PATTERN.finditer(body):
+        found["pmid"].add(_normalize_reference_id(match.group(1)))
+    for match in _PMCID_PATTERN.finditer(body):
+        found["pmcid"].add(_normalize_reference_id(match.group(0)))
+    return found
+
+
+def _title_tokens(title: str) -> set[str]:
+    lowered = title.lower()
+    tokens = re.findall(r"[a-z0-9][a-z0-9\-]{3,}", lowered)
+    stopwords = {
+        "with", "from", "this", "that", "into", "over", "such",
+        "their", "they", "than", "these", "those", "which", "about",
+        "when", "what", "where", "some", "have", "does", "doing",
+        "using", "based", "toward", "towards", "among", "also",
+    }
+    return {token for token in tokens if token not in stopwords}
+
+
+@app.route("/desktop/related/suggest", methods=["GET"])
+def desktop_suggest_related():
+    article_arg = request.args.get("articlePath", "").strip()
+    if not article_arg:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    article_path = Path(article_arg)
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+
+    root = _resolve_library_root(request.args.get("root"))
+    if not root.exists():
+        return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
+
+    try:
+        body = _read_markdown_body(article_path)
+    except Exception as exc:
+        return jsonify(success=False, message=f"Failed to read document: {exc}"), 500
+
+    source_frontmatter, _ = _split_frontmatter(article_path.read_text(encoding="utf-8"))
+    source_title = _frontmatter_string(source_frontmatter, "title") or article_path.stem
+    source_title_tokens = _title_tokens(source_title)
+
+    reference_ids = _extract_reference_ids(body)
+
+    try:
+        source_resolved = article_path.resolve()
+    except Exception:
+        source_resolved = article_path
+
+    suggestions: list[dict] = []
+    for doc in _scan_library_documents(root):
+        try:
+            doc_resolved = Path(doc["articlePath"]).resolve()
+        except Exception:
+            doc_resolved = Path(doc["articlePath"])
+        if doc_resolved == source_resolved:
+            continue
+        meta = doc.get("metadataText") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        reasons: list[str] = []
+        doc_doi = _normalize_reference_id(meta.get("doi") or "")
+        if doc_doi and doc_doi in reference_ids["doi"]:
+            reasons.append(f"Cited DOI {doc_doi}")
+        doc_arxiv = _normalize_reference_id(meta.get("arxiv_id") or "")
+        if doc_arxiv:
+            bare = doc_arxiv.split("v", 1)[0]
+            if doc_arxiv in reference_ids["arxiv"] or bare in reference_ids["arxiv"]:
+                reasons.append(f"Cited arXiv {doc_arxiv}")
+        doc_pmid = _normalize_reference_id(meta.get("pmid") or "")
+        if doc_pmid and doc_pmid in reference_ids["pmid"]:
+            reasons.append(f"Cited PMID {doc_pmid}")
+        doc_pmcid = _normalize_reference_id(meta.get("pmcid") or "")
+        if doc_pmcid and doc_pmcid in reference_ids["pmcid"]:
+            reasons.append(f"Cited {doc_pmcid.upper()}")
+        doc_title_tokens = _title_tokens(doc.get("title") or "")
+        overlap = source_title_tokens & doc_title_tokens
+        score = 10 * len(reasons) + len(overlap)
+        if reasons:
+            suggestions.append(
+                {
+                    **doc,
+                    "score": score,
+                    "reasons": reasons,
+                    "sharedTerms": sorted(overlap),
+                }
+            )
+            continue
+        if len(overlap) >= 2:
+            suggestions.append(
+                {
+                    **doc,
+                    "score": score,
+                    "reasons": [f"Shared terms: {', '.join(sorted(overlap))}"],
+                    "sharedTerms": sorted(overlap),
+                }
+            )
+
+    suggestions.sort(key=lambda item: (-int(item.get("score") or 0), item.get("title") or ""))
+    return jsonify(success=True, suggestions=suggestions[:30])
+
+
 @app.route("/desktop/related", methods=["POST"])
 def desktop_save_related():
     data = request.get_json(silent=True) or {}

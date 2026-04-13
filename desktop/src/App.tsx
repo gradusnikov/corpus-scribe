@@ -254,6 +254,17 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return data as T
     }
+    case 'suggest_related': {
+      const params = new URLSearchParams()
+      if (payload.articlePath) params.set('articlePath', String(payload.articlePath))
+      if (payload.root) params.set('root', String(payload.root))
+      const response = await fetch(`${browserApiBase}/desktop/related/suggest?${params.toString()}`)
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to load suggestions')
+      }
+      return (data.suggestions ?? []) as T
+    }
     case 'save_related': {
       const response = await fetch(`${browserApiBase}/desktop/related`, {
         method: 'POST',
@@ -1422,6 +1433,9 @@ function App() {
   const [relatedPickerQuery, setRelatedPickerQuery] = useState('')
   const [relatedDraftNote, setRelatedDraftNote] = useState('')
   const [relatedSaving, setRelatedSaving] = useState(false)
+  type RelatedSuggestion = DocumentSummary & { score: number; reasons: string[]; sharedTerms: string[] }
+  const [relatedSuggestions, setRelatedSuggestions] = useState<RelatedSuggestion[]>([])
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false)
   const [loadingLibrary, setLoadingLibrary] = useState(false)
   const [reindexing, setReindexing] = useState(false)
   const [searching, setSearching] = useState(false)
@@ -1988,6 +2002,7 @@ function App() {
       setNotesDraft(loaded.notesMarkdown)
       setHighlights(loaded.highlights)
       setRelatedLinks(loaded.related ?? [])
+      setRelatedSuggestions([])
       setRelatedDraftNote('')
       setRelatedPickerQuery('')
       setPendingSelection(null)
@@ -2146,6 +2161,23 @@ function App() {
       setStatus(stringifyError(error))
     } finally {
       setRelatedSaving(false)
+    }
+  }
+
+  async function loadRelatedSuggestions() {
+    if (!detail) return
+    setLoadingSuggestions(true)
+    try {
+      const items = await desktopCommand<RelatedSuggestion[]>('suggest_related', {
+        articlePath: detail.summary.articlePath,
+        root: library.root || null,
+      })
+      setRelatedSuggestions(items)
+      setStatus(items.length ? `Found ${items.length} suggestions` : 'No related documents found in library')
+    } catch (error) {
+      setStatus(stringifyError(error))
+    } finally {
+      setLoadingSuggestions(false)
     }
   }
 
@@ -3867,18 +3899,61 @@ function App() {
             <section className="info-card">
               <div className="highlights-header">
                 <h3>Related</h3>
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => {
-                    setRelatedPickerOpen((value) => !value)
-                    setRelatedPickerQuery('')
-                  }}
-                  disabled={relatedSaving}
-                >
-                  {relatedPickerOpen ? 'Cancel' : '+ Link'}
-                </button>
+                <div className="notes-mode-toggle">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => void loadRelatedSuggestions()}
+                    disabled={loadingSuggestions}
+                    title="Find documents in the library that this one references"
+                  >
+                    {loadingSuggestions ? 'Suggesting…' : 'Suggest'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => {
+                      setRelatedPickerOpen((value) => !value)
+                      setRelatedPickerQuery('')
+                    }}
+                    disabled={relatedSaving}
+                  >
+                    {relatedPickerOpen ? 'Cancel' : '+ Link'}
+                  </button>
+                </div>
               </div>
+              {relatedSuggestions.length ? (
+                <ul className="related-list">
+                  {relatedSuggestions
+                    .filter((suggestion) => !relatedLinks.some((link) => link.targetPath === suggestion.articlePath))
+                    .map((suggestion) => (
+                      <li key={`suggest-${suggestion.id}`} className="related-item related-suggestion">
+                        <div className="related-row">
+                          <button
+                            type="button"
+                            className="related-title"
+                            onClick={() => void loadDocumentByPath(suggestion.articlePath, suggestion.title)}
+                            title={suggestion.articlePath}
+                          >
+                            {suggestion.title}
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost-button highlight-button"
+                            onClick={() => void addRelatedLink(suggestion)}
+                            disabled={relatedSaving}
+                            title="Save as a related link"
+                          >
+                            + Link
+                          </button>
+                        </div>
+                        {suggestion.reasons.length ? (
+                          <p className="muted related-reason">{suggestion.reasons.join(' · ')}</p>
+                        ) : null}
+                      </li>
+                    ))}
+                </ul>
+              ) : null}
               {relatedPickerOpen ? (
                 <div className="related-picker">
                   <input

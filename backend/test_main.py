@@ -826,6 +826,75 @@ class MainApiTests(unittest.TestCase):
             self.assertEqual(cleared.status_code, 200)
             self.assertFalse((root / "A.related.json").exists())
 
+    def test_desktop_related_suggest_matches_by_doi_and_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "neuro").mkdir()
+
+            source = root / "neuro" / "Source.md"
+            source.write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution Review"\n'
+                'label: "neuro"\n'
+                "---\n\n"
+                "We build on prior work (10.1016/j.neuroimage.2007.02.016) "
+                "and compare with the methods from PMID:12345678. "
+                "Related work on arxiv 1706.03762 provides context.\n",
+                encoding="utf-8",
+            )
+
+            cited_doi = root / "neuro" / "Tournier.md"
+            cited_doi.write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution"\n'
+                'label: "neuro"\n'
+                'doi: "10.1016/j.neuroimage.2007.02.016"\n'
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            cited_arxiv = root / "neuro" / "Transformer.md"
+            cited_arxiv.write_text(
+                "---\n"
+                'title: "Attention Is All You Need"\n'
+                'label: "neuro"\n'
+                'arxiv_id: "1706.03762"\n'
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            cited_pmid = root / "neuro" / "Pmid.md"
+            cited_pmid.write_text(
+                "---\n"
+                'title: "Random PMID Paper"\n'
+                'label: "neuro"\n'
+                'pmid: "12345678"\n'
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            unrelated = root / "neuro" / "Unrelated.md"
+            unrelated.write_text(
+                "---\n"
+                'title: "Completely Unrelated Topic"\n'
+                'label: "neuro"\n'
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get(
+                "/desktop/related/suggest",
+                query_string={"articlePath": str(source), "root": str(root)},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            titles = {doc["title"] for doc in payload["suggestions"]}
+            self.assertIn("Constrained Spherical Deconvolution", titles)
+            self.assertIn("Attention Is All You Need", titles)
+            self.assertIn("Random PMID Paper", titles)
+            self.assertNotIn("Completely Unrelated Topic", titles)
+
     def test_desktop_related_rejects_self_link(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             article = Path(tmpdir) / "A.md"
