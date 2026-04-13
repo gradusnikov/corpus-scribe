@@ -162,6 +162,337 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["pdfOcr"]["engine"], "mistral")
         self.assertEqual(payload["pdfOcr"]["fallback"], "pdftotext")
 
+    def test_desktop_document_includes_highlights(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'label: "Research"\n'
+                'source_site: "example.com"\n'
+                'ingested_at: "2026-04-13T09:00:00+00:00"\n'
+                "---\n\n"
+                "# Fixture\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+            highlights_path = article_path.with_name("Article.highlights.json")
+            highlights_path.write_text(
+                json.dumps(
+                    {
+                        "articlePath": str(article_path),
+                        "highlights": [
+                            {
+                                "id": "h1",
+                                "text": "Important sentence",
+                                "createdAt": "2026-04-13T09:30:00+00:00",
+                                "startOffset": 12,
+                                "endOffset": 30,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            response = self.client.get("/desktop/document", query_string={"articlePath": str(article_path)})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["detail"]["summary"]["highlightCount"], 1)
+        self.assertEqual(payload["detail"]["highlights"][0]["id"], "h1")
+        self.assertEqual(payload["detail"]["highlights"][0]["text"], "Important sentence")
+        self.assertEqual(payload["detail"]["highlights"][0]["startOffset"], 12)
+        self.assertEqual(payload["detail"]["highlights"][0]["endOffset"], 30)
+
+    def test_desktop_save_highlights_writes_sibling_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'doc_id: "fixture-article"\n'
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/highlights",
+                json={
+                    "articlePath": str(article_path),
+                    "highlights": [
+                        {
+                            "id": "highlight-1",
+                            "text": "A highlighted quote",
+                            "createdAt": "2026-04-13T10:00:00+00:00",
+                            "startOffset": 4,
+                            "endOffset": 23,
+                        }
+                    ],
+                },
+            )
+
+            highlights_path = article_path.with_name("Article.highlights.json")
+            saved = json.loads(highlights_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["highlightsPath"], str(highlights_path))
+        self.assertEqual(saved["highlights"][0]["id"], "highlight-1")
+        self.assertEqual(saved["highlights"][0]["text"], "A highlighted quote")
+        self.assertEqual(saved["highlights"][0]["startOffset"], 4)
+        self.assertEqual(saved["highlights"][0]["endOffset"], 23)
+
+    @patch("main._generate_companion_notes")
+    def test_desktop_generate_notes_backfills_existing_article(self, generate_notes_mock):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Label" / "Article" / "Article.md"
+            article_path.parent.mkdir(parents=True, exist_ok=True)
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'doc_id: "fixture-article"\n'
+                'label: "Label"\n'
+                'source_site: "example.com"\n'
+                'ingested_at: "2026-04-13T09:00:00+00:00"\n'
+                "---\n\n"
+                "# Fixture\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+            notes_path = article_path.with_name("Article.notes.md")
+            generate_notes_mock.return_value = notes_path
+            notes_path.write_text(
+                "---\n"
+                'title: "Fixture Article Notes"\n'
+                'doc_id: "fixture-article:notes"\n'
+                'doc_type: "notes"\n'
+                'source_article: "Article.md"\n'
+                'source_doc_id: "fixture-article"\n'
+                "---\n\n"
+                "# Notes\n\n- Generated.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/notes/generate",
+                json={"articlePath": str(article_path)},
+            )
+
+            article_text = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["notesPath"], str(notes_path))
+        self.assertIn("- Generated.", payload["notesMarkdown"])
+        self.assertIn('notes_file: "Article.notes.md"', article_text)
+        self.assertIn('notes_doc_id: "fixture-article:notes"', article_text)
+
+    def test_desktop_save_notes_preserves_existing_frontmatter(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'doc_id: "fixture-article"\n'
+                'label: "Research"\n'
+                'source_site: "example.com"\n'
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+            notes_path = article_path.with_name("Article.notes.md")
+            notes_path.write_text(
+                "---\n"
+                'title: "Fixture Article Notes"\n'
+                'doc_id: "fixture-article:notes"\n'
+                'doc_type: "notes"\n'
+                'type: "companion_notes"\n'
+                'generated_by: "anthropic:claude-sonnet-4-20250514"\n'
+                'source_article: "Article.md"\n'
+                'source_doc_id: "fixture-article"\n'
+                "---\n\n"
+                "- Old notes.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/notes",
+                json={
+                    "articlePath": str(article_path),
+                    "notesMarkdown": "# Notes\n\n- Updated.\n",
+                },
+            )
+
+            saved_notes = notes_path.read_text(encoding="utf-8")
+            saved_article = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["notesPath"], str(notes_path))
+        self.assertIn('generated_by: "anthropic:claude-sonnet-4-20250514"', saved_notes)
+        self.assertIn('source_article: "Article.md"', saved_notes)
+        self.assertIn("- Updated.", saved_notes)
+        self.assertIn('notes_file: "Article.notes.md"', saved_article)
+
+
+    def test_desktop_save_rating_writes_frontmatter(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'doc_id: "fixture-article"\n'
+                'label: "Research"\n'
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/rating",
+                json={"articlePath": str(article_path), "rating": 4},
+            )
+
+            saved = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["rating"], 4)
+        self.assertIn("rating: 4", saved)
+
+    def test_desktop_save_rating_zero_clears_frontmatter(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'doc_id: "fixture-article"\n'
+                "rating: 5\n"
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/rating",
+                json={"articlePath": str(article_path), "rating": 0},
+            )
+
+            saved = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["rating"], 0)
+        self.assertNotIn("rating:", saved)
+
+    def test_desktop_save_rating_rejects_out_of_range(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                "---\n\n"
+                "Body.\n",
+                encoding="utf-8",
+            )
+
+            too_high = self.client.post(
+                "/desktop/rating",
+                json={"articlePath": str(article_path), "rating": 6},
+            )
+            negative = self.client.post(
+                "/desktop/rating",
+                json={"articlePath": str(article_path), "rating": -1},
+            )
+            non_numeric = self.client.post(
+                "/desktop/rating",
+                json={"articlePath": str(article_path), "rating": "five"},
+            )
+
+            saved = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(too_high.status_code, 400)
+        self.assertEqual(negative.status_code, 400)
+        self.assertEqual(non_numeric.status_code, 400)
+        self.assertNotIn("rating:", saved)
+
+    def test_desktop_save_rating_missing_article_returns_404(self):
+        response = self.client.post(
+            "/desktop/rating",
+            json={"articlePath": "/nonexistent/Article.md", "rating": 3},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_desktop_library_sorts_by_rating(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "low").mkdir()
+            (root / "low" / "Low.md").write_text(
+                "---\n"
+                'title: "Low Rated"\n'
+                'label: "low"\n'
+                'ingested_at: "2026-04-13T10:00:00+00:00"\n'
+                "rating: 1\n"
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            (root / "high").mkdir()
+            (root / "high" / "High.md").write_text(
+                "---\n"
+                'title: "High Rated"\n'
+                'label: "high"\n'
+                'ingested_at: "2026-04-12T10:00:00+00:00"\n'
+                "rating: 5\n"
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            (root / "mid").mkdir()
+            (root / "mid" / "Mid.md").write_text(
+                "---\n"
+                'title: "Mid Rated"\n'
+                'label: "mid"\n'
+                'ingested_at: "2026-04-11T10:00:00+00:00"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get("/desktop/library", query_string={"root": str(root)})
+
+        self.assertEqual(response.status_code, 200)
+        documents = response.get_json()["documents"]
+        self.assertEqual([doc["title"] for doc in documents], ["High Rated", "Low Rated", "Mid Rated"])
+        self.assertEqual(documents[0]["rating"], 5)
+        self.assertEqual(documents[1]["rating"], 1)
+        self.assertEqual(documents[2]["rating"], 0)
+
+    def test_desktop_document_returns_rating(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Rated Article"\n'
+                "rating: 3\n"
+                "---\n\n"
+                "Body text.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get(
+                "/desktop/document",
+                query_string={"articlePath": str(article_path)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.get_json()["detail"]["summary"]
+        self.assertEqual(summary["rating"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

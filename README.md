@@ -48,6 +48,9 @@ corpus-scribe/
     popup.html / popup.js     # extension UI
     background.js
     assets/
+  desktop/
+    src/                      # browser reader UI
+    vite.config.ts
 ```
 
 ## Quick start
@@ -96,6 +99,38 @@ The usual workflow is:
 - store it under a label
 - keep the markdown as the main artifact
 - optionally generate notes and reading PDFs
+
+## Reader UI
+
+There is now a browser reader in [desktop/](desktop) aimed at a Zotero-meets-Typora workflow:
+
+- library browser on the left
+- markdown reader in the center
+- notes and bibliography on the right
+- local search over article and notes content
+- independently scrolling panes
+- draggable splitters for resizing the side panels
+
+It reads the existing Corpus Scribe bundle layout directly instead of introducing a new storage model. The reader runs as a normal web app and talks to the Flask backend through local `/desktop/*` endpoints.
+
+From the repo root:
+
+```bash
+./scripts/compose-with-home-env.sh up -d --build backend
+cd desktop
+npm install
+npm run dev
+```
+
+Then open:
+
+```text
+http://localhost:1420/
+```
+
+On WSL, opening that URL in Windows Chrome is the recommended path.
+
+The compose wrapper above sources `~/.env` first, so backend-only secrets such as `NOTES_LLM_API_KEY` and `MISTRAL_API_KEY` can stay in your home environment instead of the repo-local `.env`.
 
 ## API
 

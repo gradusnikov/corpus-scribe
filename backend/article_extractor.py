@@ -1142,6 +1142,21 @@ def _generate_companion_notes_body(md_text: str) -> str:
     return _generate_companion_notes_body_with_config(md_text, _resolve_notes_client_config({}))
 
 
+def _strip_reference_sections_for_notes(md_text: str) -> str:
+    patterns = (
+        r"(?mis)^\s{0,3}#{1,6}\s*(?:references|bibliography)\s*$",
+        r"(?mis)^\s{0,3}(?:references|bibliography)\s*$",
+    )
+    cut_positions = []
+    for pattern in patterns:
+        match = re.search(pattern, md_text)
+        if match:
+            cut_positions.append(match.start())
+    if not cut_positions:
+        return md_text
+    return md_text[:min(cut_positions)].rstrip() + "\n"
+
+
 def _resolve_notes_client_config(overrides: dict) -> dict:
     provider = (overrides.get("provider") or _DEFAULT_NOTES_PROVIDER).strip().lower()
     config = {
@@ -1160,6 +1175,7 @@ def _resolve_notes_client_config(overrides: dict) -> dict:
 
 
 def _generate_companion_notes_body_with_config(md_text: str, notes_client: dict) -> str:
+    md_text = _strip_reference_sections_for_notes(md_text)
     prompt = (
         "Read the article markdown inside <article_markdown>. "
         "Write extractive companion notes in markdown only, with these sections exactly in this order:\n"

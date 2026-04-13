@@ -25,6 +25,7 @@ from article_extractor import (
     _resize_images_for_pdf,
     _safe_output_name,
     _sanitize_unicode_text,
+    _strip_reference_sections_for_notes,
     extract_article,
     extract_pdf_bytes,
 )
@@ -651,6 +652,27 @@ class ArticleExtractorTests(unittest.TestCase):
             "https://api.anthropic.com/v1/messages",
         )
         self.assertEqual(post_mock.call_args.kwargs["headers"]["x-api-key"], "ak-test")
+
+    def test_strip_reference_sections_for_notes_removes_trailing_references(self):
+        md_text = (
+            "---\n"
+            'title: "Fixture"\n'
+            "---\n\n"
+            "# Fixture\n\n"
+            "Core content.\n\n"
+            "## Method\n\n"
+            "Important details.\n\n"
+            "## References\n\n"
+            "1. Example citation\n"
+            "2. Another citation\n"
+        )
+
+        cleaned = _strip_reference_sections_for_notes(md_text)
+
+        self.assertIn("Core content.", cleaned)
+        self.assertIn("Important details.", cleaned)
+        self.assertNotIn("## References", cleaned)
+        self.assertNotIn("Example citation", cleaned)
 
 
 if __name__ == "__main__":
