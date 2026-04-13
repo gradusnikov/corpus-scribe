@@ -3016,7 +3016,12 @@ function App() {
               className="text-input"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Full-text search title, content, notes…"
+              placeholder="term or (Tournier[Author] AND CSD[Title])"
+              title={
+                'Pubmed-style queries supported.\n' +
+                'Fields: [Author] [Title] [DOI] [Year] [Body] [Journal] [Publisher] [PMID] [PMCID] [Arxiv] [URL] [Label] [All]\n' +
+                'Operators: AND, OR, NOT, parentheses. Default field is All.'
+              }
             />
 
             <label className="field-label" htmlFor="label-filter">Label</label>

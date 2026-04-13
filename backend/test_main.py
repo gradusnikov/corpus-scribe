@@ -684,6 +684,77 @@ class MainApiTests(unittest.TestCase):
             self.assertEqual(len(by_year), 1)
             self.assertEqual(by_year[0]["title"], "Attention Is All You Need")
 
+    def test_desktop_search_pubmed_style_query(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "neuro").mkdir()
+            (root / "neuro" / "Tournier.md").write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution (CSD) on GPU"\n'
+                'label: "neuro"\n'
+                'authors: "J-D Tournier, F Calamante"\n'
+                "year: 2007\n"
+                "---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            (root / "neuro" / "Other.md").write_text(
+                "---\n"
+                'title: "CSD for Beginners"\n'
+                'label: "neuro"\n'
+                'authors: "Someone Else"\n'
+                "year: 2010\n"
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            (root / "neuro" / "Tournier2.md").write_text(
+                "---\n"
+                'title: "Unrelated Work"\n'
+                'label: "neuro"\n'
+                'authors: "Tournier JD"\n'
+                "year: 2015\n"
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            def search(query: str) -> list[str]:
+                response = self.client.post(
+                    "/desktop/search",
+                    json={"root": str(root), "query": query},
+                )
+                self.assertEqual(response.status_code, 200, response.get_json())
+                return sorted(doc["title"] for doc in response.get_json()["documents"])
+
+            self.assertEqual(
+                search("((Tournier[Author]) AND (CSD[Title])) AND GPU"),
+                ["Constrained Spherical Deconvolution (CSD) on GPU"],
+            )
+            self.assertEqual(
+                search("Tournier[Author] AND CSD[Title]"),
+                ["Constrained Spherical Deconvolution (CSD) on GPU"],
+            )
+            self.assertEqual(
+                search("CSD[Title]"),
+                ["CSD for Beginners", "Constrained Spherical Deconvolution (CSD) on GPU"],
+            )
+            self.assertEqual(
+                search("Tournier[Author] NOT GPU"),
+                ["Unrelated Work"],
+            )
+            self.assertEqual(
+                search("2015[Year] OR 2010[Year]"),
+                ["CSD for Beginners", "Unrelated Work"],
+            )
+
+    def test_desktop_search_invalid_query_returns_400(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            (Path(tmpdir) / "label").mkdir()
+            response = self.client.post(
+                "/desktop/search",
+                json={"root": tmpdir, "query": "foo[Author"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["success"])
+
     def test_desktop_delete_document_removes_bundle_and_index_records(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
             bundle_dir = Path(tmpdir) / "Label" / "Fixture"

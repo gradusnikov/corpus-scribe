@@ -907,49 +907,357 @@ def desktop_reindex():
     )
 
 
+_SEARCH_FIELD_ALIASES: dict[str, str] = {
+    "all": "all",
+    "allfields": "all",
+    "title": "title",
+    "ti": "title",
+    "author": "author",
+    "authors": "author",
+    "au": "author",
+    "doi": "doi",
+    "year": "year",
+    "date": "year",
+    "dp": "year",
+    "pubdate": "year",
+    "body": "body",
+    "text": "body",
+    "abstract": "body",
+    "ab": "body",
+    "tiab": "titleabstract",
+    "titleabstract": "titleabstract",
+    "notes": "notes",
+    "highlight": "highlight",
+    "highlights": "highlight",
+    "label": "label",
+    "journal": "journal",
+    "ta": "journal",
+    "publisher": "publisher",
+    "pmid": "pmid",
+    "pmcid": "pmcid",
+    "arxiv": "arxiv",
+    "arxivid": "arxiv",
+    "url": "url",
+}
+
+
+class _SearchQueryError(ValueError):
+    pass
+
+
+def _search_keyword_at(text: str, idx: int, keyword: str) -> bool:
+    end = idx + len(keyword)
+    if text[idx:end].upper() != keyword:
+        return False
+    if end < len(text) and not (text[end].isspace() or text[end] in "()"):
+        return False
+    if idx > 0 and not (text[idx - 1].isspace() or text[idx - 1] in "()"):
+        return False
+    return True
+
+
+def _tokenize_search_query(query: str) -> list[tuple]:
+    tokens: list[tuple] = []
+    i = 0
+    n = len(query)
+    while i < n:
+        ch = query[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "(":
+            tokens.append(("LPAREN",))
+            i += 1
+            continue
+        if ch == ")":
+            tokens.append(("RPAREN",))
+            i += 1
+            continue
+        if _search_keyword_at(query, i, "AND"):
+            tokens.append(("OP", "AND"))
+            i += 3
+            continue
+        if _search_keyword_at(query, i, "OR"):
+            tokens.append(("OP", "OR"))
+            i += 2
+            continue
+        if _search_keyword_at(query, i, "NOT"):
+            tokens.append(("OP", "NOT"))
+            i += 3
+            continue
+        if ch == '"':
+            end = query.find('"', i + 1)
+            if end == -1:
+                raise _SearchQueryError("Unclosed quoted phrase")
+            text = query[i + 1 : end]
+            i = end + 1
+        else:
+            start = i
+            while i < n:
+                c = query[i]
+                if c in "()[\"":
+                    break
+                if c.isspace():
+                    j = i
+                    while j < n and query[j].isspace():
+                        j += 1
+                    if j >= n:
+                        break
+                    if query[j] in "()":
+                        break
+                    if _search_keyword_at(query, j, "AND"):
+                        break
+                    if _search_keyword_at(query, j, "OR"):
+                        break
+                    if _search_keyword_at(query, j, "NOT"):
+                        break
+                i += 1
+            text = query[start:i]
+        field: str | None = None
+        if i < n and query[i] == "[":
+            end = query.find("]", i + 1)
+            if end == -1:
+                raise _SearchQueryError("Unclosed field tag")
+            field_raw = query[i + 1 : end].strip().lower().replace(" ", "").replace("/", "").replace("-", "")
+            field = _SEARCH_FIELD_ALIASES.get(field_raw, field_raw) if field_raw else "all"
+            i = end + 1
+        text = text.strip()
+        if not text:
+            continue
+        if field is None:
+            for word in text.split():
+                tokens.append(("TERM", word.lower(), "all"))
+        else:
+            tokens.append(("TERM", text.lower(), field))
+    return tokens
+
+
+class _SearchQueryParser:
+    def __init__(self, tokens: list[tuple]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def _peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def _consume(self):
+        tok = self.tokens[self.pos]
+        self.pos += 1
+        return tok
+
+    def parse(self):
+        if not self.tokens:
+            return None
+        node = self._parse_or()
+        if self.pos != len(self.tokens):
+            raise _SearchQueryError(f"Unexpected token: {self.tokens[self.pos]}")
+        return node
+
+    def _parse_or(self):
+        left = self._parse_and()
+        while True:
+            tok = self._peek()
+            if tok is None or tok[0] != "OP" or tok[1] != "OR":
+                break
+            self._consume()
+            right = self._parse_and()
+            left = ("or", left, right)
+        return left
+
+    def _parse_and(self):
+        left = self._parse_not()
+        while True:
+            tok = self._peek()
+            if tok is None:
+                break
+            if tok[0] == "RPAREN":
+                break
+            if tok[0] == "OP" and tok[1] == "OR":
+                break
+            if tok[0] == "OP" and tok[1] == "AND":
+                self._consume()
+                right = self._parse_not()
+                left = ("and", left, right)
+                continue
+            right = self._parse_not()
+            left = ("and", left, right)
+        return left
+
+    def _parse_not(self):
+        tok = self._peek()
+        if tok and tok[0] == "OP" and tok[1] == "NOT":
+            self._consume()
+            child = self._parse_not()
+            return ("not", child)
+        return self._parse_atom()
+
+    def _parse_atom(self):
+        tok = self._peek()
+        if tok is None:
+            raise _SearchQueryError("Unexpected end of query")
+        if tok[0] == "LPAREN":
+            self._consume()
+            node = self._parse_or()
+            closing = self._peek()
+            if closing is None or closing[0] != "RPAREN":
+                raise _SearchQueryError("Missing closing parenthesis")
+            self._consume()
+            return node
+        if tok[0] == "TERM":
+            self._consume()
+            return ("term", tok[1], tok[2])
+        raise _SearchQueryError(f"Unexpected token: {tok}")
+
+
+def _parse_search_query(query: str):
+    tokens = _tokenize_search_query(query)
+    return _SearchQueryParser(tokens).parse()
+
+
+class _DocSearchHaystack:
+    def __init__(self, doc: dict):
+        self.doc = doc
+        self._body_loaded = False
+        self._body = ""
+        self._notes_loaded = False
+        self._notes = ""
+        self._highlights_loaded = False
+        self._highlights = ""
+
+    def _body_text(self) -> str:
+        if not self._body_loaded:
+            self._body_loaded = True
+            try:
+                self._body = _read_markdown_body(Path(self.doc["articlePath"]))
+            except Exception:
+                self._body = ""
+        return self._body
+
+    def _notes_text(self) -> str:
+        if not self._notes_loaded:
+            self._notes_loaded = True
+            notes_path = self.doc.get("notesPath")
+            if notes_path:
+                try:
+                    self._notes = _read_markdown_body(Path(notes_path))
+                except Exception:
+                    self._notes = ""
+        return self._notes
+
+    def _highlights_text(self) -> str:
+        if not self._highlights_loaded:
+            self._highlights_loaded = True
+            if self.doc.get("highlightsPath"):
+                try:
+                    items = _load_highlights(Path(self.doc["articlePath"]))
+                    self._highlights = "\n".join(item.get("text", "") for item in items)
+                except Exception:
+                    self._highlights = ""
+        return self._highlights
+
+    def _metadata(self) -> dict:
+        meta = self.doc.get("metadataText") or {}
+        return meta if isinstance(meta, dict) else {}
+
+    def values_for(self, field: str) -> list[str]:
+        doc = self.doc
+        meta = self._metadata()
+        if field == "title":
+            return [doc.get("title") or ""]
+        if field == "author":
+            return [meta.get("authors") or "", meta.get("author") or ""]
+        if field == "doi":
+            return [meta.get("doi") or ""]
+        if field == "year":
+            return [
+                meta.get("year") or "",
+                meta.get("published") or "",
+                meta.get("date") or "",
+                meta.get("ingested_at") or "",
+            ]
+        if field == "body":
+            return [self._body_text()]
+        if field == "titleabstract":
+            return [doc.get("title") or "", self._body_text()]
+        if field == "notes":
+            return [self._notes_text()]
+        if field == "highlight":
+            return [self._highlights_text()]
+        if field == "label":
+            return [doc.get("label") or ""]
+        if field == "journal":
+            return [meta.get("journal") or ""]
+        if field == "publisher":
+            return [meta.get("publisher") or ""]
+        if field == "pmid":
+            return [meta.get("pmid") or ""]
+        if field == "pmcid":
+            return [meta.get("pmcid") or ""]
+        if field == "arxiv":
+            return [meta.get("arxiv_id") or ""]
+        if field == "url":
+            return [doc.get("url") or "", doc.get("canonicalUrl") or "", doc.get("sourceSite") or ""]
+        if field == "all":
+            values: list[str] = [
+                doc.get("title") or "",
+                doc.get("label") or "",
+                doc.get("url") or "",
+                doc.get("canonicalUrl") or "",
+                doc.get("sourceSite") or "",
+                doc.get("excerpt") or "",
+            ]
+            values.extend(str(v) for v in meta.values() if v)
+            values.append(self._body_text())
+            values.append(self._notes_text())
+            values.append(self._highlights_text())
+            return values
+        return []
+
+
+def _evaluate_search_query(node, haystack: _DocSearchHaystack) -> bool:
+    if node is None:
+        return True
+    kind = node[0]
+    if kind == "term":
+        _, text, field = node
+        if not text:
+            return True
+        needle = text
+        for value in haystack.values_for(field):
+            if value and needle in value.lower():
+                return True
+        return False
+    if kind == "and":
+        return _evaluate_search_query(node[1], haystack) and _evaluate_search_query(node[2], haystack)
+    if kind == "or":
+        return _evaluate_search_query(node[1], haystack) or _evaluate_search_query(node[2], haystack)
+    if kind == "not":
+        return not _evaluate_search_query(node[1], haystack)
+    return False
+
+
 @app.route("/desktop/search", methods=["POST"])
 def desktop_search():
     data = request.get_json(silent=True) or {}
     root = _resolve_library_root(data.get("root"))
-    query = (data.get("query") or "").strip().lower()
+    query = (data.get("query") or "").strip()
     label = (data.get("label") or "").strip()
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
     if not query:
         return jsonify(success=True, documents=[])
 
+    try:
+        tree = _parse_search_query(query)
+    except _SearchQueryError as exc:
+        return jsonify(success=False, message=f"Invalid query: {exc}"), 400
+
     results: list[dict] = []
     for doc in _scan_library_documents(root):
         if label and label != "all" and (doc.get("label") or "") != label:
             continue
-        haystacks = [
-            doc.get("title") or "",
-            doc.get("excerpt") or "",
-            doc.get("label") or "",
-            doc.get("url") or "",
-            doc.get("canonicalUrl") or "",
-            doc.get("sourceSite") or "",
-        ]
-        metadata_text = doc.get("metadataText") or {}
-        if isinstance(metadata_text, dict):
-            haystacks.extend(str(value) for value in metadata_text.values() if value)
-        article_path = Path(doc["articlePath"])
-        try:
-            haystacks.append(_read_markdown_body(article_path))
-        except Exception:
-            pass
-        if doc.get("notesPath"):
-            try:
-                haystacks.append(_read_markdown_body(Path(doc["notesPath"])))
-            except Exception:
-                pass
-        if doc.get("highlightsPath"):
-            try:
-                haystacks.append("\n".join(item["text"] for item in _load_highlights(article_path)))
-            except Exception:
-                pass
-        joined = "\n".join(haystacks).lower()
-        if query in joined:
+        haystack = _DocSearchHaystack(doc)
+        if _evaluate_search_query(tree, haystack):
             results.append(doc)
 
     return jsonify(success=True, documents=results[:200])
