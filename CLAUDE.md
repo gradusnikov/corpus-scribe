@@ -91,6 +91,7 @@ Single-file React app. It fetches bundles through the `/desktop/*` endpoints and
 
 - `API_KEY` — all backend routes require `apiKey` in the JSON body or query string (default `api-key-1234`).
 - `OUTPUT_DIR` — container-side output root (`/output`). The host mount is `HOST_OUTPUT_DIR` (defaults to `./output`). Set it to a Windows-backed path on WSL for clean cross-OS access.
+- `HOST_OUTPUT_DIR_NATIVE` — native-OS-style mirror of `HOST_OUTPUT_DIR` for reader "Open location" / "Open external" buttons. The backend can't launch host file managers from inside the container, so it translates `/output/...` → this prefix and the desktop reader copies the translated path to the clipboard. For WSL users whose `HOST_OUTPUT_DIR` is `/mnt/<drive>/...`, the backend auto-derives the Windows form (`C:\\...`) so this env var only needs to be set for unusual layouts (e.g. `\\wsl.localhost\Ubuntu\...` or a custom mount).
 - `DESKTOP_API_ROOT` — overrides the default library root the desktop reader scans (falls back to `OUTPUT_DIR`).
 - `MISTRAL_API_KEY` — enables Mistral OCR as the primary PDF extractor; absent → `pdftotext` fallback.
 - `NOTES_LLM_*` — selects the companion-notes provider. See the "Companion notes" section in `README.md` for the full matrix.

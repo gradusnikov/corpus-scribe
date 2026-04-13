@@ -43,6 +43,13 @@
   --color-blockquote-text: #5a6773;
   --color-highlight-card-bg: #fffaf1;
   --color-highlight-card-hover-bg: #fff4dc;
+  --color-highlight-bg-top: rgba(255, 229, 153, 0.18);
+  --color-highlight-bg-bottom: rgba(255, 229, 153, 0.72);
+  --color-highlight-flash: rgba(255, 205, 82, 0.95);
+  --color-highlight-flash-mid: rgba(255, 205, 82, 0.7);
+  --color-highlight-flash-ring: rgba(255, 205, 82, 0.35);
+  --color-find-match-bg: rgba(250, 204, 21, 0.45);
+  --color-find-active-bg: rgba(249, 115, 22, 0.7);
   --color-notes-bg: #f8f9fb;
   --color-notes-border: rgba(41, 53, 65, 0.12);
   --color-notes-text: #2a3845;
@@ -103,6 +110,13 @@
   --color-blockquote-text: #b1bcc8;
   --color-highlight-card-bg: #272d3a;
   --color-highlight-card-hover-bg: #2d3442;
+  --color-highlight-bg-top: rgba(200, 210, 224, 0.18);
+  --color-highlight-bg-bottom: rgba(200, 210, 224, 0.58);
+  --color-highlight-flash: rgba(220, 228, 240, 0.85);
+  --color-highlight-flash-mid: rgba(200, 210, 224, 0.6);
+  --color-highlight-flash-ring: rgba(200, 210, 224, 0.3);
+  --color-find-match-bg: rgba(200, 210, 224, 0.38);
+  --color-find-active-bg: rgba(235, 240, 250, 0.7);
   --color-notes-bg: #171c26;
   --color-notes-border: rgba(255, 255, 255, 0.06);
   --color-notes-text: #d1d9e3;
@@ -138,6 +152,40 @@
 
 .shell.focus-mode .reader-pane {
   max-width: none;
+}
+
+.shell.focus-mode .reader-header,
+.shell.focus-mode .selection-banner {
+  display: none;
+}
+
+.shell.focus-mode .markdown-card {
+  padding-top: 36px;
+}
+
+.focus-exit-button {
+  position: fixed;
+  top: 14px;
+  right: 18px;
+  z-index: 900;
+  padding: 6px 12px;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  border: 1px solid var(--color-input-border);
+  background: var(--color-panel-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  opacity: 0.22;
+  transition: opacity 160ms ease, color 160ms ease, background 160ms ease;
+}
+
+.focus-exit-button:hover,
+.focus-exit-button:focus-visible {
+  opacity: 1;
+  color: var(--color-text-primary);
+  background: var(--color-ghost-bg);
+  outline: none;
 }
 
 .sidebar,
@@ -767,7 +815,7 @@ select {
 }
 
 .markdown-body mark.inline-highlight {
-  background: linear-gradient(180deg, rgba(255, 229, 153, 0.18), rgba(255, 229, 153, 0.72));
+  background: linear-gradient(180deg, var(--color-highlight-bg-top), var(--color-highlight-bg-bottom));
   color: inherit;
   border-radius: 0.22em;
   box-decoration-break: clone;
@@ -838,15 +886,15 @@ select {
 
 @keyframes highlight-flash {
   0% {
-    background: rgba(255, 205, 82, 0.95);
-    box-shadow: 0 0 0 4px rgba(255, 205, 82, 0.35);
+    background: var(--color-highlight-flash);
+    box-shadow: 0 0 0 4px var(--color-highlight-flash-ring);
   }
   60% {
-    background: rgba(255, 205, 82, 0.7);
-    box-shadow: 0 0 0 2px rgba(255, 205, 82, 0.2);
+    background: var(--color-highlight-flash-mid);
+    box-shadow: 0 0 0 2px var(--color-highlight-flash-ring);
   }
   100% {
-    background: linear-gradient(180deg, rgba(255, 229, 153, 0.18), rgba(255, 229, 153, 0.72));
+    background: linear-gradient(180deg, var(--color-highlight-bg-top), var(--color-highlight-bg-bottom));
     box-shadow: none;
   }
 }
@@ -1482,12 +1530,12 @@ select {
 }
 
 ::highlight(find-match) {
-  background-color: rgba(250, 204, 21, 0.45);
+  background-color: var(--color-find-match-bg);
   color: inherit;
 }
 
 ::highlight(find-active) {
-  background-color: rgba(249, 115, 22, 0.7);
+  background-color: var(--color-find-active-bg);
   color: inherit;
 }
 

@@ -51,8 +51,8 @@
 32. [x] Bug: Math equations cannot be copied to clipboard as latex
 33. [x] Feature: In Info make the information clickable, e.g. md files are opened with system editor, or DOI opens DOI Lookup, etc.
 34. [x] Bug: The generated Reading PDF contains Noise, does not contain Highlights
-35. [ ] Feature: Make Focus mode more focused. Remove all UI elements (title, rating, buttons, etc.). However, allow to de-focus.
-36. [ ] Bug: Change highlight color in dark mode - silver/grey. 
+35. [x] Feature: Make Focus mode more focused. Remove all UI elements (title, rating, buttons, etc.). However, allow to de-focus.
+36. [x] Bug: Change highlight color in dark mode - silver/grey. 
 
 ## Notes
 
@@ -85,11 +85,11 @@
 
 ## MCP server - instead of a chat panel, allow to use any LLM app to interface with the corpus db via MCP
 
-1. [ ] Feature: Tool - Search
-2. [ ] Feature: Tool - Get Current Context - returns links to documents, notes, highlights, etc.
-3. [ ] Feature: Tool - Read - get .md content without the Noise
-4. [ ] Feature: Tool - Update notes
-5. [ ] Feature: CLI wrapper of the MCP server. Allows to do everything what MCP does but via CLI
+1. [x] Feature: Tool - Search
+2. [x] Feature: Tool - Get Current Context - returns links to documents, notes, highlights, etc.
+3. [x] Feature: Tool - Read - get .md content without the Noise
+4. [x] Feature: Tool - Update notes
+5. [x] Feature: CLI wrapper of the MCP server. Allows to do everything what MCP does but via CLI
 
 ## Chrome Extension
 

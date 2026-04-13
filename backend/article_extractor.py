@@ -2733,6 +2733,138 @@ def _replace_text_in_html(soup: BeautifulSoup, needle: str, mode: str) -> None:
         return
 
 
+_REFERENCES_HEADING_RE = re.compile(
+    r"^(#{1,6})\s*(references|bibliography|works cited|citations)\b\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _normalize_for_noise_match(text: str) -> str:
+    """Lowercase + collapse whitespace so stored noise plain text can be
+    fuzzy-matched against markdown source regardless of how the two sides
+    were whitespace-formatted."""
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _markdown_line_to_plain(line: str) -> str:
+    """Best-effort strip of common markdown syntax to approximate the
+    rendered plain text of a single line.
+
+    Stored noise text comes from ``window.getSelection().toString()`` in the
+    reader's rendered DOM — so it has no markdown syntax and URLs appear as
+    their visible text (``<url>`` autolinks render to the URL, ``[text](url)``
+    links render to ``text``). This helper does the same transformations on
+    the markdown source so the two sides can be compared.
+    """
+    plain = line
+    plain = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", plain)            # images → ""
+    plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", plain)        # links → anchor text
+    plain = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", plain)       # reference links
+    plain = re.sub(r"<(https?://[^>]+)>", r"\1", plain)           # auto-links → URL text
+    plain = re.sub(r"`([^`]+)`", r"\1", plain)                    # inline code
+    plain = re.sub(r"[*_]{2,3}([^*_]+?)[*_]{2,3}", r"\1", plain)  # bold
+    plain = re.sub(r"[*_]([^*_]+?)[*_]", r"\1", plain)            # italics
+    plain = re.sub(r"^\s*#{1,6}\s*", "", plain)                   # heading markers
+    plain = re.sub(r"^\s*([-*+]|\d+[.)])\s+", "", plain)          # list bullets
+    plain = re.sub(r"^\s*>+\s?", "", plain)                       # blockquotes
+    return plain
+
+
+def _strip_noise_from_markdown(
+    body: str,
+    highlights: list[dict],
+    strip_references: bool = True,
+) -> str:
+    """Return ``body`` with noise-marked highlights removed.
+
+    Handles four cases:
+
+    1. **Cross-element text noise** (selection spanning two list items or
+       several paragraphs): drop each markdown line whose normalized plain
+       text is a substring of some noise item's normalized plain text.
+       Stored noise text came from ``selection.toString()`` on the rendered
+       DOM — it has no markdown syntax — so the markdown source must first
+       be converted to plain text via ``_markdown_line_to_plain`` before
+       comparison.
+    2. **Inline text noise** that sits within a single markdown line without
+       any formatting: literal substring replacement on what's left after
+       pass 1.
+    3. **Element noise** for images: drop the N-th ``![...](...)`` in the
+       markdown. Table element noise is left to fall through to line-drop
+       since markdown tables are multi-line.
+    4. **References section**: when ``strip_references`` is set, drop from
+       the first References/Bibliography heading to EOF.
+    """
+    cleaned = body
+
+    noise_text_items: list[str] = []
+    for item in highlights:
+        if not isinstance(item, dict):
+            continue
+        if item.get("variant") != "noise":
+            continue
+        if item.get("kind") == "element":
+            continue
+        text = (item.get("text") or "").strip()
+        if text:
+            noise_text_items.append(text)
+
+    if noise_text_items:
+        noise_normalized = [
+            _normalize_for_noise_match(t) for t in noise_text_items
+        ]
+        lines = cleaned.split("\n")
+        kept_lines: list[str] = []
+        for line in lines:
+            line_plain = _markdown_line_to_plain(line)
+            line_normalized = _normalize_for_noise_match(line_plain)
+            if (
+                line_normalized
+                and len(line_normalized) >= 3
+                and any(
+                    len(noise) >= 10 and line_normalized in noise
+                    for noise in noise_normalized
+                )
+            ):
+                continue
+            kept_lines.append(line)
+        cleaned = "\n".join(kept_lines)
+
+        for text in noise_text_items:
+            if text and text in cleaned:
+                cleaned = cleaned.replace(text, "")
+
+    image_noise_indices = sorted(
+        {
+            item["elementIndex"]
+            for item in highlights
+            if isinstance(item, dict)
+            and item.get("variant") == "noise"
+            and item.get("kind") == "element"
+            and item.get("elementType") == "img"
+            and isinstance(item.get("elementIndex"), int)
+            and item.get("elementIndex") >= 0
+        },
+        reverse=True,
+    )
+    if image_noise_indices:
+        image_pattern = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+        matches = list(image_pattern.finditer(cleaned))
+        for idx in image_noise_indices:
+            if 0 <= idx < len(matches):
+                span = matches[idx]
+                cleaned = cleaned[: span.start()] + cleaned[span.end():]
+                matches = list(image_pattern.finditer(cleaned))
+
+    if strip_references:
+        match = _REFERENCES_HEADING_RE.search(cleaned)
+        if match is not None:
+            cleaned = cleaned[: match.start()].rstrip() + "\n"
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip() + "\n"
+
+
 def regenerate_reading_pdf(
     article_path: Path,
     page_size: str = "a5",
@@ -2740,14 +2872,20 @@ def regenerate_reading_pdf(
 ) -> Path:
     """Regenerate the reading PDF for an existing markdown article.
 
-    Applies noise removal and highlight wrapping via ``_apply_html_annotations``
-    inside ``_generate_pdf``. Bundle assets are never mutated — the PDF render
-    uses a staged copy of the assets directory.
+    Strips noise at the markdown level (handles cross-element noise that
+    HTML text-node substring matching can't reach), then renders via pandoc
+    → HTML → Chromium. Highlights are wrapped as ``<mark>`` at the HTML
+    stage via ``_apply_html_annotations``. Bundle assets are never mutated
+    — the PDF render uses a staged copy of the assets directory.
     """
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     md_raw = article_path.read_text(encoding="utf-8")
     match = re.match(r"^---\n.*?\n---\n\n?", md_raw, re.DOTALL)
     body = md_raw[match.end():] if match else md_raw
+    if highlights:
+        body = _strip_noise_from_markdown(
+            body, highlights, strip_references=False
+        )
     title = article_path.stem
     article_dir = article_path.parent
     safe_name = article_path.stem

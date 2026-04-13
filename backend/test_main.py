@@ -664,6 +664,338 @@ class MainApiTests(unittest.TestCase):
         summary = response.get_json()["detail"]["summary"]
         self.assertEqual(summary["rating"], 3)
 
+    def test_translate_container_path_to_host_windows_style(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", r"C:\Users\alice\corpus"
+        ):
+            translated = main._translate_container_path_to_host("/output/coding/Foo/Foo.md")
+        self.assertEqual(translated, r"C:\Users\alice\corpus\coding\Foo\Foo.md")
+
+    def test_translate_container_path_to_host_posix_style(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", "/home/alice/corpus"
+        ):
+            translated = main._translate_container_path_to_host("/output/coding/Foo")
+        self.assertEqual(translated, "/home/alice/corpus/coding/Foo")
+
+    def test_translate_container_path_to_host_returns_none_without_env(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", ""
+        ), patch.object(main, "HOST_OUTPUT_DIR", ""):
+            self.assertIsNone(main._translate_container_path_to_host("/output/anything.md"))
+
+    def test_translate_container_path_to_host_returns_none_outside_root(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", "/home/alice/corpus"
+        ):
+            self.assertIsNone(main._translate_container_path_to_host("/tmp/not-in-output"))
+
+    def test_derive_wsl_native_prefix_converts_mnt_c(self):
+        self.assertEqual(
+            main._derive_wsl_native_prefix("/mnt/c/Users/wgrad/Documents/reading"),
+            r"C:\Users\wgrad\Documents\reading",
+        )
+
+    def test_derive_wsl_native_prefix_handles_drive_root(self):
+        self.assertEqual(main._derive_wsl_native_prefix("/mnt/d"), "D:\\")
+        self.assertEqual(main._derive_wsl_native_prefix("/mnt/d/"), "D:\\")
+
+    def test_derive_wsl_native_prefix_returns_none_for_non_wsl(self):
+        self.assertIsNone(main._derive_wsl_native_prefix("/home/alice/scribe"))
+        self.assertIsNone(main._derive_wsl_native_prefix("./output"))
+        self.assertIsNone(main._derive_wsl_native_prefix(""))
+
+    def test_translate_container_path_to_host_auto_derives_from_wsl_mount(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", ""
+        ), patch.object(
+            main, "HOST_OUTPUT_DIR", "/mnt/c/Users/wgrad/Documents/reading"
+        ):
+            translated = main._translate_container_path_to_host(
+                "/output/coding/Foo/Foo.md"
+            )
+        self.assertEqual(translated, r"C:\Users\wgrad\Documents\reading\coding\Foo\Foo.md")
+
+    def test_translate_container_path_to_host_explicit_overrides_derivation(self):
+        with patch.object(main, "OUTPUT_DIR", "/output"), patch.object(
+            main, "HOST_OUTPUT_DIR_NATIVE", r"Z:\override"
+        ), patch.object(
+            main, "HOST_OUTPUT_DIR", "/mnt/c/Users/wgrad/Documents/reading"
+        ):
+            translated = main._translate_container_path_to_host("/output/Foo.md")
+        self.assertEqual(translated, r"Z:\override\Foo.md")
+
+    def test_desktop_reveal_returns_host_directory_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main, "OUTPUT_DIR", tmpdir
+        ), patch.object(main, "HOST_OUTPUT_DIR_NATIVE", r"D:\scribe"):
+            article_dir = Path(tmpdir) / "coding" / "Foo"
+            article_dir.mkdir(parents=True)
+            article_path = article_dir / "Foo.md"
+            article_path.write_text("---\ntitle: \"x\"\n---\n\nbody\n", encoding="utf-8")
+
+            with patch.object(main, "_try_open_with_host_tool", return_value=False):
+                response = self.client.post(
+                    "/desktop/reveal",
+                    json={"path": str(article_path)},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertFalse(payload["launched"])
+        self.assertEqual(payload["directoryPath"], str(article_dir))
+        self.assertEqual(payload["hostDirectoryPath"], r"D:\scribe\coding\Foo")
+
+    def test_strip_noise_from_markdown_removes_text_noise(self):
+        body = "Intro sentence. Boilerplate garbage. Real content.\n"
+        highlights = [
+            {
+                "id": "n1",
+                "text": "Boilerplate garbage.",
+                "variant": "noise",
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertNotIn("Boilerplate garbage.", cleaned)
+        self.assertIn("Real content.", cleaned)
+
+    def test_strip_noise_from_markdown_drops_references_section(self):
+        body = (
+            "# Introduction\n\n"
+            "Main body paragraph.\n\n"
+            "## References\n\n"
+            "1. Smith 2020\n"
+            "2. Jones 2021\n"
+        )
+        cleaned = main._strip_noise_from_markdown(body, [], strip_references=True)
+        self.assertIn("Main body paragraph.", cleaned)
+        self.assertNotIn("References", cleaned)
+        self.assertNotIn("Smith 2020", cleaned)
+
+    def test_strip_noise_from_markdown_removes_image_element_noise(self):
+        body = "intro ![fig1](img1.png) middle ![fig2](img2.png) end\n"
+        highlights = [
+            {
+                "id": "n2",
+                "kind": "element",
+                "variant": "noise",
+                "elementType": "img",
+                "elementIndex": 1,
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertIn("![fig1](img1.png)", cleaned)
+        self.assertNotIn("![fig2](img2.png)", cleaned)
+
+    def test_strip_noise_from_markdown_drops_cross_list_item_noise(self):
+        body = (
+            "Abstract paragraph.\n\n"
+            "-   [Previous article in issue](/science/article/pii/S1687850725001281)\n"
+            "-   [Next article in issue](/science/article/pii/S1687850725001943)\n\n"
+            "## Keywords\n\n"
+            "Real content.\n"
+        )
+        highlights = [
+            {
+                "id": "n-cross",
+                "text": "Previous article in issue\nNext article in issue",
+                "variant": "noise",
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertNotIn("Previous article in issue", cleaned)
+        self.assertNotIn("Next article in issue", cleaned)
+        self.assertIn("Abstract paragraph.", cleaned)
+        self.assertIn("Keywords", cleaned)
+
+    def test_strip_noise_from_markdown_handles_markdown_link_syntax(self):
+        body = (
+            "Author links open overlay panel, , , , , , , , , "
+            "<https://doi.org/10.1016/j.jrras.2025.101454>"
+            "[Get rights and content](https://example.com/a)"
+            "Under a Creative Commons [license](http://example.com/l)Open access\n\n"
+            "## Abstract\n\nReal body.\n"
+        )
+        highlights = [
+            {
+                "id": "n-link",
+                "text": (
+                    "Author links open overlay panel, , , , , , , , , "
+                    "https://doi.org/10.1016/j.jrras.2025.101454"
+                    "Get rights and content"
+                    "Under a Creative Commons licenseOpen access"
+                ),
+                "variant": "noise",
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertNotIn("Author links open overlay panel", cleaned)
+        self.assertNotIn("Get rights and content", cleaned)
+        self.assertIn("Real body.", cleaned)
+
+    def test_strip_noise_from_markdown_drops_cross_paragraph_block(self):
+        body = (
+            "## Introduction\n\n"
+            "Body paragraph.\n\n"
+            "## CRediT authorship contribution statement\n\n"
+            "Author A: investigation.\n\n"
+            "Author B: curation.\n\n"
+            "## Declaration\n\n"
+            "Nothing to declare.\n\n"
+            "## Conclusion\n\n"
+            "Final thoughts.\n"
+        )
+        highlights = [
+            {
+                "id": "n-block",
+                "text": (
+                    "CRediT authorship contribution statement\n"
+                    "Author A: investigation.\n\n"
+                    "Author B: curation.\n\n"
+                    "Declaration\n\n"
+                    "Nothing to declare."
+                ),
+                "variant": "noise",
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertIn("Body paragraph.", cleaned)
+        self.assertIn("Final thoughts.", cleaned)
+        self.assertNotIn("CRediT", cleaned)
+        self.assertNotIn("Author A", cleaned)
+        self.assertNotIn("Author B", cleaned)
+        self.assertNotIn("Nothing to declare", cleaned)
+
+    def test_strip_noise_from_markdown_preserves_short_unrelated_lines(self):
+        body = "Intro.\n\nabc\n\n- [Previous](/x)\n- [Next](/y)\n\nEnd.\n"
+        highlights = [
+            {
+                "id": "n",
+                "text": "Previous\nNext",
+                "variant": "noise",
+                "createdAt": "2026-04-13T10:00:00+00:00",
+            }
+        ]
+        cleaned = main._strip_noise_from_markdown(body, highlights, strip_references=False)
+        self.assertIn("Intro.", cleaned)
+        self.assertIn("End.", cleaned)
+        self.assertIn("abc", cleaned)
+
+    def test_desktop_document_read_returns_noise_stripped_body(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture"\n'
+                "---\n\n"
+                "# Body\n\n"
+                "Real sentence. Noisy bit to strip.\n\n"
+                "## References\n\n"
+                "1. Old ref\n",
+                encoding="utf-8",
+            )
+            highlights_path = article_path.with_name("Article.highlights.json")
+            highlights_path.write_text(
+                json.dumps(
+                    {
+                        "articlePath": str(article_path),
+                        "highlights": [
+                            {
+                                "id": "n1",
+                                "text": "Noisy bit to strip.",
+                                "variant": "noise",
+                                "createdAt": "2026-04-13T10:00:00+00:00",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/document/read",
+                json={"articlePath": str(article_path)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["noiseStripped"])
+        self.assertTrue(payload["referencesStripped"])
+        self.assertIn("Real sentence.", payload["markdown"])
+        self.assertNotIn("Noisy bit to strip.", payload["markdown"])
+        self.assertNotIn("References", payload["markdown"])
+        self.assertNotIn("Old ref", payload["markdown"])
+
+    def test_desktop_document_read_can_keep_noise(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\ntitle: \"Fixture\"\n---\n\nBody with noise here.\n",
+                encoding="utf-8",
+            )
+            highlights_path = article_path.with_name("Article.highlights.json")
+            highlights_path.write_text(
+                json.dumps(
+                    {
+                        "articlePath": str(article_path),
+                        "highlights": [
+                            {
+                                "id": "n1",
+                                "text": "noise here",
+                                "variant": "noise",
+                                "createdAt": "2026-04-13T10:00:00+00:00",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/document/read",
+                json={"articlePath": str(article_path), "stripNoise": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload["noiseStripped"])
+        self.assertIn("noise here", payload["markdown"])
+
+    def test_desktop_session_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Paper.md"
+            article_path.write_text(
+                "---\ntitle: \"Paper\"\n---\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            post = self.client.post(
+                "/desktop/session",
+                json={
+                    "openDocumentPaths": [str(article_path)],
+                    "focusedDocumentPath": str(article_path),
+                    "labelFilter": "Research",
+                },
+            )
+            post_payload = post.get_json()
+            self.assertTrue(post_payload["success"])
+            self.assertEqual(post_payload["session"]["labelFilter"], "Research")
+            self.assertEqual(post_payload["session"]["focusedHighlightCount"], 0)
+
+            get = self.client.get("/desktop/session")
+
+        get_payload = get.get_json()
+        self.assertTrue(get_payload["success"])
+        self.assertEqual(get_payload["session"]["focusedDocumentPath"], str(article_path))
+        self.assertEqual(get_payload["session"]["openDocumentPaths"], [str(article_path)])
+
     def test_desktop_document_returns_frontmatter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             article_path = Path(tmpdir) / "Article.md"

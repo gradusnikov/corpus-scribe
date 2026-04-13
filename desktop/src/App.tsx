@@ -329,6 +329,7 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return {
         directoryPath: (data.directoryPath ?? '') as string,
+        hostDirectoryPath: (data.hostDirectoryPath ?? null) as string | null,
         launched: Boolean(data.launched),
       } as T
     }
@@ -1748,6 +1749,32 @@ function App() {
   }, [openDocIds])
 
   useEffect(() => {
+    const idToPath = new Map(library.documents.map((doc) => [doc.id, doc.articlePath]))
+    const openDocumentPaths = openDocIds
+      .map((id) => idToPath.get(id))
+      .filter((path): path is string => typeof path === 'string' && path.length > 0)
+    const focusedDocumentPath = detail?.summary.articlePath ?? null
+    const payload = {
+      openDocumentPaths,
+      focusedDocumentPath,
+      labelFilter: selectedLabel,
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      fetch(`${browserApiBase}/desktop/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).catch(() => {})
+    }, 200)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [openDocIds, detail?.summary.articlePath, selectedLabel, library.documents])
+
+  useEffect(() => {
     if (!activeId) return
     setOpenDocIds((current) => {
       const filtered = current.filter((id) => id !== activeId)
@@ -1828,6 +1855,19 @@ function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [infoOpen])
+
+  useEffect(() => {
+    if (!focusMode) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      if (infoOpen || lightbox || settingsOpen || switcherOpen || tocOpen || findOpen) return
+      const target = event.target as HTMLElement | null
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+      setFocusMode(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [focusMode, infoOpen, lightbox, settingsOpen, switcherOpen, tocOpen, findOpen])
 
   useEffect(() => {
     if (!detail) {
@@ -2510,19 +2550,25 @@ function App() {
   async function handleRevealLocation() {
     if (!detail) return
     try {
-      const response = await desktopCommand<{ directoryPath: string; launched: boolean }>(
-        'reveal_location',
-        { path: detail.summary.articlePath },
-      )
+      const response = await desktopCommand<{
+        directoryPath: string
+        hostDirectoryPath: string | null
+        launched: boolean
+      }>('reveal_location', { path: detail.summary.articlePath })
+      const displayPath = response.hostDirectoryPath || response.directoryPath
       if (response.launched) {
-        setStatus(`Opened ${response.directoryPath}`)
+        setStatus(`Opened ${displayPath}`)
         return
       }
       try {
-        await navigator.clipboard.writeText(response.directoryPath)
-        setStatus(`Copied location: ${response.directoryPath}`)
+        await navigator.clipboard.writeText(displayPath)
+        setStatus(
+          response.hostDirectoryPath
+            ? `Copied host path to clipboard: ${displayPath}`
+            : `Copied container path to clipboard: ${displayPath} (set HOST_OUTPUT_DIR_NATIVE to translate)`,
+        )
       } catch {
-        setStatus(`Location: ${response.directoryPath}`)
+        setStatus(`Location: ${displayPath}`)
       }
     } catch (error) {
       setStatus(stringifyError(error))
@@ -3030,6 +3076,17 @@ function App() {
 
   return (
     <div className={`shell${focusMode ? ' focus-mode' : ''}`} style={shellStyle} data-theme={theme}>
+      {focusMode ? (
+        <button
+          type="button"
+          className="focus-exit-button"
+          onClick={toggleFocusMode}
+          title="Exit focus mode (Esc)"
+          aria-label="Exit focus mode"
+        >
+          Exit focus
+        </button>
+      ) : null}
       {switcherOpen ? (
         <div
           className="switcher-overlay"

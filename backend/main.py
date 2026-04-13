@@ -21,6 +21,7 @@ from article_extractor import (
     _build_frontmatter,
     _generate_companion_notes,
     _notes_doc_id,
+    _strip_noise_from_markdown,
     extract_article,
     extract_pdf_url,
     regenerate_reading_pdf,
@@ -35,6 +36,8 @@ API_KEY = os.environ.get("API_KEY", "api-key-1234")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 TEMP_DIR = "/tmp/scribe"
 DESKTOP_API_ROOT = os.environ.get("DESKTOP_API_ROOT", OUTPUT_DIR)
+HOST_OUTPUT_DIR_NATIVE = os.environ.get("HOST_OUTPUT_DIR_NATIVE", "").strip()
+HOST_OUTPUT_DIR = os.environ.get("HOST_OUTPUT_DIR", "").strip()
 
 
 def _pdf_ocr_available() -> bool:
@@ -1439,6 +1442,46 @@ def desktop_document():
     )
 
 
+@app.route("/desktop/document/read", methods=["GET", "POST"])
+def desktop_document_read():
+    """Return a document's markdown body with noise-marked highlights removed.
+
+    Intended for LLM/MCP consumers that want clean prose. Accepts either a GET
+    with ``articlePath`` / ``stripNoise`` / ``stripReferences`` query args, or
+    a POST with the same keys in a JSON body.
+    """
+    if request.method == "GET":
+        raw_path = (request.args.get("articlePath") or "").strip()
+        strip_noise = (request.args.get("stripNoise") or "true").lower() != "false"
+        strip_references = (request.args.get("stripReferences") or "true").lower() != "false"
+    else:
+        data = request.get_json(silent=True) or {}
+        raw_path = (data.get("articlePath") or "").strip()
+        strip_noise = data.get("stripNoise", True) is not False
+        strip_references = data.get("stripReferences", True) is not False
+
+    if not raw_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    path = Path(raw_path)
+    if not path.exists():
+        return jsonify(success=False, message=f"Document not found: {path}"), 404
+
+    content = path.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(content)
+    highlights = _load_highlights(path)
+    if strip_noise:
+        body = _strip_noise_from_markdown(body, highlights, strip_references=strip_references)
+
+    return jsonify(
+        success=True,
+        articlePath=str(path),
+        title=_frontmatter_string(frontmatter, "title") or path.stem,
+        markdown=body,
+        noiseStripped=bool(strip_noise),
+        referencesStripped=bool(strip_references and strip_noise),
+    )
+
+
 @app.route("/desktop/notes", methods=["POST"])
 def desktop_save_notes():
     data = request.get_json(silent=True) or {}
@@ -1949,21 +1992,104 @@ def desktop_file():
     return send_file(path, as_attachment=download_flag, download_name=path.name if download_flag else None)
 
 
+def _running_in_docker() -> bool:
+    """Best-effort detection of running inside a Docker/OCI container.
+
+    Used to skip ``xdg-open`` et al. because the container usually has the
+    binary but no X / Wayland session, so ``subprocess.Popen`` returns
+    successfully while the file manager never actually appears — leading the
+    desktop reader's Location button to look broken.
+    """
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    return "docker" in cgroup or "containerd" in cgroup
+
+
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])(/.*)?$")
+
+
+def _derive_wsl_native_prefix(host_path: str) -> str | None:
+    """Translate a WSL-style ``/mnt/<letter>/...`` host path into a
+    Windows-native path (e.g. ``/mnt/c/Users/x`` → ``C:\\Users\\x``).
+
+    Returns None if ``host_path`` does not look like a WSL bind onto a Windows
+    drive. This lets WSL users skip setting ``HOST_OUTPUT_DIR_NATIVE``
+    explicitly — the backend can derive the Windows form from the
+    ``HOST_OUTPUT_DIR`` mount point the compose file already passes through.
+    """
+    if not host_path:
+        return None
+    m = _WSL_MOUNT_RE.match(host_path.strip())
+    if not m:
+        return None
+    drive = m.group(1).upper()
+    tail = (m.group(2) or "").rstrip("/")
+    if not tail:
+        return f"{drive}:\\"
+    return f"{drive}:" + tail.replace("/", "\\")
+
+
+def _resolve_host_native_prefix() -> str | None:
+    """Pick the host-native root for path translation.
+
+    Explicit ``HOST_OUTPUT_DIR_NATIVE`` wins; otherwise try to auto-derive it
+    from ``HOST_OUTPUT_DIR`` (currently only WSL ``/mnt/<letter>`` binds).
+    """
+    if HOST_OUTPUT_DIR_NATIVE:
+        return HOST_OUTPUT_DIR_NATIVE
+    return _derive_wsl_native_prefix(HOST_OUTPUT_DIR)
+
+
+def _translate_container_path_to_host(target: str) -> str | None:
+    """Map ``target`` (a container-side path under ``OUTPUT_DIR``) to the
+    host-native form using ``HOST_OUTPUT_DIR_NATIVE`` when set, or auto-derived
+    from ``HOST_OUTPUT_DIR`` for WSL mounts.
+
+    Returns None if no translation is available or the path is not under
+    ``OUTPUT_DIR``. The host-native form is returned verbatim — callers should
+    treat it as opaque (it may be a Windows-style path like ``C:\\Users\\…``
+    or a WSL UNC path like ``\\\\wsl.localhost\\Ubuntu\\…``).
+    """
+    host_prefix = _resolve_host_native_prefix()
+    if not host_prefix:
+        return None
+    output_root = str(Path(OUTPUT_DIR)).rstrip("/")
+    if not output_root:
+        return None
+    if not target.startswith(output_root):
+        return None
+    remainder = target[len(output_root):].lstrip("/")
+    host_root = host_prefix.rstrip("/").rstrip("\\")
+    if not remainder:
+        return host_root
+    if "\\" in host_root:
+        return host_root + "\\" + remainder.replace("/", "\\")
+    return host_root + "/" + remainder
+
+
 def _try_open_with_host_tool(target: str) -> bool:
     """Attempt to hand ``target`` to the host's file manager / default opener.
 
-    Returns True if a launcher was found and executed without raising. The
-    backend may be running inside a container with no desktop session, in
-    which case every launcher will be absent and this returns False — callers
-    should fall back to surfacing the path directly.
+    Returns True only if we're reasonably sure a GUI launcher exists. Inside a
+    Docker container we skip the launch path entirely — the callers fall back
+    to surfacing the translated host path (via ``HOST_OUTPUT_DIR_NATIVE``) so
+    the desktop reader can copy it to clipboard for the user to paste into
+    their host file manager.
     """
+    if _running_in_docker():
+        return False
+
     candidates: list[list[str]] = []
     if sys.platform == "darwin":
         candidates.append(["open", target])
     elif sys.platform.startswith("win"):
         candidates.append(["explorer", target])
     else:
-        for cmd in ("wslview", "xdg-open", "gio", "gnome-open", "kde-open"):
+        for cmd in ("wslview", "gio", "gnome-open", "kde-open", "xdg-open"):
             if cmd == "gio":
                 candidates.append([cmd, "open", target])
             else:
@@ -1997,9 +2123,11 @@ def desktop_reveal():
         return jsonify(success=False, message=f"Path not found: {target}"), 404
     directory = target if target.is_dir() else target.parent
     launched = _try_open_with_host_tool(str(directory))
+    host_directory = _translate_container_path_to_host(str(directory))
     return jsonify(
         success=True,
         directoryPath=str(directory),
+        hostDirectoryPath=host_directory,
         launched=launched,
     )
 
@@ -2020,11 +2148,73 @@ def desktop_open_external():
     if not target.exists():
         return jsonify(success=False, message=f"Path not found: {target}"), 404
     launched = _try_open_with_host_tool(str(target))
+    host_path = _translate_container_path_to_host(str(target))
     return jsonify(
         success=True,
         path=str(target),
+        hostPath=host_path,
         launched=launched,
     )
+
+
+def _session_state_path() -> Path:
+    return Path(OUTPUT_DIR) / ".session.json"
+
+
+def _read_session_state() -> dict:
+    path = _session_state_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_session_state(state: dict) -> None:
+    path = _session_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+@app.route("/desktop/session", methods=["GET", "POST"])
+def desktop_session():
+    """Read or write the desktop reader's current session state.
+
+    The reader POSTs its open tabs / focused document whenever state changes so
+    MCP and CLI consumers can ask ``scribe context`` for links to what the user
+    is currently reading. State is persisted to ``<OUTPUT_DIR>/.session.json``
+    so it survives backend restarts.
+    """
+    if request.method == "GET":
+        return jsonify(success=True, session=_read_session_state())
+
+    data = request.get_json(silent=True) or {}
+    allowed_keys = {
+        "openDocumentPaths",
+        "focusedDocumentPath",
+        "labelFilter",
+        "focusedHighlightId",
+        "updatedAt",
+    }
+    state: dict = {}
+    for key in allowed_keys:
+        if key in data:
+            state[key] = data[key]
+    state["updatedAt"] = datetime.now(timezone.utc).isoformat()
+
+    focused = state.get("focusedDocumentPath")
+    if isinstance(focused, str) and focused:
+        focused_path = Path(focused)
+        if focused_path.exists():
+            highlights = _load_highlights(focused_path)
+            state["focusedHighlightCount"] = len(highlights)
+            notes_path = _sibling_with_suffix_if_exists(focused_path, ".notes.md")
+            state["focusedNotesPath"] = str(notes_path) if notes_path else None
+
+    _write_session_state(state)
+    return jsonify(success=True, session=state)
 
 
 if __name__ == "__main__":
