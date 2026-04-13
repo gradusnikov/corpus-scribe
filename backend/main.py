@@ -260,6 +260,8 @@ def _scan_library_documents(root_path: Path) -> list[dict]:
                 "sourceSite": _frontmatter_string(frontmatter, "source_site"),
                 "ingestedAt": _frontmatter_string(frontmatter, "ingested_at"),
                 "rating": rating,
+                "url": _frontmatter_string(frontmatter, "url"),
+                "canonicalUrl": _frontmatter_string(frontmatter, "canonical_url"),
                 "excerpt": _excerpt_from_markdown(body),
             }
         )
@@ -716,6 +718,8 @@ def desktop_document():
         "sourceSite": _frontmatter_string(frontmatter, "source_site"),
         "ingestedAt": _frontmatter_string(frontmatter, "ingested_at"),
         "rating": rating,
+        "url": _frontmatter_string(frontmatter, "url"),
+        "canonicalUrl": _frontmatter_string(frontmatter, "canonical_url"),
         "excerpt": _excerpt_from_markdown(body),
     }
 
@@ -893,7 +897,8 @@ def desktop_file():
     path = Path(raw_path)
     if not path.exists() or not path.is_file():
         return jsonify(success=False, message=f"File not found: {path}"), 404
-    return send_file(path)
+    download_flag = request.args.get("download", "").strip().lower() in {"1", "true", "yes"}
+    return send_file(path, as_attachment=download_flag, download_name=path.name if download_flag else None)
 
 
 if __name__ == "__main__":

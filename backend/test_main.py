@@ -472,6 +472,71 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(documents[1]["rating"], 1)
         self.assertEqual(documents[2]["rating"], 0)
 
+    def test_desktop_document_exposes_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'url: "https://example.com/article"\n'
+                'canonical_url: "https://example.com/article/v2"\n'
+                "---\n\n"
+                "Body.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get(
+                "/desktop/document",
+                query_string={"articlePath": str(article_path)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.get_json()["detail"]["summary"]
+        self.assertEqual(summary["url"], "https://example.com/article")
+        self.assertEqual(summary["canonicalUrl"], "https://example.com/article/v2")
+
+    def test_desktop_library_exposes_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir) / "label"
+            root.mkdir()
+            (root / "Article.md").write_text(
+                "---\n"
+                'title: "Fixture Article"\n'
+                'label: "label"\n'
+                'url: "https://example.com/article"\n'
+                "---\n\n"
+                "Body.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.get("/desktop/library", query_string={"root": str(tmpdir)})
+
+        self.assertEqual(response.status_code, 200)
+        documents = response.get_json()["documents"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0]["url"], "https://example.com/article")
+
+    def test_desktop_file_download_flag_returns_attachment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "Fixture.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n% fixture\n")
+
+            inline = self.client.get(
+                "/desktop/file",
+                query_string={"path": str(pdf_path)},
+            )
+            attachment = self.client.get(
+                "/desktop/file",
+                query_string={"path": str(pdf_path), "download": "1"},
+            )
+
+        self.assertEqual(inline.status_code, 200)
+        self.assertEqual(attachment.status_code, 200)
+        self.assertNotIn("attachment", (inline.headers.get("Content-Disposition") or "").lower())
+        disposition = (attachment.headers.get("Content-Disposition") or "").lower()
+        self.assertIn("attachment", disposition)
+        self.assertIn("fixture.pdf", disposition)
+
     def test_desktop_document_returns_rating(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             article_path = Path(tmpdir) / "Article.md"
