@@ -245,6 +245,22 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return data as T
     }
+    case 'browse_directory': {
+      const params = new URLSearchParams()
+      if (payload.path) {
+        params.set('path', String(payload.path))
+      }
+      const response = await fetch(`${browserApiBase}/desktop/browse?${params.toString()}`)
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to browse directory')
+      }
+      return {
+        path: data.path as string,
+        parent: (data.parent ?? null) as string | null,
+        directories: (data.directories ?? []) as { name: string; path: string }[],
+      } as T
+    }
     default:
       throw new Error(`Unsupported desktop command in browser mode: ${command}`)
   }
@@ -1403,6 +1419,12 @@ function App() {
   const [focusedHighlight, setFocusedHighlight] = useState<{ id: string; ts: number } | null>(null)
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null)
   const [infoOpen, setInfoOpen] = useState(false)
+  const [rootPickerOpen, setRootPickerOpen] = useState(false)
+  const [rootPickerPath, setRootPickerPath] = useState('')
+  const [rootPickerParent, setRootPickerParent] = useState<string | null>(null)
+  const [rootPickerEntries, setRootPickerEntries] = useState<{ name: string; path: string }[]>([])
+  const [rootPickerLoading, setRootPickerLoading] = useState(false)
+  const [rootPickerError, setRootPickerError] = useState<string | null>(null)
   const [findOpen, setFindOpen] = useState(false)
   const [findQuery, setFindQuery] = useState('')
   const [findMatchCount, setFindMatchCount] = useState(0)
@@ -1868,6 +1890,38 @@ function App() {
     } finally {
       setLoadingLibrary(false)
     }
+  }
+
+  async function loadRootPickerPath(path: string | null) {
+    setRootPickerLoading(true)
+    setRootPickerError(null)
+    try {
+      const response = await desktopCommand<{
+        path: string
+        parent: string | null
+        directories: { name: string; path: string }[]
+      }>('browse_directory', { path: path ?? '' })
+      setRootPickerPath(response.path)
+      setRootPickerParent(response.parent)
+      setRootPickerEntries(response.directories)
+    } catch (error) {
+      setRootPickerError(stringifyError(error))
+    } finally {
+      setRootPickerLoading(false)
+    }
+  }
+
+  function openRootPicker() {
+    const seed = rootPath.trim() || null
+    setRootPickerOpen(true)
+    void loadRootPickerPath(seed)
+  }
+
+  async function confirmRootPicker() {
+    if (!rootPickerPath) return
+    setRootPickerOpen(false)
+    setRootPath(rootPickerPath)
+    await refreshLibrary(rootPickerPath)
   }
 
   async function handleReindex() {
@@ -2975,6 +3029,97 @@ function App() {
           </div>
         </div>
       ) : null}
+      {rootPickerOpen ? (
+        <div
+          className="info-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Choose corpus root"
+          onClick={() => setRootPickerOpen(false)}
+        >
+          <div
+            className="info-panel picker-panel"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="info-header">
+              <h2>Choose corpus root</h2>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setRootPickerOpen(false)}
+                aria-label="Close directory picker"
+              >
+                Close
+              </button>
+            </header>
+            <div className="picker-body">
+              <div className="picker-toolbar">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  disabled={!rootPickerParent || rootPickerLoading}
+                  onClick={() => void loadRootPickerPath(rootPickerParent)}
+                >
+                  ← Parent
+                </button>
+                <input
+                  type="text"
+                  className="text-input picker-path"
+                  value={rootPickerPath}
+                  onChange={(event) => setRootPickerPath(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      void loadRootPickerPath(rootPickerPath.trim() || null)
+                    }
+                  }}
+                  placeholder="/path/to/corpus"
+                />
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => void loadRootPickerPath(rootPickerPath.trim() || null)}
+                  disabled={rootPickerLoading}
+                >
+                  Go
+                </button>
+              </div>
+              {rootPickerError ? (
+                <p className="picker-error">{rootPickerError}</p>
+              ) : null}
+              <ul className="picker-list">
+                {rootPickerLoading ? (
+                  <li className="picker-item muted">Loading…</li>
+                ) : rootPickerEntries.length === 0 ? (
+                  <li className="picker-item muted">No subdirectories</li>
+                ) : (
+                  rootPickerEntries.map((entry) => (
+                    <li key={entry.path}>
+                      <button
+                        type="button"
+                        className="picker-item"
+                        onClick={() => void loadRootPickerPath(entry.path)}
+                      >
+                        📁 {entry.name}
+                      </button>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </div>
+            <footer className="picker-footer">
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => void confirmRootPicker()}
+                disabled={!rootPickerPath || rootPickerLoading}
+              >
+                Use this folder
+              </button>
+            </footer>
+          </div>
+        </div>
+      ) : null}
       <aside className="sidebar">
         <div className="sidebar-scroll">
           <div className="brand">
@@ -2995,6 +3140,14 @@ function App() {
                 onChange={(event) => setRootPath(event.target.value)}
                 placeholder="/path/to/output"
               />
+              <button
+                className="ghost-button"
+                onClick={openRootPicker}
+                disabled={loadingLibrary}
+                title="Browse filesystem to pick a corpus root"
+              >
+                Browse…
+              </button>
               <button className="ghost-button" onClick={() => void refreshLibrary()} disabled={loadingLibrary}>
                 Reload
               </button>

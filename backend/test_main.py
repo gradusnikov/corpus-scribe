@@ -745,6 +745,37 @@ class MainApiTests(unittest.TestCase):
                 ["CSD for Beginners", "Unrelated Work"],
             )
 
+    def test_desktop_browse_directory_lists_subdirectories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "alpha").mkdir()
+            (root / "beta").mkdir()
+            (root / "gamma").mkdir()
+            (root / ".hidden").mkdir()
+            (root / "file.md").write_text("body", encoding="utf-8")
+
+            response = self.client.get(
+                "/desktop/browse",
+                query_string={"path": str(root)},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["path"], str(root))
+        names = [entry["name"] for entry in payload["directories"]]
+        self.assertEqual(names, ["alpha", "beta", "gamma"])
+
+    def test_desktop_browse_directory_handles_missing_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "does_not_exist"
+            response = self.client.get(
+                "/desktop/browse",
+                query_string={"path": str(missing)},
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.get_json()["success"])
+
     def test_desktop_search_invalid_query_returns_400(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
             (Path(tmpdir) / "label").mkdir()

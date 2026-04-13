@@ -4,7 +4,7 @@
 
 1. [x] Feature: Show the ranking stars
 2. [x] Feature: Allow to remove articles from the library
-3. [ ] Feature: Use file selector dialog to set the corpus root
+3. [x] Feature: Use file selector dialog to set the corpus root
 4. [x] Bug: Do not load automatically the first document
 5. [ ] Feature: Search related to the current document (based on references found in the current document, or semantic search)
 6. [ ] Feature: Allow to link a related document to the current document - allow to add a note

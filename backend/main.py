@@ -858,6 +858,37 @@ def desktop_default_root():
     return jsonify(success=True, root=str(root))
 
 
+@app.route("/desktop/browse", methods=["GET"])
+def desktop_browse_directory():
+    raw_path = (request.args.get("path") or "").strip()
+    candidate = Path(raw_path).expanduser() if raw_path else Path.home()
+    try:
+        resolved = candidate.resolve()
+    except Exception as exc:
+        return jsonify(success=False, message=f"Invalid path: {exc}"), 400
+    if not resolved.exists():
+        return jsonify(success=False, message=f"Path does not exist: {resolved}"), 404
+    if not resolved.is_dir():
+        return jsonify(success=False, message=f"Not a directory: {resolved}"), 400
+
+    try:
+        entries = sorted(
+            (entry for entry in resolved.iterdir() if entry.is_dir() and not entry.name.startswith(".")),
+            key=lambda item: item.name.casefold(),
+        )
+    except PermissionError as exc:
+        return jsonify(success=False, message=f"Permission denied: {exc}"), 403
+
+    directories = [{"name": entry.name, "path": str(entry)} for entry in entries]
+    parent = str(resolved.parent) if resolved.parent != resolved else None
+    return jsonify(
+        success=True,
+        path=str(resolved),
+        parent=parent,
+        directories=directories,
+    )
+
+
 @app.route("/desktop/library", methods=["GET"])
 def desktop_library():
     root = _resolve_library_root(request.args.get("root"))
