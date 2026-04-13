@@ -10,7 +10,7 @@
 6. [ ] Feature: Allow to link a related document to the current document - allow to add a note
 7. [ ] Feature: Allow to display and image in full resolution
 8. [~] Feature: search should prioritize highly ranked sources, affinity to the current document (rating priority done; affinity pending)
-9. [ ] Feature: In search use author, latex article id, doi, date, etc.
+9. [x] Feature: In search use author, latex article id, doi, date, etc.
 10. [ ] Feature: Add pubmed style search criteria (e.g. "((Tournier JD[Author]) AND (CSD[Title])) AND (GPU)"). The default is all-fields
 11. [x] Persist UI state (label, font, mode, etc.)
 12. [x] Feature: Add re-index db button

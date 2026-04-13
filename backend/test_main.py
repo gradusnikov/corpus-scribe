@@ -634,6 +634,56 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(frontmatter["year"], 2024)
         self.assertEqual(frontmatter["rating"], 4)
 
+    def test_desktop_search_matches_metadata_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "neuro").mkdir()
+            (root / "neuro" / "Tournier.md").write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution"\n'
+                'label: "neuro"\n'
+                'authors: "J-D Tournier, F Calamante"\n'
+                'doi: "10.1016/j.neuroimage.2007.02.016"\n'
+                "year: 2007\n"
+                "---\n\nBody about CSD.\n",
+                encoding="utf-8",
+            )
+            (root / "ml").mkdir()
+            (root / "ml" / "Transformer.md").write_text(
+                "---\n"
+                'title: "Attention Is All You Need"\n'
+                'label: "ml"\n'
+                'authors: "Vaswani et al."\n'
+                'arxiv_id: "1706.03762"\n'
+                "year: 2017\n"
+                "---\n\nBody about transformers.\n",
+                encoding="utf-8",
+            )
+
+            def search(query: str) -> list[dict]:
+                response = self.client.post(
+                    "/desktop/search",
+                    json={"root": str(root), "query": query},
+                )
+                self.assertEqual(response.status_code, 200)
+                return response.get_json()["documents"]
+
+            by_author = search("tournier")
+            self.assertEqual(len(by_author), 1)
+            self.assertEqual(by_author[0]["title"], "Constrained Spherical Deconvolution")
+
+            by_doi = search("10.1016/j.neuroimage")
+            self.assertEqual(len(by_doi), 1)
+            self.assertEqual(by_doi[0]["title"], "Constrained Spherical Deconvolution")
+
+            by_arxiv = search("1706.03762")
+            self.assertEqual(len(by_arxiv), 1)
+            self.assertEqual(by_arxiv[0]["title"], "Attention Is All You Need")
+
+            by_year = search("2017")
+            self.assertEqual(len(by_year), 1)
+            self.assertEqual(by_year[0]["title"], "Attention Is All You Need")
+
     def test_desktop_delete_document_removes_bundle_and_index_records(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
             bundle_dir = Path(tmpdir) / "Label" / "Fixture"

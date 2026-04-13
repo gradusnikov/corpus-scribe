@@ -245,6 +245,39 @@ def _stable_doc_id(path: Path) -> str:
     return path.as_posix().lower()
 
 
+def _frontmatter_text_field(frontmatter: dict, key: str) -> str | None:
+    value = frontmatter.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, list):
+        parts = [
+            item.strip() if isinstance(item, str) else str(item)
+            for item in value
+            if item not in (None, "")
+        ]
+        joined = ", ".join(part for part in parts if part)
+        return joined or None
+    return None
+
+
+_FRONTMATTER_SEARCH_KEYS: tuple[str, ...] = (
+    "authors",
+    "author",
+    "doi",
+    "arxiv_id",
+    "pmid",
+    "pmcid",
+    "year",
+    "published",
+    "date",
+    "ingested_at",
+    "publisher",
+    "journal",
+)
+
+
 def _scan_library_documents(root_path: Path) -> list[dict]:
     documents: list[dict] = []
     for path in root_path.rglob("*.md"):
@@ -265,6 +298,11 @@ def _scan_library_documents(root_path: Path) -> list[dict]:
         source_pdf_path = _sibling_with_suffix_if_exists(path, ".source.pdf")
         rating_value = _frontmatter_int(frontmatter, "rating")
         rating = max(0, min(5, rating_value)) if isinstance(rating_value, int) else 0
+        metadata_text: dict[str, str] = {}
+        for key in _FRONTMATTER_SEARCH_KEYS:
+            value = _frontmatter_text_field(frontmatter, key)
+            if value:
+                metadata_text[key] = value
         documents.append(
             {
                 "id": _stable_doc_id(path),
@@ -282,6 +320,13 @@ def _scan_library_documents(root_path: Path) -> list[dict]:
                 "rating": rating,
                 "url": _frontmatter_string(frontmatter, "url"),
                 "canonicalUrl": _frontmatter_string(frontmatter, "canonical_url"),
+                "authors": metadata_text.get("authors") or metadata_text.get("author"),
+                "doi": metadata_text.get("doi"),
+                "year": metadata_text.get("year"),
+                "arxivId": metadata_text.get("arxiv_id"),
+                "pmid": metadata_text.get("pmid"),
+                "pmcid": metadata_text.get("pmcid"),
+                "metadataText": metadata_text,
                 "excerpt": _excerpt_from_markdown(body),
             }
         )
@@ -877,7 +922,17 @@ def desktop_search():
     for doc in _scan_library_documents(root):
         if label and label != "all" and (doc.get("label") or "") != label:
             continue
-        haystacks = [doc.get("title") or "", doc.get("excerpt") or ""]
+        haystacks = [
+            doc.get("title") or "",
+            doc.get("excerpt") or "",
+            doc.get("label") or "",
+            doc.get("url") or "",
+            doc.get("canonicalUrl") or "",
+            doc.get("sourceSite") or "",
+        ]
+        metadata_text = doc.get("metadataText") or {}
+        if isinstance(metadata_text, dict):
+            haystacks.extend(str(value) for value in metadata_text.values() if value)
         article_path = Path(doc["articlePath"])
         try:
             haystacks.append(_read_markdown_body(article_path))
