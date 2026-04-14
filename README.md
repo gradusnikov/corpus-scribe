@@ -1,10 +1,10 @@
 # Corpus Scribe
 
-Corpus Scribe turns web articles and PDFs into a **personalized, high-quality, LLM-friendly knowledge base**.
+Corpus Scribe is a **Markdown-first research ingestion and corpus tool** for web articles and PDFs.
 
-It captures messy publisher pages and source PDFs, normalizes them into **clean Markdown-first article bundles**, preserves local assets, generates citation metadata, and optionally writes companion notes. Reading PDFs are still supported, but they are a derived artifact rather than the primary output.
+It captures messy publisher pages and source PDFs, normalizes them into **clean, durable article bundles**, preserves local assets, generates citation metadata, and optionally writes companion notes. The main artifact is always the saved Markdown. Reader views, notes, and reading PDFs are derived layers around that corpus.
 
-Comes with:
+It includes:
 
 - a Chrome extension for one-click capture
 - a Dockerized Flask backend
@@ -16,23 +16,43 @@ Comes with:
 
 ![Corpus Scribe clipper](docs/corpus-scribe-clipper.png)
 
+## What it is
+
+Corpus Scribe is built for people who want a private local corpus that can be:
+
+- read comfortably in a browser
+- searched and indexed locally
+- processed by scripts, local tools, and LLM workflows
+- preserved in a format that stays useful outside this app
+
+The core job is not "save pages to read later." The core job is:
+
+1. capture technical content from the web or a source PDF
+2. normalize it into a high-quality Markdown bundle
+3. keep provenance and companion artifacts beside it
+4. make that corpus usable for reading, annotation, and later machine-assisted work
+
 ## Why use it
 
 - Build a personal research corpus in plain Markdown instead of scattered bookmarks, PDFs, and clipped HTML.
-- Create a knowledge base that is easier for local agents and LLM workflows to read, search, summarize, and link.
-- Preserve higher-quality source structure than generic clipping tools: equations, tables, code blocks, images, bibliography, and notes.
-- Keep both provenance and usability:
+- Keep technical documents usable after capture: equations, tables, code blocks, images, bibliography, and notes survive much better than in generic clipping workflows.
+- Create a corpus that is easier for local agents and LLM workflows to read, search, summarize, and link.
+- Keep both provenance and usability in the same bundle:
   - original source PDF when applicable
   - canonical `.md`
   - optional `.notes.md`
   - optional reading PDF for Kindle or offline reading
 
-## Ways to use it
+## Best fit
 
-- Build a personal LLM knowledge base from articles, blog posts, papers, and technical documentation.
-- Save papers into labeled folders like `ml`, `agents`, `biology`, or `ideas` and query them later with local tools.
-- Generate clean reading copies from difficult source PDFs without making the PDF workflow the center of the system.
-- Maintain a private markdown library with stable frontmatter, bibliography files, notes, and an index that can be processed by scripts or agents.
+Corpus Scribe is a good fit if you want to:
+
+- build a personal knowledge base from articles, blog posts, papers, and technical documentation
+- save papers into labeled folders like `ml`, `agents`, `biology`, or `ideas` and query them later with local tools
+- keep a private markdown library with stable frontmatter, bibliography files, notes, and an index that scripts or agents can consume
+- generate cleaner reading copies from difficult source PDFs without making the PDF workflow the center of the system
+
+It is less about social bookmarking or casual read-it-later queues, and more about building a durable technical corpus.
 
 ## Core features
 
@@ -49,7 +69,7 @@ Comes with:
 
 ### Reader and library UI
 
-- Browser-based reader optimized for WSL + Windows Chrome
+- Browser-based reader and library workbench optimized for WSL + Windows Chrome
 - Library search with local indexing and article quality stars
 - Open-document switching, close current document, and persisted UI state
 - Focus mode, dark mode, adjustable font size, and persisted reading position
@@ -85,6 +105,7 @@ Comes with:
 ### Corpus structure and indexing
 
 - Markdown is the canonical artifact
+- Annotation layers such as highlights, notes, and noise stay attached to the article bundle instead of replacing the source
 - Stable YAML frontmatter for indexing and downstream processing
 - Generated `index.jsonl` at the corpus root
 - Companion artifacts around the main article:
@@ -155,18 +176,20 @@ Inside the container the backend still writes to `/output`, but Docker will map 
      - `Detected: PDF`
      - `Extraction: Mistral OCR`
      - or `Extraction: pdftotext fallback`
-7. Choose **Send to Kindle** or **Save PDF + MD**
+7. Choose **Save PDF + MD** or **Send to Kindle**
 
-The usual workflow is:
+The primary workflow is:
 
 - capture article or PDF
 - store it under a label
 - keep the markdown as the main artifact
 - optionally generate notes and reading PDFs
 
+Kindle delivery is supported, but it is an export path, not the center of the system.
+
 ## Reader UI
 
-There is now a browser reader in [desktop/](desktop) aimed at a Zotero-meets-Typora workflow:
+There is now a browser reader in [desktop/](desktop) that acts as a workbench over the saved corpus:
 
 - library browser on the left
 - markdown reader in the center
@@ -177,7 +200,7 @@ There is now a browser reader in [desktop/](desktop) aimed at a Zotero-meets-Typ
 - draggable splitters for resizing the side panels
 - persisted UI state such as selected label, display mode, and view preferences
 
-It reads the existing Corpus Scribe bundle layout directly instead of introducing a new storage model. The reader runs as a normal web app and talks to the Flask backend through local `/desktop/*` endpoints.
+It reads the existing Corpus Scribe bundle layout directly instead of introducing a new storage model. The reader is intentionally downstream of the saved corpus: if you stop using the UI, the Markdown bundles remain usable on their own. The reader runs as a normal web app and talks to the Flask backend through local `/desktop/*` endpoints.
 
 From the repo root:
 

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -21,8 +22,11 @@ from article_extractor import (
     _build_frontmatter,
     _generate_companion_notes,
     _notes_doc_id,
+    _normalize_latex_delimiters_in_markdown,
+    _strip_pdf_thematic_breaks,
     _strip_noise_from_markdown,
     extract_article,
+    extract_url,
     extract_pdf_url,
     regenerate_reading_pdf,
 )
@@ -82,7 +86,9 @@ def _resolve_library_root(root: str | None) -> Path:
     value = (root or "").strip()
     if not value:
         return Path(DESKTOP_API_ROOT)
-    return Path(value).expanduser()
+    candidate = Path(value).expanduser()
+    resolved = _translate_host_library_root_to_container(str(candidate))
+    return Path(resolved).expanduser()
 
 
 def _split_frontmatter(text: str) -> tuple[dict, str]:
@@ -364,6 +370,7 @@ def _scan_library_documents(root_path: Path) -> list[dict]:
                 "label": label,
                 "articlePath": str(path),
                 "notesPath": str(notes_path) if notes_path else None,
+                "notesPending": _notes_generation_pending(path),
                 "bibPath": str(bib_path) if bib_path else None,
                 "highlightsPath": str(highlights_path) if highlights_path.exists() else None,
                 "highlightCount": len(highlights),
@@ -399,6 +406,497 @@ def _read_markdown_body(path: Path) -> str:
     content = path.read_text(encoding="utf-8")
     _, body = _split_frontmatter(content)
     return body
+
+
+def _search_db_path(root: Path) -> Path:
+    return root / ".corpus-scribe-search.sqlite3"
+
+
+def _open_search_db(root: Path) -> sqlite3.Connection:
+    root.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_search_db_path(root))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
+
+
+def _search_schema_is_current(conn: sqlite3.Connection) -> bool:
+    documents_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+    ).fetchone()
+    fts_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'"
+    ).fetchone()
+    if not documents_sql_row and not fts_sql_row:
+        return True
+    if not documents_sql_row or not fts_sql_row:
+        return False
+
+    documents_sql = (documents_sql_row[0] or "").lower()
+    fts_sql = (fts_sql_row[0] or "").lower()
+    required_documents = (
+        "doc_key text",
+        "article_path text",
+        "authors text",
+        "highlights_mtime_ns integer",
+    )
+    required_fts = (
+        "author",
+        "doi",
+        "body",
+        "titleabstract",
+        "highlight",
+        "publisher",
+        "pmcid",
+        "arxiv",
+    )
+    return all(token in documents_sql for token in required_documents) and all(
+        token in fts_sql for token in required_fts
+    )
+
+
+def _reset_search_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS documents_fts")
+    conn.execute("DROP TABLE IF EXISTS documents")
+    conn.commit()
+
+
+def _ensure_search_schema(conn: sqlite3.Connection) -> None:
+    if not _search_schema_is_current(conn):
+        _reset_search_schema(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY,
+            doc_key TEXT NOT NULL,
+            article_path TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            label TEXT,
+            notes_path TEXT,
+            bib_path TEXT,
+            highlights_path TEXT,
+            highlight_count INTEGER NOT NULL DEFAULT 0,
+            reading_pdf_path TEXT,
+            source_pdf_path TEXT,
+            source_site TEXT,
+            ingested_at TEXT,
+            rating INTEGER NOT NULL DEFAULT 0,
+            url TEXT,
+            canonical_url TEXT,
+            excerpt TEXT,
+            authors TEXT,
+            doi TEXT,
+            year TEXT,
+            published TEXT,
+            date_text TEXT,
+            arxiv_id TEXT,
+            pmid TEXT,
+            pmcid TEXT,
+            journal TEXT,
+            publisher TEXT,
+            article_mtime_ns INTEGER NOT NULL,
+            notes_mtime_ns INTEGER NOT NULL DEFAULT 0,
+            highlights_mtime_ns INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            title,
+            author,
+            doi,
+            year,
+            body,
+            titleabstract,
+            notes,
+            highlight,
+            label,
+            journal,
+            publisher,
+            pmid,
+            pmcid,
+            arxiv,
+            url,
+            tokenize='unicode61'
+        )
+        """
+    )
+
+
+def _path_mtime_ns(path: Path | None) -> int:
+    if not path or not path.exists():
+        return 0
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _build_search_document(path: Path) -> dict:
+    content = path.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(content)
+    title = _frontmatter_string(frontmatter, "title") or path.stem
+    label = _frontmatter_string(frontmatter, "label")
+    notes_path = _sibling_with_suffix_if_exists(path, ".notes.md")
+    bib_path = _sibling_if_exists(path, "bib")
+    highlights = _load_highlights(path)
+    highlights_path = _highlights_path(path)
+    reading_pdf_path = _sibling_with_suffix_if_exists(path, ".reading.pdf") or _sibling_if_exists(path, "pdf")
+    source_pdf_path = _sibling_with_suffix_if_exists(path, ".source.pdf")
+    rating_value = _frontmatter_int(frontmatter, "rating")
+    rating = max(0, min(5, rating_value)) if isinstance(rating_value, int) else 0
+
+    metadata_text: dict[str, str] = {}
+    for key in _FRONTMATTER_SEARCH_KEYS:
+        value = _frontmatter_text_field(frontmatter, key)
+        if value:
+            metadata_text[key] = value
+
+    notes_body = ""
+    if notes_path:
+        try:
+            notes_body = _read_markdown_body(notes_path)
+        except Exception:
+            notes_body = ""
+    highlight_text = "\n".join(item.get("text", "") for item in highlights if item.get("text"))
+
+    authors = metadata_text.get("authors") or metadata_text.get("author") or ""
+    doi = metadata_text.get("doi") or ""
+    arxiv_id = metadata_text.get("arxiv_id") or ""
+    pmid = metadata_text.get("pmid") or ""
+    pmcid = metadata_text.get("pmcid") or ""
+    journal = metadata_text.get("journal") or ""
+    publisher = metadata_text.get("publisher") or ""
+    source_site = _frontmatter_string(frontmatter, "source_site")
+    url = _frontmatter_string(frontmatter, "url")
+    canonical_url = _frontmatter_string(frontmatter, "canonical_url")
+    ingested_at = _frontmatter_string(frontmatter, "ingested_at")
+    year_text = " ".join(
+        value
+        for value in (
+            metadata_text.get("year"),
+            metadata_text.get("published"),
+            metadata_text.get("date"),
+            ingested_at,
+        )
+        if value
+    )
+    url_text = "\n".join(value for value in (url, canonical_url, source_site) if value)
+
+    return {
+        "summary": {
+            "id": _stable_doc_id(path),
+            "title": title,
+            "label": label,
+            "articlePath": str(path),
+            "notesPath": str(notes_path) if notes_path else None,
+            "bibPath": str(bib_path) if bib_path else None,
+            "highlightsPath": str(highlights_path) if highlights_path.exists() else None,
+            "highlightCount": len(highlights),
+            "readingPdfPath": str(reading_pdf_path) if reading_pdf_path else None,
+            "sourcePdfPath": str(source_pdf_path) if source_pdf_path else None,
+            "sourceSite": source_site,
+            "ingestedAt": ingested_at,
+            "rating": rating,
+            "url": url,
+            "canonicalUrl": canonical_url,
+            "authors": authors or None,
+            "doi": doi or None,
+            "year": metadata_text.get("year"),
+            "arxivId": arxiv_id or None,
+            "pmid": pmid or None,
+            "pmcid": pmcid or None,
+            "excerpt": _excerpt_from_markdown(body),
+        },
+        "search": {
+            "title": title,
+            "author": authors,
+            "doi": doi,
+            "year": year_text,
+            "body": body,
+            "titleabstract": f"{title}\n\n{body}".strip(),
+            "notes": notes_body,
+            "highlight": highlight_text,
+            "label": label or "",
+            "journal": journal,
+            "publisher": publisher,
+            "pmid": pmid,
+            "pmcid": pmcid,
+            "arxiv": arxiv_id,
+            "url": url_text,
+            "published": metadata_text.get("published") or "",
+            "date_text": metadata_text.get("date") or "",
+        },
+        "mtimes": {
+            "article_mtime_ns": _path_mtime_ns(path),
+            "notes_mtime_ns": _path_mtime_ns(notes_path),
+            "highlights_mtime_ns": _path_mtime_ns(highlights_path if highlights_path.exists() else None),
+        },
+    }
+
+
+def _upsert_search_document(conn: sqlite3.Connection, document: dict) -> None:
+    summary = document["summary"]
+    search = document["search"]
+    mtimes = document["mtimes"]
+    conn.execute(
+        """
+        INSERT INTO documents (
+            doc_key,
+            article_path,
+            title,
+            label,
+            notes_path,
+            bib_path,
+            highlights_path,
+            highlight_count,
+            reading_pdf_path,
+            source_pdf_path,
+            source_site,
+            ingested_at,
+            rating,
+            url,
+            canonical_url,
+            excerpt,
+            authors,
+            doi,
+            year,
+            published,
+            date_text,
+            arxiv_id,
+            pmid,
+            pmcid,
+            journal,
+            publisher,
+            article_mtime_ns,
+            notes_mtime_ns,
+            highlights_mtime_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(article_path) DO UPDATE SET
+            doc_key = excluded.doc_key,
+            title = excluded.title,
+            label = excluded.label,
+            notes_path = excluded.notes_path,
+            bib_path = excluded.bib_path,
+            highlights_path = excluded.highlights_path,
+            highlight_count = excluded.highlight_count,
+            reading_pdf_path = excluded.reading_pdf_path,
+            source_pdf_path = excluded.source_pdf_path,
+            source_site = excluded.source_site,
+            ingested_at = excluded.ingested_at,
+            rating = excluded.rating,
+            url = excluded.url,
+            canonical_url = excluded.canonical_url,
+            excerpt = excluded.excerpt,
+            authors = excluded.authors,
+            doi = excluded.doi,
+            year = excluded.year,
+            published = excluded.published,
+            date_text = excluded.date_text,
+            arxiv_id = excluded.arxiv_id,
+            pmid = excluded.pmid,
+            pmcid = excluded.pmcid,
+            journal = excluded.journal,
+            publisher = excluded.publisher,
+            article_mtime_ns = excluded.article_mtime_ns,
+            notes_mtime_ns = excluded.notes_mtime_ns,
+            highlights_mtime_ns = excluded.highlights_mtime_ns
+        """,
+        (
+            summary["id"],
+            summary["articlePath"],
+            summary["title"],
+            summary["label"],
+            summary["notesPath"],
+            summary["bibPath"],
+            summary["highlightsPath"],
+            summary["highlightCount"],
+            summary["readingPdfPath"],
+            summary["sourcePdfPath"],
+            summary["sourceSite"],
+            summary["ingestedAt"],
+            summary["rating"],
+            summary["url"],
+            summary["canonicalUrl"],
+            summary["excerpt"],
+            summary["authors"],
+            summary["doi"],
+            summary["year"],
+            search["published"],
+            search["date_text"],
+            summary["arxivId"],
+            summary["pmid"],
+            summary["pmcid"],
+            search["journal"],
+            search["publisher"],
+            mtimes["article_mtime_ns"],
+            mtimes["notes_mtime_ns"],
+            mtimes["highlights_mtime_ns"],
+        ),
+    )
+    row_id = conn.execute(
+        "SELECT id FROM documents WHERE article_path = ?",
+        (summary["articlePath"],),
+    ).fetchone()[0]
+    conn.execute("DELETE FROM documents_fts WHERE rowid = ?", (row_id,))
+    conn.execute(
+        """
+        INSERT INTO documents_fts (
+            rowid,
+            title,
+            author,
+            doi,
+            year,
+            body,
+            titleabstract,
+            notes,
+            highlight,
+            label,
+            journal,
+            publisher,
+            pmid,
+            pmcid,
+            arxiv,
+            url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row_id,
+            search["title"],
+            search["author"],
+            search["doi"],
+            search["year"],
+            search["body"],
+            search["titleabstract"],
+            search["notes"],
+            search["highlight"],
+            search["label"],
+            search["journal"],
+            search["publisher"],
+            search["pmid"],
+            search["pmcid"],
+            search["arxiv"],
+            search["url"],
+        ),
+    )
+
+
+def _sync_search_index(root: Path) -> dict[str, int | str]:
+    conn = _open_search_db(root)
+    try:
+        _ensure_search_schema(conn)
+        fts_row_ids = {
+            row[0]
+            for row in conn.execute("SELECT rowid FROM documents_fts").fetchall()
+        }
+        existing_rows = conn.execute(
+            "SELECT id, article_path, article_mtime_ns, notes_mtime_ns, highlights_mtime_ns FROM documents"
+        ).fetchall()
+        existing = {
+            row["article_path"]: (
+                row["id"],
+                row["article_mtime_ns"],
+                row["notes_mtime_ns"],
+                row["highlights_mtime_ns"],
+            )
+            for row in existing_rows
+        }
+
+        seen: set[str] = set()
+        indexed = 0
+        updated = 0
+        errors = 0
+        for path in root.rglob("*.md"):
+            if path.name.endswith(".notes.md"):
+                continue
+            article_path = str(path)
+            notes_path = _sibling_with_suffix_if_exists(path, ".notes.md")
+            highlights_path = _highlights_path(path)
+            current_mtimes = (
+                _path_mtime_ns(path),
+                _path_mtime_ns(notes_path),
+                _path_mtime_ns(highlights_path if highlights_path.exists() else None),
+            )
+            seen.add(article_path)
+            cached = existing.get(article_path)
+            if cached and cached[1:] == current_mtimes and cached[0] in fts_row_ids:
+                indexed += 1
+                continue
+            try:
+                document = _build_search_document(path)
+                _upsert_search_document(conn, document)
+                indexed += 1
+                updated += 1
+            except Exception as exc:
+                app.logger.warning("Search index sync skipped %s: %s", path, exc)
+                errors += 1
+
+        removed = 0
+        for article_path, (row_id, *_rest) in existing.items():
+            if article_path in seen:
+                continue
+            conn.execute("DELETE FROM documents_fts WHERE rowid = ?", (row_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (row_id,))
+            removed += 1
+
+        conn.commit()
+        return {
+            "indexed": indexed,
+            "updated": updated,
+            "removed": removed,
+            "errors": errors,
+            "dbPath": str(_search_db_path(root)),
+        }
+    finally:
+        conn.close()
+
+
+def _remove_search_records_for_article(article_path: Path) -> int:
+    removed = 0
+    output_root = Path(OUTPUT_DIR)
+    candidate_roots: list[Path] = []
+    try:
+        current = article_path.parent.resolve()
+        output_resolved = output_root.resolve()
+    except Exception:
+        current = article_path.parent
+        output_resolved = output_root
+
+    while True:
+        candidate_roots.append(current)
+        if current == output_resolved or current.parent == current:
+            break
+        current = current.parent
+
+    seen_roots: set[str] = set()
+    for root in candidate_roots:
+        key = str(root)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        db_path = _search_db_path(root)
+        if not db_path.exists():
+            continue
+        conn = _open_search_db(root)
+        try:
+            _ensure_search_schema(conn)
+            row = conn.execute(
+                "SELECT id FROM documents WHERE article_path = ?",
+                (str(article_path),),
+            ).fetchone()
+            if not row:
+                continue
+            row_id = row["id"]
+            conn.execute("DELETE FROM documents_fts WHERE rowid = ?", (row_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (row_id,))
+            conn.commit()
+            removed += 1
+        finally:
+            conn.close()
+    return removed
 
 
 def _relative_to_output(path: str | None) -> str | None:
@@ -479,6 +977,8 @@ def _delete_article_bundle(article_path: Path) -> dict:
         f"{stem}.pdf",
         f"{stem}.highlights.json",
         f"{stem}.html",
+        f"{stem}.raw.html",
+        f"{stem}.normalized.html",
         "ocr_response.json",
     }
 
@@ -512,11 +1012,13 @@ def _delete_article_bundle(article_path: Path) -> dict:
         if rel:
             relative_paths.add(rel)
     removed_index = _remove_index_records_for_paths(relative_paths)
+    removed_search = _remove_search_records_for_article(article_path)
 
     return {
         "removedFiles": removed_files,
         "removedDirs": removed_dirs,
         "removedIndexRecords": removed_index,
+        "removedSearchRecords": removed_search,
     }
 
 
@@ -597,6 +1099,25 @@ def _notes_metadata_from_article(article_frontmatter: dict, article_path: Path) 
     }
 
 
+def _notes_pending_path(article_path: Path) -> Path:
+    return article_path.with_name(article_path.stem + ".notes.pending")
+
+
+def _notes_generation_pending(article_path: Path) -> bool:
+    return _notes_pending_path(article_path).exists()
+
+
+def _mark_notes_generation_pending(article_path: Path) -> None:
+    _notes_pending_path(article_path).write_text(
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        encoding="utf-8",
+    )
+
+
+def _clear_notes_generation_pending(article_path: Path) -> None:
+    _notes_pending_path(article_path).unlink(missing_ok=True)
+
+
 def _build_existing_article_payload(article_path: Path) -> dict:
     article_text = article_path.read_text(encoding="utf-8")
     article_frontmatter, article_body = _split_frontmatter(article_text)
@@ -621,6 +1142,7 @@ def _build_existing_article_payload(article_path: Path) -> dict:
         "sourcePdfAvailable": bool(source_pdf_path),
         "notes": str(notes_path) if notes_path.exists() else None,
         "notesAvailable": notes_path.exists(),
+        "notesPending": _notes_generation_pending(article_path),
         "notesDocId": _frontmatter_string(notes_frontmatter, "doc_id") or (_notes_doc_id(_frontmatter_string(article_frontmatter, "doc_id")) if notes_path.exists() and _frontmatter_string(article_frontmatter, "doc_id") else None),
         "metadata": {
             "doc_id": _frontmatter_string(article_frontmatter, "doc_id"),
@@ -675,11 +1197,15 @@ def _generate_existing_notes(article_path: Path, notes_config: dict | None = Non
 
 def _spawn_async_notes_generation(article_path: Path, notes_config: dict | None = None) -> None:
     """Kick off companion-notes generation in a background thread."""
+    _mark_notes_generation_pending(article_path)
+
     def _run():
         try:
             _generate_existing_notes(article_path, notes_config)
         except Exception:
             app.logger.exception("Async notes generation failed for %s", article_path)
+        finally:
+            _clear_notes_generation_pending(article_path)
 
     thread = threading.Thread(target=_run, name="scribe-notes-async", daemon=True)
     thread.start()
@@ -793,7 +1319,7 @@ def generate_pdf():
     page_size = data.get("pageSize", "a5")
     app.logger.info("Extracting article from %s", url)
 
-    metadata = extract_article(
+    metadata = extract_url(
         html=data["html"],
         output_dir=TEMP_DIR,
         cookies=data.get("cookies"),
@@ -830,7 +1356,7 @@ def save_local():
     app.logger.info("Extracting article from %s (save local)", url)
 
     # Extract directly into the output directory — creates {OUTPUT_DIR}/{label}/{title}/
-    metadata = extract_article(
+    metadata = extract_url(
         html=data["html"],
         output_dir=str(target_dir),
         cookies=data.get("cookies"),
@@ -857,6 +1383,7 @@ def save_local():
         "pdfAvailable": bool(metadata["file-path"]),
         "notes": metadata.get("notes-path"),
         "notesAvailable": bool(metadata.get("notes-path")),
+        "notesPending": bool(metadata.get("md-path")),
         "notesDocId": metadata.get("notes-doc-id"),
         "metadata": metadata.get("metadata", {}),
     }
@@ -908,6 +1435,7 @@ def save_pdf():
         "sourcePdfAvailable": bool(metadata.get("source-pdf-path")),
         "notes": metadata.get("notes-path"),
         "notesAvailable": bool(metadata.get("notes-path")),
+        "notesPending": bool(metadata.get("md-path")),
         "notesDocId": metadata.get("notes-doc-id"),
         "metadata": metadata.get("metadata", {}),
     }
@@ -1000,6 +1528,7 @@ def desktop_reindex():
         "\n".join(json.dumps(item, ensure_ascii=False) for item in ordered) + ("\n" if ordered else ""),
         encoding="utf-8",
     )
+    search_sync = _sync_search_index(root)
 
     return jsonify(
         success=True,
@@ -1007,6 +1536,9 @@ def desktop_reindex():
         records=len(ordered),
         errors=errors,
         indexPath=str(index_path),
+        searchDbPath=search_sync["dbPath"],
+        indexedDocuments=search_sync["indexed"],
+        searchErrors=search_sync["errors"],
     )
 
 
@@ -1042,6 +1574,7 @@ _SEARCH_FIELD_ALIASES: dict[str, str] = {
     "arxivid": "arxiv",
     "url": "url",
 }
+_SEARCHABLE_FIELDS = frozenset(_SEARCH_FIELD_ALIASES.values())
 
 
 class _SearchQueryError(ValueError):
@@ -1064,6 +1597,7 @@ def _tokenize_search_query(query: str) -> list[tuple]:
     i = 0
     n = len(query)
     while i < n:
+        quoted = False
         ch = query[i]
         if ch.isspace():
             i += 1
@@ -1094,6 +1628,7 @@ def _tokenize_search_query(query: str) -> list[tuple]:
                 raise _SearchQueryError("Unclosed quoted phrase")
             text = query[i + 1 : end]
             i = end + 1
+            quoted = True
         else:
             start = i
             while i < n:
@@ -1122,16 +1657,24 @@ def _tokenize_search_query(query: str) -> list[tuple]:
             if end == -1:
                 raise _SearchQueryError("Unclosed field tag")
             field_raw = query[i + 1 : end].strip().lower().replace(" ", "").replace("/", "").replace("-", "")
-            field = _SEARCH_FIELD_ALIASES.get(field_raw, field_raw) if field_raw else "all"
+            if not field_raw:
+                field = "all"
+            else:
+                field = _SEARCH_FIELD_ALIASES.get(field_raw)
+                if field is None or field not in _SEARCHABLE_FIELDS:
+                    raise _SearchQueryError(f"Unknown field tag: {field_raw}")
             i = end + 1
         text = text.strip()
         if not text:
             continue
-        if field is None:
+        if quoted:
+            tokens.append(("TERM", text.lower(), field or "all", True))
+        elif field is None:
             for word in text.split():
-                tokens.append(("TERM", word.lower(), "all"))
+                tokens.append(("TERM", word.lower(), "all", False))
         else:
-            tokens.append(("TERM", text.lower(), field))
+            for word in text.split():
+                tokens.append(("TERM", word.lower(), field, False))
     return tokens
 
 
@@ -1208,7 +1751,7 @@ class _SearchQueryParser:
             return node
         if tok[0] == "TERM":
             self._consume()
-            return ("term", tok[1], tok[2])
+            return ("term", tok[1], tok[2], tok[3])
         raise _SearchQueryError(f"Unexpected token: {tok}")
 
 
@@ -1217,126 +1760,177 @@ def _parse_search_query(query: str):
     return _SearchQueryParser(tokens).parse()
 
 
-class _DocSearchHaystack:
-    def __init__(self, doc: dict):
-        self.doc = doc
-        self._body_loaded = False
-        self._body = ""
-        self._notes_loaded = False
-        self._notes = ""
-        self._highlights_loaded = False
-        self._highlights = ""
-
-    def _body_text(self) -> str:
-        if not self._body_loaded:
-            self._body_loaded = True
-            try:
-                self._body = _read_markdown_body(Path(self.doc["articlePath"]))
-            except Exception:
-                self._body = ""
-        return self._body
-
-    def _notes_text(self) -> str:
-        if not self._notes_loaded:
-            self._notes_loaded = True
-            notes_path = self.doc.get("notesPath")
-            if notes_path:
-                try:
-                    self._notes = _read_markdown_body(Path(notes_path))
-                except Exception:
-                    self._notes = ""
-        return self._notes
-
-    def _highlights_text(self) -> str:
-        if not self._highlights_loaded:
-            self._highlights_loaded = True
-            if self.doc.get("highlightsPath"):
-                try:
-                    items = _load_highlights(Path(self.doc["articlePath"]))
-                    self._highlights = "\n".join(item.get("text", "") for item in items)
-                except Exception:
-                    self._highlights = ""
-        return self._highlights
-
-    def _metadata(self) -> dict:
-        meta = self.doc.get("metadataText") or {}
-        return meta if isinstance(meta, dict) else {}
-
-    def values_for(self, field: str) -> list[str]:
-        doc = self.doc
-        meta = self._metadata()
-        if field == "title":
-            return [doc.get("title") or ""]
-        if field == "author":
-            return [meta.get("authors") or "", meta.get("author") or ""]
-        if field == "doi":
-            return [meta.get("doi") or ""]
-        if field == "year":
-            return [
-                meta.get("year") or "",
-                meta.get("published") or "",
-                meta.get("date") or "",
-                meta.get("ingested_at") or "",
-            ]
-        if field == "body":
-            return [self._body_text()]
-        if field == "titleabstract":
-            return [doc.get("title") or "", self._body_text()]
-        if field == "notes":
-            return [self._notes_text()]
-        if field == "highlight":
-            return [self._highlights_text()]
-        if field == "label":
-            return [doc.get("label") or ""]
-        if field == "journal":
-            return [meta.get("journal") or ""]
-        if field == "publisher":
-            return [meta.get("publisher") or ""]
-        if field == "pmid":
-            return [meta.get("pmid") or ""]
-        if field == "pmcid":
-            return [meta.get("pmcid") or ""]
-        if field == "arxiv":
-            return [meta.get("arxiv_id") or ""]
-        if field == "url":
-            return [doc.get("url") or "", doc.get("canonicalUrl") or "", doc.get("sourceSite") or ""]
-        if field == "all":
-            values: list[str] = [
-                doc.get("title") or "",
-                doc.get("label") or "",
-                doc.get("url") or "",
-                doc.get("canonicalUrl") or "",
-                doc.get("sourceSite") or "",
-                doc.get("excerpt") or "",
-            ]
-            values.extend(str(v) for v in meta.values() if v)
-            values.append(self._body_text())
-            values.append(self._notes_text())
-            values.append(self._highlights_text())
-            return values
-        return []
+_SEARCH_BM25_WEIGHTS = (12.0, 9.0, 11.0, 5.0, 2.0, 6.0, 3.0, 4.0, 7.0, 5.0, 4.0, 10.0, 10.0, 10.0, 3.0)
 
 
-def _evaluate_search_query(node, haystack: _DocSearchHaystack) -> bool:
+def _fts_phrase(text: str) -> str:
+    return '"' + text.replace('"', '""').strip() + '"'
+
+
+def _search_term_uses_prefix(text: str, quoted: bool) -> bool:
+    if quoted:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", text))
+
+
+def _compile_search_term_query(text: str, field: str, quoted: bool) -> str:
+    if _search_term_uses_prefix(text, quoted):
+        compiled = f"{text}*"
+    else:
+        compiled = _fts_phrase(text)
+    if field == "all":
+        return compiled
+    return f"{field} : {compiled}"
+
+
+def _compile_search_sql(node) -> tuple[str, list[str]]:
     if node is None:
-        return True
+        return "1", []
     kind = node[0]
     if kind == "term":
-        _, text, field = node
-        if not text:
-            return True
-        needle = text
-        for value in haystack.values_for(field):
-            if value and needle in value.lower():
-                return True
-        return False
+        _, text, field, quoted = node
+        compiled = _compile_search_term_query(text, field, quoted)
+        return (
+            "documents.id IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?)",
+            [compiled],
+        )
     if kind == "and":
-        return _evaluate_search_query(node[1], haystack) and _evaluate_search_query(node[2], haystack)
+        left_sql, left_params = _compile_search_sql(node[1])
+        right_sql, right_params = _compile_search_sql(node[2])
+        return f"({left_sql} AND {right_sql})", [*left_params, *right_params]
     if kind == "or":
-        return _evaluate_search_query(node[1], haystack) or _evaluate_search_query(node[2], haystack)
+        left_sql, left_params = _compile_search_sql(node[1])
+        right_sql, right_params = _compile_search_sql(node[2])
+        return f"({left_sql} OR {right_sql})", [*left_params, *right_params]
     if kind == "not":
-        return not _evaluate_search_query(node[1], haystack)
-    return False
+        child_sql, child_params = _compile_search_sql(node[1])
+        return f"(NOT ({child_sql}))", child_params
+    raise _SearchQueryError(f"Unsupported search node: {kind}")
+
+
+def _collect_positive_search_terms(node, negated: bool = False) -> list[str]:
+    if node is None:
+        return []
+    kind = node[0]
+    if kind == "term":
+        if negated:
+            return []
+        _, text, field, quoted = node
+        return [_compile_search_term_query(text, field, quoted)]
+    if kind == "not":
+        return _collect_positive_search_terms(node[1], True)
+    if kind in {"and", "or"}:
+        return [
+            *_collect_positive_search_terms(node[1], negated),
+            *_collect_positive_search_terms(node[2], negated),
+        ]
+    return []
+
+
+def _search_result_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["doc_key"],
+        "title": row["title"],
+        "label": row["label"],
+        "articlePath": row["article_path"],
+        "notesPath": row["notes_path"],
+        "notesPending": False,
+        "bibPath": row["bib_path"],
+        "highlightsPath": row["highlights_path"],
+        "highlightCount": int(row["highlight_count"] or 0),
+        "readingPdfPath": row["reading_pdf_path"],
+        "sourcePdfPath": row["source_pdf_path"],
+        "sourceSite": row["source_site"],
+        "ingestedAt": row["ingested_at"],
+        "rating": int(row["rating"] or 0),
+        "url": row["url"],
+        "canonicalUrl": row["canonical_url"],
+        "excerpt": row["excerpt"] or "",
+    }
+
+
+def _indexed_document_from_row(row: sqlite3.Row) -> dict:
+    doc = _search_result_from_row(row)
+    doc["authors"] = row["authors"]
+    doc["doi"] = row["doi"]
+    doc["year"] = row["year"]
+    doc["arxivId"] = row["arxiv_id"]
+    doc["pmid"] = row["pmid"]
+    doc["pmcid"] = row["pmcid"]
+    doc["metadataText"] = {
+        "authors": row["authors"] or "",
+        "doi": row["doi"] or "",
+        "year": row["year"] or "",
+        "published": row["published"] or "",
+        "date": row["date_text"] or "",
+        "arxiv_id": row["arxiv_id"] or "",
+        "pmid": row["pmid"] or "",
+        "pmcid": row["pmcid"] or "",
+        "journal": row["journal"] or "",
+        "publisher": row["publisher"] or "",
+        "ingested_at": row["ingested_at"] or "",
+    }
+    return doc
+
+
+def _load_indexed_documents(root: Path) -> list[dict]:
+    conn = _open_search_db(root)
+    try:
+        _ensure_search_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM documents
+            ORDER BY rating DESC, ingested_at DESC, title COLLATE NOCASE ASC
+            """
+        ).fetchall()
+        return [_indexed_document_from_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _run_indexed_search(root: Path, query_tree, label: str | None = None, limit: int = 200) -> tuple[list[dict], int]:
+    conn = _open_search_db(root)
+    try:
+        _ensure_search_schema(conn)
+        where_sql, where_params = _compile_search_sql(query_tree)
+        if label and label != "all":
+            where_sql = f"({where_sql}) AND COALESCE(documents.label, '') = ?"
+            where_params = [*where_params, label]
+
+        positive_terms = list(dict.fromkeys(_collect_positive_search_terms(query_tree)))
+        if positive_terms:
+            weights_sql = ", ".join(str(weight) for weight in _SEARCH_BM25_WEIGHTS)
+            score_parts = [
+                f"COALESCE((SELECT bm25(documents_fts, {weights_sql}) "
+                "FROM documents_fts WHERE rowid = documents.id AND documents_fts MATCH ?), 0.0)"
+                for _ in positive_terms
+            ]
+            score_sql = " + ".join(score_parts)
+            score_params = positive_terms
+        else:
+            score_sql = "0.0"
+            score_params = []
+
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM documents WHERE {where_sql}",
+            where_params,
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT
+                documents.*,
+                {score_sql} AS search_rank
+            FROM documents
+            WHERE {where_sql}
+            ORDER BY search_rank ASC, rating DESC, ingested_at DESC, title COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            [*score_params, *where_params, limit],
+        ).fetchall()
+        return ([_search_result_from_row(row) for row in rows], int(total))
+    finally:
+        conn.close()
 
 
 @app.route("/desktop/search", methods=["POST"])
@@ -1345,47 +1939,25 @@ def desktop_search():
     root = _resolve_library_root(data.get("root"))
     query = (data.get("query") or "").strip()
     label = (data.get("label") or "").strip()
-    active_path_raw = (data.get("activeArticlePath") or "").strip()
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
     if not query:
-        return jsonify(success=True, documents=[])
+        return jsonify(success=True, documents=[], total=0, truncated=False)
 
     try:
         tree = _parse_search_query(query)
     except _SearchQueryError as exc:
         return jsonify(success=False, message=f"Invalid query: {exc}"), 400
 
-    affinity_context: dict | None = None
-    if active_path_raw:
-        active_path = Path(active_path_raw)
-        if active_path.exists() and active_path.is_file():
-            try:
-                affinity_context = _load_affinity_context(active_path)
-            except Exception:
-                affinity_context = None
-
-    results: list[dict] = []
-    for doc in _scan_library_documents(root):
-        if label and label != "all" and (doc.get("label") or "") != label:
-            continue
-        haystack = _DocSearchHaystack(doc)
-        if _evaluate_search_query(tree, haystack):
-            if affinity_context is not None:
-                doc["affinityScore"] = _compute_affinity_score(doc, affinity_context)
-            results.append(doc)
-
-    if affinity_context is not None:
-        results.sort(
-            key=lambda item: (
-                -int(item.get("affinityScore") or 0),
-                -int(item.get("rating") or 0),
-                item.get("ingestedAt") or "",
-                (item.get("title") or "").casefold(),
-            ),
-        )
-
-    return jsonify(success=True, documents=results[:200])
+    sync_info = _sync_search_index(root)
+    results, total = _run_indexed_search(root, tree, label or None, limit=200)
+    return jsonify(
+        success=True,
+        documents=results,
+        total=total,
+        truncated=total > len(results),
+        indexPath=sync_info["dbPath"],
+    )
 
 
 @app.route("/desktop/document", methods=["GET"])
@@ -1400,6 +1972,9 @@ def desktop_document():
 
     content = path.read_text(encoding="utf-8")
     frontmatter, body = _split_frontmatter(content)
+    if (_frontmatter_string(frontmatter, "source_format") or "").lower() == "pdf":
+        body = _strip_pdf_thematic_breaks(body)
+        body = _normalize_latex_delimiters_in_markdown(body)
     rating_value = _frontmatter_int(frontmatter, "rating")
     rating = max(0, min(5, rating_value)) if isinstance(rating_value, int) else 0
     summary = {
@@ -1408,6 +1983,7 @@ def desktop_document():
         "label": _frontmatter_string(frontmatter, "label"),
         "articlePath": str(path),
         "notesPath": str(_sibling_with_suffix_if_exists(path, ".notes.md")) if _sibling_with_suffix_if_exists(path, ".notes.md") else None,
+        "notesPending": _notes_generation_pending(path),
         "bibPath": str(_sibling_if_exists(path, "bib")) if _sibling_if_exists(path, "bib") else None,
         "highlightsPath": str(_highlights_path(path)) if _highlights_path(path).exists() else None,
         "highlightCount": len(_load_highlights(path)),
@@ -1512,6 +2088,7 @@ def desktop_save_notes():
         _build_frontmatter(notes_frontmatter) + "\n\n" + notes_markdown.strip() + "\n",
         encoding="utf-8",
     )
+    _clear_notes_generation_pending(article_path)
 
     article_frontmatter["notes_file"] = notes_path.name
     if _frontmatter_string(article_frontmatter, "doc_id"):
@@ -1520,7 +2097,7 @@ def desktop_save_notes():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
-    return jsonify(success=True, notesPath=str(notes_path), notesMarkdown=notes_markdown)
+    return jsonify(success=True, notesPath=str(notes_path), notesMarkdown=notes_markdown, notesPending=False)
 
 
 @app.route("/desktop/notes/generate", methods=["POST"])
@@ -1536,6 +2113,7 @@ def desktop_generate_notes():
         payload = _generate_existing_notes(article_path)
     except Exception as error:
         return jsonify(success=False, message=str(error)), 500
+    _clear_notes_generation_pending(article_path)
 
     notes_markdown = _read_markdown_body(Path(payload["notes"])) if payload.get("notes") else ""
     return jsonify(
@@ -1543,6 +2121,7 @@ def desktop_generate_notes():
         notesPath=payload.get("notes"),
         notesMarkdown=notes_markdown,
         notesDocId=payload.get("notesDocId"),
+        notesPending=False,
     )
 
 
@@ -1756,6 +2335,7 @@ def desktop_suggest_related():
     root = _resolve_library_root(request.args.get("root"))
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
+    _sync_search_index(root)
 
     try:
         body = _read_markdown_body(article_path)
@@ -1774,7 +2354,7 @@ def desktop_suggest_related():
         source_resolved = article_path
 
     suggestions: list[dict] = []
-    for doc in _scan_library_documents(root):
+    for doc in _load_indexed_documents(root):
         try:
             doc_resolved = Path(doc["articlePath"]).resolve()
         except Exception:
@@ -1873,8 +2453,33 @@ def desktop_save_related():
     return jsonify(success=True, relatedPath=str(related_path), items=cleaned)
 
 
-def _reading_pdf_is_fresh(article_path: Path, reading_pdf: Path) -> bool:
-    """Return True if the reading PDF is newer than the md + highlights sources."""
+def _reading_pdf_meta_path(article_path: Path) -> Path:
+    return article_path.with_name(article_path.stem + ".reading.meta.json")
+
+
+def _read_reading_pdf_meta(article_path: Path) -> dict:
+    path = _reading_pdf_meta_path(article_path)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_reading_pdf_meta(article_path: Path, meta: dict) -> None:
+    path = _reading_pdf_meta_path(article_path)
+    path.write_text(json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _reading_pdf_is_fresh(
+    article_path: Path,
+    reading_pdf: Path,
+    page_size: str,
+    strip_references: bool,
+) -> bool:
+    """Return True if the reading PDF is newer than the md + highlights sources
+    and was generated with the same page size + references setting."""
     if not reading_pdf.exists():
         return False
     try:
@@ -1893,6 +2498,11 @@ def _reading_pdf_is_fresh(article_path: Path, reading_pdf: Path) -> bool:
                 return False
         except OSError:
             return False
+    meta = _read_reading_pdf_meta(article_path)
+    if meta.get("pageSize") != page_size:
+        return False
+    if bool(meta.get("stripReferences")) != bool(strip_references):
+        return False
     return True
 
 
@@ -1908,9 +2518,12 @@ def desktop_reading_pdf():
         return jsonify(success=False, message=f"Document not found: {article_path}"), 404
 
     page_size = (data.get("pageSize") or "a5").strip().lower()
+    strip_references = bool(data.get("stripReferences"))
     reading_pdf_path = article_path.with_name(article_path.stem + ".reading.pdf")
 
-    if _reading_pdf_is_fresh(article_path, reading_pdf_path):
+    if _reading_pdf_is_fresh(
+        article_path, reading_pdf_path, page_size, strip_references
+    ):
         return jsonify(
             success=True,
             readingPdfPath=str(reading_pdf_path),
@@ -1923,10 +2536,16 @@ def desktop_reading_pdf():
             article_path=article_path,
             page_size=page_size,
             highlights=highlights,
+            strip_references=strip_references,
         )
     except Exception as error:
         app.logger.exception("Reading PDF generation failed for %s", article_path)
         return jsonify(success=False, message=str(error)), 500
+
+    _write_reading_pdf_meta(
+        article_path,
+        {"pageSize": page_size, "stripReferences": strip_references},
+    )
 
     return jsonify(
         success=True,
@@ -2044,6 +2663,43 @@ def _resolve_host_native_prefix() -> str | None:
     return _derive_wsl_native_prefix(HOST_OUTPUT_DIR)
 
 
+def _translate_host_library_root_to_container(target: str) -> str:
+    """Map a host-visible corpus root to the container-visible path.
+
+    This allows the desktop UI to pass a host path such as a WSL mount under
+    ``HOST_OUTPUT_DIR`` while the backend still reads the corresponding files
+    through the container bind mount rooted at ``OUTPUT_DIR``.
+    """
+    value = (target or "").strip()
+    if not value:
+        return value
+
+    host_prefixes = [prefix for prefix in {HOST_OUTPUT_DIR, _resolve_host_native_prefix()} if prefix]
+    output_root = str(Path(OUTPUT_DIR))
+
+    normalized_value = value.rstrip("/\\")
+    output_norm = output_root.rstrip("/\\")
+    for prefix in host_prefixes:
+        normalized_prefix = prefix.rstrip("/\\")
+        if not normalized_prefix:
+            continue
+        if "\\" in normalized_prefix:
+            candidate_cmp = normalized_value.lower()
+            prefix_cmp = normalized_prefix.lower()
+        else:
+            candidate_cmp = normalized_value
+            prefix_cmp = normalized_prefix
+        if candidate_cmp == prefix_cmp:
+            return output_norm
+        separator = "\\" if "\\" in normalized_prefix else "/"
+        if candidate_cmp.startswith(prefix_cmp + separator):
+            remainder = normalized_value[len(normalized_prefix):].lstrip("/\\")
+            if not remainder:
+                return output_norm
+            return str(Path(output_root) / Path(remainder))
+    return value
+
+
 def _translate_container_path_to_host(target: str) -> str | None:
     """Map ``target`` (a container-side path under ``OUTPUT_DIR``) to the
     host-native form using ``HOST_OUTPUT_DIR_NATIVE`` when set, or auto-derived
@@ -2122,7 +2778,8 @@ def desktop_reveal():
     if not target.exists():
         return jsonify(success=False, message=f"Path not found: {target}"), 404
     directory = target if target.is_dir() else target.parent
-    launched = _try_open_with_host_tool(str(directory))
+    should_launch = bool(data.get("launch", True))
+    launched = _try_open_with_host_tool(str(directory)) if should_launch else False
     host_directory = _translate_container_path_to_host(str(directory))
     return jsonify(
         success=True,

@@ -8,26 +8,40 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from article_extractor import (
+    _cleanup_latex,
+    _collect_markdown_image_assets,
+    _collect_images,
+    _detect_source_family,
     _apply_html_annotations,
     _convert_html_to_markdown,
     _derive_citation_metadata,
     _download_image,
     _enrich_meta_with_doi,
+    _extract_preferred_math_node,
+    _replace_problem_math_with_tex_placeholders,
+    _restore_tex_placeholders,
+    _extract_latex_metadata,
     _extract_meta,
     _generate_notes_via_anthropic,
     _generate_notes_via_openai_compatible,
     _normalize_code_listing_tables,
     _postprocess_markdown,
+    _postprocess_markdown_before_math_restore,
+    _postprocess_mistral_markdown,
     _postprocess_pdf_markdown,
+    _postprocess_source_markdown,
     _prepare_html_for_markdown,
     _prepare_html_for_pdf,
+    _preferred_figure_image_url,
     _render_html_to_pdf_with_chromium,
     _resolve_notes_client_config,
     _resize_images_for_pdf,
     _safe_output_name,
+    _sanitize_latex_for_markdown,
     _sanitize_unicode_text,
     _strip_reference_sections_for_notes,
     extract_article,
+    extract_url,
     extract_pdf_bytes,
 )
 
@@ -128,6 +142,150 @@ FIXTURE_HTML = """<!doctype html>
 
 
 class ArticleExtractorTests(unittest.TestCase):
+    def test_detect_source_family_prefers_arxiv(self):
+        self.assertEqual(
+            _detect_source_family("https://arxiv.org/abs/1706.03762"),
+            "arxiv",
+        )
+        self.assertEqual(
+            _detect_source_family(
+                "",
+                '<html><head><link rel="canonical" href="https://arxiv.org/abs/1706.03762" /></head></html>',
+            ),
+            "arxiv",
+        )
+
+    def test_extract_url_routes_arxiv_through_adapter(self):
+        from unittest.mock import patch
+
+        with patch(
+            "article_extractor._extract_arxiv_url",
+            return_value={"title": "Attention Is All You Need"},
+        ) as arxiv_mock, patch(
+            "article_extractor.extract_article",
+            return_value={"title": "Generic"},
+        ) as generic_mock:
+            result = extract_url(
+                "<html></html>",
+                output_dir="/tmp/out",
+                url="https://arxiv.org/abs/1706.03762",
+                render_pdf=False,
+            )
+
+        self.assertEqual(result["title"], "Attention Is All You Need")
+        arxiv_mock.assert_called_once()
+        generic_mock.assert_not_called()
+
+    def test_extract_url_arxiv_falls_back_to_pdf_pipeline(self):
+        from unittest.mock import patch
+
+        with patch(
+            "article_extractor._discover_arxiv_html_url",
+            return_value=None,
+        ), patch(
+            "article_extractor.extract_pdf_url",
+            return_value={
+                "title": "Attention Is All You Need",
+                "md-path": None,
+                "metadata": {},
+            },
+        ) as pdf_mock:
+            result = extract_url(
+                "<html></html>",
+                output_dir="/tmp/out",
+                url="https://arxiv.org/abs/1706.03762",
+                render_pdf=False,
+            )
+
+        self.assertEqual(result["metadata"]["extraction_adapter"], "arxiv")
+        self.assertEqual(result["metadata"]["source_format"], "pdf")
+        self.assertIn("arxiv_pdf", result["metadata"]["extraction_fallback_chain"])
+        pdf_mock.assert_called_once()
+
+    def test_extract_latex_metadata_reads_starred_title_command(self):
+        metadata = _extract_latex_metadata(
+            r"\title*{New Scheme Adaption Strategy}\author{Alice~Example}\abstract{Body}"
+        )
+
+        self.assertEqual(metadata["title"], "New Scheme Adaption Strategy")
+        self.assertEqual(metadata["author"], "Alice Example")
+        self.assertEqual(metadata["abstract"], "Body")
+
+    def test_extract_latex_metadata_ignores_titlerunning_when_reading_title(self):
+        metadata = _extract_latex_metadata(
+            r"\titlerunning{Short Title}\title*{Long Paper Title}\author{Alice Example}"
+        )
+
+        self.assertEqual(metadata["title"], "Long Paper Title")
+
+    def test_sanitize_latex_for_markdown_preserves_citations_and_normalizes_xbar(self):
+        source = r"""\newcommand{\mU}{\bm{U}}
+\newcommand*\xbar[1]{\hbox{\ensuremath{#1}}}
+See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
+
+        cleaned = _sanitize_latex_for_markdown(source)
+
+        self.assertIn("[@CKM2025; @RL87]", cleaned)
+        self.assertIn(r"\overline{\bm{U}}_j", cleaned)
+
+    def test_collect_markdown_image_assets_copies_and_rewrites_local_images(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = Path(tmpdir) / "src"
+            assets_dir = Path(tmpdir) / "assets"
+            source_dir.mkdir()
+            assets_dir.mkdir()
+            image = source_dir / "figure.png"
+            image.write_bytes(b"png")
+
+            rewritten = _collect_markdown_image_assets(
+                "![caption](figure.png)",
+                source_dir,
+                assets_dir,
+            )
+            self.assertEqual(rewritten, "![caption](assets/figure.png)")
+            self.assertTrue((assets_dir / "figure.png").exists())
+
+    def test_collect_markdown_image_assets_rewrites_html_img_tags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = Path(tmpdir) / "src"
+            assets_dir = Path(tmpdir) / "assets"
+            source_dir.mkdir()
+            assets_dir.mkdir()
+            image = source_dir / "figure.png"
+            image.write_bytes(b"png")
+
+            rewritten = _collect_markdown_image_assets(
+                '<figure><img src="figure.png" /></figure>',
+                source_dir,
+                assets_dir,
+            )
+
+            self.assertEqual(rewritten, '<figure><img src="assets/figure.png" /></figure>')
+            self.assertTrue((assets_dir / "figure.png").exists())
+
+    def test_collect_markdown_image_assets_renders_pdf_embeds_to_png(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = Path(tmpdir) / "src"
+            assets_dir = Path(tmpdir) / "assets"
+            source_dir.mkdir()
+            assets_dir.mkdir()
+            html_path = source_dir / "fixture.html"
+            pdf_path = source_dir / "figure.pdf"
+            html_path.write_text(
+                "<!doctype html><html><body><h1>Fixture</h1><p>Rendered to PDF.</p></body></html>",
+                encoding="utf-8",
+            )
+            _render_html_to_pdf_with_chromium(html_path, pdf_path)
+
+            rewritten = _collect_markdown_image_assets(
+                '<div class="figure*">\n\n<embed src="figure.pdf" />\n\n</div>',
+                source_dir,
+                assets_dir,
+            )
+
+            self.assertIn("![](assets/figure.png)", rewritten)
+            self.assertTrue((assets_dir / "figure.png").exists())
+
     def test_safe_output_name_truncates_long_titles_stably(self):
         title = (
             "Stop Designing REST APIs Like a Mid-Level Dev: 4Advanced Patterns "
@@ -275,6 +433,104 @@ class ArticleExtractorTests(unittest.TestCase):
         self.assertIn("< 0.4", cleaned)
         self.assertIn("$k_{\\mathrm{init}}$", cleaned)
 
+    def test_pdf_markdown_postprocess_removes_page_separator_thematic_breaks(self):
+        text = (
+            "# Title\n\n"
+            "Intro paragraph.\n\n"
+            "---\n\n"
+            "Author footer.\n\n"
+            "***\n\n"
+            "## Section\n\n"
+            "Body text.\n"
+        )
+
+        cleaned = _postprocess_pdf_markdown(text)
+
+        self.assertIn("# Title", cleaned)
+        self.assertIn("Intro paragraph.", cleaned)
+        self.assertIn("Author footer.", cleaned)
+        self.assertIn("## Section", cleaned)
+        self.assertIn("Body text.", cleaned)
+        self.assertNotRegex(cleaned, r"(?m)^[ \t]{0,3}(?:---+|\*\*\*+|___+)[ \t]*$")
+
+    def test_postprocess_mistral_markdown_cleans_running_headers_and_citations(self):
+        pages = [
+            {
+                "markdown": (
+                    "# XMorpher\n\n"
+                    "###### Abstract\n\n"
+                    "A powerful network in DMIR*[1, 5, 15]*.\n"
+                ),
+                "header": None,
+                "footer": None,
+            },
+            {
+                "markdown": (
+                    "J. Shi et al.\n\n"
+                    "Body paragraph with networks[13,16] and more text.\n\n"
+                    "Full Transformer for Deformable Image Registration"
+                ),
+                "header": None,
+                "footer": None,
+            },
+            {
+                "markdown": (
+                    "J. Shi et al.\n\n"
+                    "Another page body.\n\n"
+                    "Full Transformer for Deformable Image Registration"
+                ),
+                "header": None,
+                "footer": None,
+            },
+        ]
+
+        cleaned = _postprocess_mistral_markdown(
+            [page["markdown"] for page in pages],
+            pages,
+        )
+
+        self.assertIn("## Abstract", cleaned)
+        self.assertIn("DMIR [1, 5, 15].", cleaned)
+        self.assertIn("networks [13,16]", cleaned)
+        self.assertNotIn("###### Abstract", cleaned)
+        self.assertNotIn("J. Shi et al.", cleaned)
+        self.assertNotIn("Full Transformer for Deformable Image Registration", cleaned)
+
+    def test_postprocess_mistral_markdown_uses_explicit_header_footer_fields(self):
+        pages = [
+            {
+                "markdown": (
+                    "Conference Header\n\n"
+                    "Real content starts here.\n\n"
+                    "12"
+                ),
+                "header": "Conference Header",
+                "footer": "12",
+            }
+        ]
+
+        cleaned = _postprocess_mistral_markdown(
+            [page["markdown"] for page in pages],
+            pages,
+        )
+
+        self.assertEqual(cleaned, "Real content starts here.")
+
+    def test_postprocess_source_markdown_cleans_citations_and_raw_wrappers(self):
+        text = (
+            '<div class="figure*">\n\n![](assets/intro.png)\n\n</div>\n\n'
+            '<span id="tab:x" label="tab:x"></span>\n\n'
+            'Citations $$@bai2023qwen; @bai2025qwen3$$ stay inline.'
+        )
+
+        cleaned = _postprocess_source_markdown(text)
+
+        self.assertNotIn('<div class="figure*">', cleaned)
+        self.assertNotIn("</div>", cleaned)
+        self.assertNotIn("<span", cleaned)
+        self.assertIn("![](assets/intro.png)", cleaned)
+        self.assertIn("Citations [@bai2023qwen; @bai2025qwen3] stay inline.", cleaned)
+
     def test_code_listing_tables_become_pre_blocks(self):
         html = """<article><table class="crayon-table"><tr><td>12</td><td class="urvanov-syntax-highlighter-code"><div class="crayon-pre"><div class="crayon-line">import numpy as np</div><div class="crayon-line">print(1)</div></div></td></tr></table></article>"""
         soup = BeautifulSoup(html, "html.parser")
@@ -358,6 +614,340 @@ class ArticleExtractorTests(unittest.TestCase):
         self.assertRegex(markdown, r"(?m)^-\s+Banana")
         self.assertRegex(markdown, r"(?m)^-\s+Cherry")
 
+    def test_extract_preferred_math_node_prefers_data_mathml_over_broken_assistive_copy(self):
+        html = """<span class="formula">
+        <span class="MathJax_SVG" data-mathml="&lt;math xmlns=&quot;http://www.w3.org/1998/Math/MathML&quot;&gt;&lt;mrow&gt;&lt;mi&gt;ρ&lt;/mi&gt;&lt;mo&gt;+&lt;/mo&gt;&lt;mi&gt;ω&lt;/mi&gt;&lt;/mrow&gt;&lt;/math&gt;"></span>
+        <span class="MJX_Assistive_MathML"><math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>Ï</mi><mo>+</mo><mi>Ï‰</mi></mrow></math></span>
+        <script type="math/mml"><math xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>Ï</mi><mo>+</mo><mi>Ï‰</mi></mrow></math></script>
+        </span>"""
+
+        soup = BeautifulSoup(html, "html.parser")
+        math_node = _extract_preferred_math_node(soup)
+
+        self.assertIsNotNone(math_node)
+        self.assertIn("ρ", str(math_node))
+        self.assertIn("ω", str(math_node))
+        self.assertNotIn("Ï", str(math_node))
+
+    def test_replace_math_with_tex_placeholders_serializes_inline_annotation_math(self):
+        html = """<article><p>That is, <math display="inline"><semantics><mrow><mi>b</mi><mo>=</mo><mi>E</mi><mi>ρ</mi><mo>.</mo></mrow><annotation encoding="application/x-tex">b = E\\rho.</annotation></semantics></math> Here.</p></article>"""
+        soup = BeautifulSoup(html, "html.parser")
+
+        replacements = _replace_problem_math_with_tex_placeholders(soup)
+        restored = _restore_tex_placeholders(str(soup), replacements, target="markdown")
+
+        self.assertIn("$b = E\\rho.$", restored)
+        self.assertIn("That is, $b = E\\rho.$ Here.", restored)
+        self.assertIn("Here.", restored)
+        self.assertNotIn("<math", restored)
+
+    def test_replace_math_with_tex_placeholders_serializes_plain_mathml(self):
+        html = """<article><p><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>E</mi><mo>=</mo><mi>W</mi><mi>D</mi><mi>F</mi><mi>C</mi><mi>M</mi><mo>,</mo></mrow></math> where M applies warping.</p></article>"""
+        soup = BeautifulSoup(html, "html.parser")
+
+        replacements = _replace_problem_math_with_tex_placeholders(soup)
+
+        self.assertTrue(replacements)
+        restored = _restore_tex_placeholders(str(soup), replacements, target="markdown")
+        self.assertIn("$", restored)
+        self.assertIn("$E = W D F C M,$ where M applies warping.", restored)
+        self.assertNotIn("<math", restored)
+
+    def test_replace_math_with_tex_placeholders_promotes_mtable_math_to_display_block(self):
+        html = """<article><p>Loss may be written as <math xmlns="http://www.w3.org/1998/Math/MathML"><mtable><mtr><mtd><mi>L</mi></mtd><mtd><mo>=</mo></mtd><mtd><mi>x</mi></mtd></mtr><mtr><mtd></mtd><mtd></mtd><mtd><mi>y</mi></mtd></mtr></mtable></math> where λ is fixed.</p></article>"""
+        soup = BeautifulSoup(html, "html.parser")
+
+        replacements = _replace_problem_math_with_tex_placeholders(soup)
+        restored = _restore_tex_placeholders(str(soup), replacements, target="markdown")
+
+        self.assertIn("Loss may be written as\n\n$$\n", restored)
+        self.assertIn("\\begin{aligned}", restored)
+        self.assertIn("\n$$\n\nwhere λ is fixed.", restored)
+
+    def test_cleanup_latex_normalizes_invalid_norm_delimiters(self):
+        source = r"\left∥E \rho - b\right∥_{2}^{2} + \left{x\right}"
+
+        cleaned = _cleanup_latex(source)
+
+        self.assertIn(r"\left\lVert E \rho - b\right\rVert _{2}^{2}", cleaned)
+        self.assertIn(r"\left\{x\right\}", cleaned)
+
+    def test_html_markdown_pipeline_restores_math_as_last_step(self):
+        markdown = (
+            "That is, SCRIBE_TEX_0001 Here, SCRIBE_TEX_0002 is arranged, "
+            "and SCRIBE_TEX_0003 where SCRIBE_TEX_0004 applies warping."
+        )
+        replacements = {
+            "SCRIBE_TEX_0001": ("b = E\\rho.", False),
+            "SCRIBE_TEX_0002": ("\\rho \\in C^{N \\times 1}", False),
+            "SCRIBE_TEX_0003": ("E = W D F C M,", False),
+            "SCRIBE_TEX_0004": ("M \\in R^{N \\times N}", False),
+        }
+
+        cleaned = _postprocess_markdown_before_math_restore(markdown)
+        cleaned = _restore_tex_placeholders(cleaned, replacements, target="markdown")
+
+        self.assertIn("That is, $b = E\\rho.$ Here, $\\rho \\in C^{N \\times 1}$", cleaned)
+        self.assertIn("and $E = W D F C M,$ where $M \\in R^{N \\times N}$ applies warping.", cleaned)
+
+    def test_table_figures_keep_raster_image_and_caption(self):
+        html = """<article>
+        <figure>
+          <img src="table-1.png" alt="table image" />
+          <figcaption>Table 1: Summary of benchmarks.</figcaption>
+        </figure>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _postprocess_markdown(_convert_html_to_markdown(str(soup)))
+
+        self.assertIn("table-1.png", markdown)
+        self.assertIn("Table 1: Summary of benchmarks.", markdown)
+
+    def test_table_figures_preserve_nested_table_data_instead_of_icon_image(self):
+        html = """<article>
+        <figure class="ltx_table">
+          <figcaption>
+            Table 1: Summary.
+            <img src="icon.png" alt="[Uncaptioned image]" />
+          </figcaption>
+          <div>
+            <table>
+              <thead><tr><th>Dataset</th><th>Year</th></tr></thead>
+              <tbody><tr><td>GRIT</td><td>2024</td></tr></tbody>
+            </table>
+          </div>
+        </figure>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _postprocess_markdown(_convert_html_to_markdown(str(soup)))
+
+        self.assertIn("Dataset", markdown)
+        self.assertIn("GRIT", markdown)
+        self.assertIn("2024", markdown)
+        self.assertNotIn("icon.png", markdown)
+        self.assertIn("Table 1: Summary.", markdown)
+
+    def test_table_cell_images_are_removed_but_text_table_remains(self):
+        html = """<article>
+        <table>
+          <thead><tr><th>Metric</th><th>Legend</th></tr></thead>
+          <tbody>
+            <tr><td>AP</td><td><img src="legend.png" alt="legend" /> 52.1</td></tr>
+          </tbody>
+        </table>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        normalized = str(soup)
+
+        self.assertNotIn("legend.png", normalized)
+        self.assertIn("Metric", normalized)
+        self.assertIn("52.1", normalized)
+
+    def test_table_cell_images_use_meaningful_alt_text_when_available(self):
+        html = """<article>
+        <table>
+          <tbody>
+            <tr><td>Status</td><td><img src="ok.png" alt="Video" /> enabled</td></tr>
+          </tbody>
+        </table>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        normalized = str(soup)
+
+        self.assertNotIn("ok.png", normalized)
+        self.assertIn("Video", normalized)
+        self.assertIn("enabled", normalized)
+
+    def test_table_cell_images_drop_generic_placeholder_alt_text(self):
+        html = """<article>
+        <table>
+          <tbody>
+            <tr><td>Status</td><td><img src="icon.png" alt="[Uncaptioned image]" /> enabled</td></tr>
+          </tbody>
+        </table>
+        </article>"""
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        normalized = str(soup)
+
+        self.assertNotIn("icon.png", normalized)
+        self.assertNotIn("[Uncaptioned image]", normalized)
+        self.assertIn("enabled", normalized)
+
+    def test_postprocess_markdown_normalizes_arxiv_bullet_artifacts(self):
+        source = (
+            "Table 1: Summary of representative datasets. "
+            "∙ \\\\bullet Modality: Image, Video. "
+            "∙ \\\\bullet Role: D: Training Dataset."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn("\\\\bullet", cleaned)
+        self.assertNotIn("∙", cleaned)
+        self.assertIn("- Modality: Image, Video.", cleaned)
+        self.assertIn("- Role: D: Training Dataset.", cleaned)
+
+    def test_postprocess_markdown_normalizes_literal_bullet_list_items(self):
+        source = "-   •\n\n    Bounding Boxes: coarse regions.\n"
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn("•", cleaned)
+        self.assertIn("- Bounding Boxes: coarse regions.", cleaned)
+
+    def test_postprocess_markdown_converts_residual_html_tables(self):
+        source = """<table style="width:100%;">
+<tbody>
+<tr class="odd">
+<td>Dataset</td>
+<td>Year</td>
+<td>Role</td>
+</tr>
+<tr class="even">
+<td>MagicBrush [226]</td>
+<td>2023</td>
+<td><p>D</p>
+<p>B</p></td>
+</tr>
+</tbody>
+</table>"""
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn("<table", cleaned)
+        self.assertIn("| Dataset | Year | Role |", cleaned)
+        self.assertIn("| MagicBrush [226] | 2023 | D B |", cleaned)
+
+    def test_postprocess_markdown_unwraps_trivial_display_matrix(self):
+        source = """$$\\begin{matrix}
+{DL = 1 - \\frac{2a}{b},}
+\\end{matrix}$$"""
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn("\\begin{matrix}", cleaned)
+        self.assertNotIn("\\end{matrix}", cleaned)
+        self.assertIn("$$\nDL = 1 - \\frac{2a}{b},\n$$", cleaned)
+
+    def test_postprocess_markdown_normalizes_tex_delimiters_in_block_math(self):
+        source = """$$\\begin{matrix}
+{E_{\\text{total}} =} & {\\underset{E(c)}{\\text{min}}{\\sum\\limits_{c = 1}^{N}\\left\\lbrack a + b \\rbrack,}}
+\\end{matrix}$$"""
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("\\left[ a + b ]", cleaned)
+        self.assertNotIn("\\left\\lbrack", cleaned)
+        self.assertNotIn("\\rbrack", cleaned)
+
+    def test_postprocess_markdown_promotes_inline_matrix_environment_to_display_block(self):
+        source = (
+            "The scaled Augmented Lagrangian may be written as "
+            "$\\begin{matrix}\n"
+            "{L(\\rho,\\omega,a)} & = & {x} \\\\\n"
+            "& & {+ y}\n"
+            "\\end{matrix}$ where $\\lambda$ is the penalty parameter."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("written as\n\n$$\n\\begin{matrix}", cleaned)
+        self.assertIn("\\end{matrix}\n$$\n\nwhere $\\lambda$", cleaned)
+
+    def test_postprocess_markdown_promotes_bare_matrix_environment_to_display_block(self):
+        source = (
+            "Step one is solved first.\n\n"
+            "\\begin{matrix}\n"
+            "{2.\\omega^{(j+1)}} & = & {x} \\\\\n"
+            "& & {+ y}\n"
+            "\\end{matrix}$$\n\n"
+            "Then the next paragraph continues."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("Step one is solved first.\n\n$$\n\\begin{matrix}", cleaned)
+        self.assertIn("\\end{matrix}\n$$\n\nThen the next paragraph continues.", cleaned)
+
+    def test_postprocess_markdown_normalizes_mixed_matrix_fences(self):
+        source = (
+            "Specifically, the loss is given as "
+            "$\\begin{matrix}\n"
+            "L_{{feat},c,d} & = & x \\\\\n"
+            "& & {+ y}\n"
+            "\\end{matrix}\n"
+            "$$\n\n"
+            "where $\\phi$ is the feature map."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("given as \n\n$$\n\\begin{matrix}", cleaned)
+        self.assertIn("\\end{matrix}\n$$\n\nwhere $\\phi$", cleaned)
+
+    def test_postprocess_markdown_canonicalizes_stray_dollar_fences_around_matrix(self):
+        source = (
+            "The corresponding scaled Augmented Lagrangian may be written as\n\n"
+            "$$\n"
+            "$$\n\n"
+            "\\begin{matrix}\n"
+            "{L(\\rho,\\omega,a)} & = & {x} \\\\\n"
+            "& & {+ y}\n"
+            "\\end{matrix}\n\n"
+            "$$ where $\\lambda$ is the penalty parameter."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn("$$\n$$", cleaned)
+        self.assertIn("written as\n\n$$\n\\begin{matrix}", cleaned)
+        self.assertIn("\\end{matrix}\n$$\n\nwhere $\\lambda$ is the penalty parameter.", cleaned)
+
+    def test_postprocess_markdown_removes_stray_inline_dollar_before_prose(self):
+        source = (
+            "3. a^{({j + 1})} = a^{(j)} + \\rho^{({j + 1})} + \\omega^{({j + 1})},$ "
+            "as depicted in Fig. 1.Step 3 can be applied directly."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertNotIn(",$ as", cleaned)
+        self.assertIn(")}, as depicted in Fig. 1.", cleaned)
+
+    def test_postprocess_markdown_keeps_valid_closing_dollar_before_prose(self):
+        source = (
+            "That is, $b = E\\rho.$ Here, $\\rho \\in C^{N \\times 1}$ is arranged as a vector, "
+            "and $E = W D F C M,$ where $M \\in R^{N \\times N}$ applies warping."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("That is, $b = E\\rho.$ Here,", cleaned)
+        self.assertIn("and $E = W D F C M,$ where $M \\in R^{N \\times N}$", cleaned)
+
+    def test_postprocess_markdown_splits_inline_math_before_here_and_where(self):
+        source = (
+            "That is, $b = E\\rho. Here, $\\rho \\in C^{N \\times 1}$ is arranged as a vector, "
+            "and $b \\in C^{K \\times 1} is a vector, where $M \\in R^{N \\times N}$ applies warping."
+        )
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("That is, $b = E\\rho.$ Here, $\\rho \\in C^{N \\times 1}$", cleaned)
+        self.assertIn("and $b \\in C^{K \\times 1}$ is a vector, where $M \\in R^{N \\times N}$", cleaned)
+
+    def test_postprocess_markdown_adds_space_after_period_before_step_prose(self):
+        source = "as depicted in Fig. 1.Step 3 can be applied directly."
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("Fig. 1. Step 3 can be applied directly.", cleaned)
+
     def test_image_cleanup_is_structural_and_captioned_figures_expand_in_pdf(self):
         html = """<article>
         <figure class="fig">
@@ -383,6 +973,101 @@ class ArticleExtractorTests(unittest.TestCase):
         self.assertNotIn("style", pdf_img.attrs)
         self.assertIsNone(pdf_soup.find("h4"))
         self.assertNotIn("View asset", pdf_soup.get_text(" ", strip=True))
+
+    def test_pmc_figure_keeps_image_heading_and_caption_without_utility_link(self):
+        html = """<article>
+        <figure class="fig xbox font-sm" id="pone.0275033.g003">
+          <h4 class="obj_head">Fig 3. Overview of the UNETR used.</h4>
+          <p class="img-box line-height-none margin-x-neg-2 tablet:margin-x-0 text-center">
+            <a class="tileshop" target="_blank" href="https://example.com/zoom">
+              <img class="graphic zoom-in" src="https://example.com/pone.0275033.g003.jpg" alt="Fig 3" />
+            </a>
+          </p>
+          <div class="p text-right font-secondary">
+            <a href="figure/pone.0275033.g003/" class="usa-link" target="_blank" rel="noopener noreferrer">Open in a new tab</a>
+          </div>
+          <figcaption><p>A 128x128x128x1 cropped volume of the input CBCT is divided into patches.</p></figcaption>
+        </figure>
+        </article>"""
+
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _postprocess_markdown(_convert_html_to_markdown(str(soup)))
+
+        self.assertIn("pone.0275033.g003.jpg", markdown)
+        self.assertIn("Fig 3. Overview of the UNETR used.", markdown)
+        self.assertIn("A 128x128x128x1 cropped volume of the input CBCT is divided into patches.", markdown)
+        self.assertNotIn("Open in a new tab", markdown)
+
+    def test_sciencedirect_figure_drops_download_links_and_flattens_to_markdown(self):
+        html = """<article>
+        <figure>
+          <img src="assets/fig7.jpg" alt="Fig. 7" />
+          <ol>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg" title="Download high-res image (385KB)">Download: Download high-res image (385KB)</a></li>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7.jpg" title="Download full-size image">Download: Download full-size image</a></li>
+          </ol>
+          <p>Fig. 7. Normalized joint histogram of prediction uncertainty and error rate for 3D brain tumor segmentation.</p>
+        </figure>
+        </article>"""
+
+        soup = BeautifulSoup(html, "html.parser")
+        _prepare_html_for_markdown(soup)
+        markdown = _postprocess_markdown(_convert_html_to_markdown(str(soup)))
+
+        self.assertIn("assets/fig7.jpg", markdown)
+        self.assertIn("Fig. 7. Normalized joint histogram of prediction uncertainty and error rate for 3D brain tumor segmentation.", markdown)
+        self.assertNotIn("Download high-res image", markdown)
+        self.assertNotIn("Download full-size image", markdown)
+        self.assertNotIn("<figure>", markdown)
+        self.assertNotIn("<ol>", markdown)
+
+    def test_postprocess_markdown_converts_residual_captionless_figure_html(self):
+        source = """## Graphical abstract
+
+<figure>
+<img src="assets/ga1.jpg" alt="ga1" />
+<ol>
+<li><a href="https://ars.els-cdn.com/content/image/ga1_lrg.jpg" title="Download high-res image (321KB)">Download: Download high-res image (321KB)</a></li>
+<li><a href="https://ars.els-cdn.com/content/image/ga1.jpg" title="Download full-size image">Download: Download full-size image</a></li>
+</ol>
+</figure>"""
+
+        cleaned = _postprocess_markdown(source)
+
+        self.assertIn("![ga1](assets/ga1.jpg)", cleaned)
+        self.assertNotIn("<figure>", cleaned)
+        self.assertNotIn("<ol>", cleaned)
+        self.assertNotIn("Download high-res image", cleaned)
+
+    def test_preferred_figure_image_url_prefers_high_res_download(self):
+        html = """<figure>
+          <img src="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7.jpg" alt="Fig. 7" />
+          <ol>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg" title="Download high-res image (385KB)">Download: Download high-res image (385KB)</a></li>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7.jpg" title="Download full-size image">Download: Download full-size image</a></li>
+          </ol>
+        </figure>"""
+
+        soup = BeautifulSoup(html, "html.parser")
+        preferred = _preferred_figure_image_url(soup.find("figure"), "https://www.sciencedirect.com/science/article/pii/S0925231219301961")
+
+        self.assertEqual(preferred, "https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg")
+
+    def test_collect_images_uses_downloadable_figure_asset_instead_of_preview(self):
+        html = """<article>
+        <figure>
+          <img src="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7.jpg" alt="Fig. 7" />
+          <ol>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg" title="Download high-res image (385KB)">Download: Download high-res image (385KB)</a></li>
+            <li><a href="https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7.jpg" title="Download full-size image">Download: Download full-size image</a></li>
+          </ol>
+        </figure>
+        </article>"""
+
+        images = _collect_images(html, "https://www.sciencedirect.com/science/article/pii/S0925231219301961")
+
+        self.assertIn("https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg", images)
 
     def test_download_image_uses_actual_image_bytes_not_misleading_headers(self):
         png_rgba = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -508,8 +1193,12 @@ class ArticleExtractorTests(unittest.TestCase):
             md_path = Path(result["md-path"])
             pdf_path = Path(result["file-path"])
             bib_path = Path(result["bib-path"])
+            raw_html_path = Path(result["raw-html-path"])
+            normalized_html_path = Path(result["normalized-html-path"])
             md_text = md_path.read_text(encoding="utf-8")
             bib_text = bib_path.read_text(encoding="utf-8")
+            raw_html_text = raw_html_path.read_text(encoding="utf-8")
+            normalized_html_text = normalized_html_path.read_text(encoding="utf-8")
 
             self.assertIn('doc_id: "', md_text)
             self.assertIn('doc_type: "article"', md_text)
@@ -543,8 +1232,13 @@ class ArticleExtractorTests(unittest.TestCase):
             self.assertNotIn("fig1_frontier.pdf", md_text)
             self.assertIn("$$A=1$$", md_text)
             self.assertTrue(bib_path.exists())
+            self.assertTrue(raw_html_path.exists())
+            self.assertTrue(normalized_html_path.exists())
             self.assertIn("@online{", bib_text)
             self.assertIn("title = {Extractor Fixture}", bib_text)
+            self.assertIn("<article>", raw_html_text)
+            self.assertIn("Extractor Fixture", normalized_html_text)
+            self.assertNotIn("data-rel-src", normalized_html_text)
 
             pdf_text = subprocess.run(
                 ["pdftotext", str(pdf_path), "-"],

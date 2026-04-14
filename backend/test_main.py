@@ -12,10 +12,10 @@ class MainApiTests(unittest.TestCase):
     def setUp(self):
         self.client = main.app.test_client()
 
-    @patch("main.extract_article")
-    def test_save_local_uses_label_subdirectory(self, extract_article_mock):
+    @patch("main.extract_url")
+    def test_save_local_uses_label_subdirectory(self, extract_url_mock):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
-            extract_article_mock.return_value = {
+            extract_url_mock.return_value = {
                 "title": "Fixture",
                 "dir": f"{tmpdir}/Deep Learning/Fixture",
                 "file-path": f"{tmpdir}/Deep Learning/Fixture/Fixture.pdf",
@@ -65,13 +65,13 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["notes"], f"{tmpdir}/Deep Learning/Fixture/Fixture.notes.md")
         self.assertEqual(payload["notesDocId"], "abc123:notes")
         self.assertEqual(payload["metadata"]["source_site"], "example.com")
-        self.assertEqual(extract_article_mock.call_args.kwargs["output_dir"], f"{tmpdir}/Deep Learning")
-        self.assertEqual(extract_article_mock.call_args.kwargs["label"], "Deep Learning")
-        self.assertFalse(extract_article_mock.call_args.kwargs["pdf_required"])
-        self.assertFalse(extract_article_mock.call_args.kwargs["render_pdf"])
-        self.assertFalse(extract_article_mock.call_args.kwargs["generate_notes"])
+        self.assertEqual(extract_url_mock.call_args.kwargs["output_dir"], f"{tmpdir}/Deep Learning")
+        self.assertEqual(extract_url_mock.call_args.kwargs["label"], "Deep Learning")
+        self.assertFalse(extract_url_mock.call_args.kwargs["pdf_required"])
+        self.assertFalse(extract_url_mock.call_args.kwargs["render_pdf"])
+        self.assertFalse(extract_url_mock.call_args.kwargs["generate_notes"])
         self.assertEqual(
-            extract_article_mock.call_args.kwargs["notes_config"]["provider"],
+            extract_url_mock.call_args.kwargs["notes_config"]["provider"],
             "openai",
         )
         spawn_mock.assert_called_once()
@@ -747,6 +747,31 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(payload["directoryPath"], str(article_dir))
         self.assertEqual(payload["hostDirectoryPath"], r"D:\scribe\coding\Foo")
 
+    def test_desktop_reveal_skips_launch_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main, "OUTPUT_DIR", tmpdir
+        ), patch.object(main, "HOST_OUTPUT_DIR_NATIVE", r"D:\scribe"):
+            article_dir = Path(tmpdir) / "coding" / "Foo"
+            article_dir.mkdir(parents=True)
+            article_path = article_dir / "Foo.md"
+            article_path.write_text("---\ntitle: \"x\"\n---\n\nbody\n", encoding="utf-8")
+
+            with patch.object(
+                main, "_try_open_with_host_tool", return_value=True
+            ) as mock_open:
+                response = self.client.post(
+                    "/desktop/reveal",
+                    json={"path": str(article_path), "launch": False},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertFalse(payload["launched"])
+        mock_open.assert_not_called()
+        self.assertEqual(payload["directoryPath"], str(article_dir))
+        self.assertEqual(payload["hostDirectoryPath"], r"D:\scribe\coding\Foo")
+
     def test_strip_noise_from_markdown_removes_text_noise(self):
         body = "Intro sentence. Boilerplate garbage. Real content.\n"
         highlights = [
@@ -1136,6 +1161,69 @@ class MainApiTests(unittest.TestCase):
                 ["CSD for Beginners", "Unrelated Work"],
             )
 
+    def test_desktop_search_prefers_title_hits_over_body_hits(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "docs").mkdir()
+            (root / "docs" / "Title.md").write_text(
+                "---\n"
+                'title: "GPU Acceleration for MRI"\n'
+                'label: "docs"\n'
+                "---\n\nGeneric body text.\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "Body.md").write_text(
+                "---\n"
+                'title: "Completely Different Title"\n'
+                'label: "docs"\n'
+                "---\n\nThis article mentions GPU acceleration only in the body.\n",
+                encoding="utf-8",
+            )
+
+            response = self.client.post(
+                "/desktop/search",
+                json={"root": str(root), "query": "gpu acceleration"},
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            titles = [doc["title"] for doc in response.get_json()["documents"]]
+            self.assertEqual(
+                titles[:2],
+                ["GPU Acceleration for MRI", "Completely Different Title"],
+            )
+
+    def test_desktop_search_reports_total_and_truncation(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "bulk").mkdir()
+            for index in range(205):
+                (root / "bulk" / f"Doc-{index:03d}.md").write_text(
+                    "---\n"
+                    f'title: "Bulk Document {index:03d}"\n'
+                    'label: "bulk"\n'
+                    "---\n\ncommon-term appears here.\n",
+                    encoding="utf-8",
+                )
+
+            response = self.client.post(
+                "/desktop/search",
+                json={"root": str(root), "query": "common-term"},
+            )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            payload = response.get_json()
+            self.assertEqual(payload["total"], 205)
+            self.assertTrue(payload["truncated"])
+            self.assertEqual(len(payload["documents"]), 200)
+
+    def test_desktop_search_unknown_field_returns_400(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            (Path(tmpdir) / "label").mkdir()
+            response = self.client.post(
+                "/desktop/search",
+                json={"root": tmpdir, "query": "foo[MadeUpField]"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["success"])
+
     def test_desktop_browse_directory_lists_subdirectories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1286,6 +1374,40 @@ class MainApiTests(unittest.TestCase):
             self.assertIn("Random PMID Paper", titles)
             self.assertNotIn("Completely Unrelated Topic", titles)
 
+    def test_desktop_related_suggest_uses_indexed_documents(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DESKTOP_API_ROOT", tmpdir):
+            root = Path(tmpdir)
+            (root / "neuro").mkdir()
+
+            source = root / "neuro" / "Source.md"
+            source.write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution Review"\n'
+                'label: "neuro"\n'
+                "---\n\nReferences DOI 10.1016/j.neuroimage.2007.02.016.\n",
+                encoding="utf-8",
+            )
+
+            cited = root / "neuro" / "Target.md"
+            cited.write_text(
+                "---\n"
+                'title: "Constrained Spherical Deconvolution"\n'
+                'label: "neuro"\n'
+                'doi: "10.1016/j.neuroimage.2007.02.016"\n'
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(main, "_scan_library_documents", side_effect=AssertionError("scan path should not be used")):
+                response = self.client.get(
+                    "/desktop/related/suggest",
+                    query_string={"articlePath": str(source), "root": str(root)},
+                )
+            self.assertEqual(response.status_code, 200, response.get_json())
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertEqual([doc["title"] for doc in payload["suggestions"]], ["Constrained Spherical Deconvolution"])
+
     def test_desktop_related_rejects_self_link(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             article = Path(tmpdir) / "A.md"
@@ -1319,7 +1441,7 @@ class MainApiTests(unittest.TestCase):
             )
             reading_pdf = article.with_name(article.stem + ".reading.pdf")
 
-            def fake_regen(article_path, page_size="a5", highlights=None):
+            def fake_regen(article_path, page_size="a5", highlights=None, strip_references=False):
                 reading_pdf.write_bytes(b"%PDF-1.4\nfake\n")
                 return reading_pdf
 
@@ -1335,6 +1457,7 @@ class MainApiTests(unittest.TestCase):
                 self.assertEqual(payload["readingPdfPath"], str(reading_pdf))
                 self.assertEqual(regen_mock.call_count, 1)
                 self.assertEqual(regen_mock.call_args.kwargs["page_size"], "a4")
+                self.assertFalse(regen_mock.call_args.kwargs["strip_references"])
 
                 # Ensure reading PDF is newer than the markdown so cache hits.
                 import os
@@ -1343,13 +1466,81 @@ class MainApiTests(unittest.TestCase):
 
                 response2 = self.client.post(
                     "/desktop/reading_pdf",
-                    json={"articlePath": str(article)},
+                    json={"articlePath": str(article), "pageSize": "a4"},
                 )
                 self.assertEqual(response2.status_code, 200)
                 payload2 = response2.get_json()
                 self.assertTrue(payload2["success"])
                 self.assertTrue(payload2["cached"])
                 self.assertEqual(regen_mock.call_count, 1)
+
+    def test_desktop_reading_pdf_invalidates_on_strip_references_toggle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article = Path(tmpdir) / "Article.md"
+            article.write_text(
+                "---\ntitle: \"Article\"\n---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            reading_pdf = article.with_name(article.stem + ".reading.pdf")
+
+            def fake_regen(article_path, page_size="a5", highlights=None, strip_references=False):
+                reading_pdf.write_bytes(b"%PDF-1.4\nfake\n")
+                return reading_pdf
+
+            with patch.object(main, "regenerate_reading_pdf", side_effect=fake_regen) as regen_mock:
+                # First call: stripReferences=false
+                self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article), "pageSize": "a5"},
+                )
+                import os
+                future = reading_pdf.stat().st_mtime + 60
+                os.utime(reading_pdf, (future, future))
+
+                # Toggling stripReferences=true should bust the cache.
+                response = self.client.post(
+                    "/desktop/reading_pdf",
+                    json={
+                        "articlePath": str(article),
+                        "pageSize": "a5",
+                        "stripReferences": True,
+                    },
+                )
+                payload = response.get_json()
+                self.assertFalse(payload["cached"])
+                self.assertEqual(regen_mock.call_count, 2)
+                self.assertTrue(regen_mock.call_args.kwargs["strip_references"])
+
+    def test_desktop_reading_pdf_invalidates_on_page_size_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article = Path(tmpdir) / "Article.md"
+            article.write_text(
+                "---\ntitle: \"Article\"\n---\n\nBody text.\n",
+                encoding="utf-8",
+            )
+            reading_pdf = article.with_name(article.stem + ".reading.pdf")
+
+            def fake_regen(article_path, page_size="a5", highlights=None, strip_references=False):
+                reading_pdf.write_bytes(b"%PDF-1.4\nfake\n")
+                return reading_pdf
+
+            with patch.object(main, "regenerate_reading_pdf", side_effect=fake_regen) as regen_mock:
+                self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article), "pageSize": "a5"},
+                )
+                import os
+                future = reading_pdf.stat().st_mtime + 60
+                os.utime(reading_pdf, (future, future))
+
+                response = self.client.post(
+                    "/desktop/reading_pdf",
+                    json={"articlePath": str(article), "pageSize": "a4"},
+                )
+                payload = response.get_json()
+                self.assertFalse(payload["cached"])
+                self.assertEqual(regen_mock.call_count, 2)
+                self.assertEqual(regen_mock.call_args.kwargs["page_size"], "a4")
 
     def test_desktop_reading_pdf_invalidates_on_highlight_change(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1428,6 +1619,13 @@ class MainApiTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            search_before = self.client.post(
+                "/desktop/search",
+                json={"root": tmpdir, "query": "fixture"},
+            )
+            self.assertEqual(search_before.status_code, 200, search_before.get_json())
+            self.assertEqual(len(search_before.get_json()["documents"]), 1)
+
             response = self.client.post(
                 "/desktop/document/delete",
                 json={"articlePath": str(article_path)},
@@ -1436,11 +1634,19 @@ class MainApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
             self.assertTrue(payload["success"])
+            self.assertEqual(payload["removedSearchRecords"], 1)
             self.assertFalse(article_path.exists())
             self.assertFalse(bundle_dir.exists())
             surviving = index_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(surviving), 1)
             self.assertIn("Other/Other.md", surviving[0])
+
+            search_after = self.client.post(
+                "/desktop/search",
+                json={"root": tmpdir, "query": "fixture"},
+            )
+            self.assertEqual(search_after.status_code, 200, search_after.get_json())
+            self.assertEqual(search_after.get_json()["documents"], [])
 
     def test_desktop_delete_document_returns_404_for_missing_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

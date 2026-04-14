@@ -20,6 +20,7 @@ type DocumentSummary = {
   label: string | null
   articlePath: string
   notesPath: string | null
+  notesPending?: boolean
   bibPath: string | null
   highlightsPath: string | null
   highlightCount: number
@@ -64,7 +65,12 @@ type SearchRequest = {
   root: string | null
   query: string
   label: string | null
-  activeArticlePath: string | null
+}
+
+type SearchResponse = {
+  documents: DocumentSummary[]
+  total: number
+  truncated: boolean
 }
 
 type Highlight = {
@@ -158,7 +164,12 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       if (!response.ok || !data.success) {
         throw new Error(data.message ?? 'Failed to search library')
       }
-      return (data.documents ?? []) as T
+      const documents = Array.isArray(data.documents) ? data.documents : []
+      const total =
+        typeof data.total === 'number' && Number.isFinite(data.total)
+          ? data.total
+          : documents.length
+      return ({ documents, total, truncated: Boolean(data.truncated) } satisfies SearchResponse) as T
     }
     case 'load_document': {
       const params = new URLSearchParams()
@@ -306,6 +317,7 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
         body: JSON.stringify({
           articlePath: payload.articlePath,
           pageSize: payload.pageSize,
+          stripReferences: Boolean(payload.stripReferences),
         }),
       })
       const data = await response.json()
@@ -318,10 +330,12 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       } as T
     }
     case 'reveal_location': {
+      const body: Record<string, unknown> = { path: payload.path }
+      if (payload.launch === false) body.launch = false
       const response = await fetch(`${browserApiBase}/desktop/reveal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: payload.path }),
+        body: JSON.stringify(body),
       })
       const data = await response.json()
       if (!response.ok || !data.success) {
@@ -420,7 +434,13 @@ function normalizeReaderMarkdown(value: string) {
   return value
     .replace(/[\u2000-\u200a\u202f\u205f\u3000]/g, ' ')
     .replace(/[\u200b-\u200d\ufeff]/g, '')
-    .replace(/\\\[((?:.|\n)*?)\\\]/g, (_, math: string) => `$$${math.trim()}$$`)
+    .replace(/\\\[((?:.|\n)*?)\\\]/g, (_, content: string) => {
+      const trimmed = content.trim()
+      if (/^\[[^\]]+\]\([^)]+\)$/.test(trimmed)) {
+        return trimmed
+      }
+      return `$$${trimmed}$$`
+    })
     .replace(/\\\((.+?)\\\)/g, (_, math: string) => `$${math.trim()}$`)
 }
 
@@ -1477,6 +1497,7 @@ function App() {
   })
   const [search, setSearch] = useState('')
   const [searchResults, setSearchResults] = useState<DocumentSummary[] | null>(null)
+  const [searchTotal, setSearchTotal] = useState<number | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [detail, setDetail] = useState<DocumentDetail | null>(null)
   const [notesDraft, setNotesDraft] = useState('')
@@ -1501,6 +1522,7 @@ function App() {
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [savingNotes, setSavingNotes] = useState(false)
   const [generatingNotes, setGeneratingNotes] = useState(false)
+  const [notesPending, setNotesPending] = useState(false)
   const [savingHighlights, setSavingHighlights] = useState(false)
   const [status, setStatus] = useState('Loading library…')
   const [leftPaneWidth, setLeftPaneWidth] = useState<number>(() => {
@@ -1525,6 +1547,10 @@ function App() {
     imageIndex: number | null
   } | null>(null)
   const [infoOpen, setInfoOpen] = useState(false)
+  const [infoLocation, setInfoLocation] = useState<{
+    directoryPath: string
+    hostDirectoryPath: string | null
+  } | null>(null)
   const [rootPickerOpen, setRootPickerOpen] = useState(false)
   const [rootPickerPath, setRootPickerPath] = useState('')
   const [rootPickerParent, setRootPickerParent] = useState<string | null>(null)
@@ -1597,7 +1623,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [pendingHashPath, setPendingHashPath] = useState<string | null>(null)
   const [scrollHeadingRequest, setScrollHeadingRequest] = useState<{ index: number; ts: number } | null>(null)
-  const deferredSearch = useDeferredValue(search.trim().toLowerCase())
+  const deferredSearch = useDeferredValue(search.trim())
   const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
   const readerScrollRef = useRef<HTMLDivElement | null>(null)
   const notesScrollRef = useRef<HTMLDivElement | null>(null)
@@ -1857,6 +1883,32 @@ function App() {
   }, [infoOpen])
 
   useEffect(() => {
+    if (!infoOpen || !detail) {
+      setInfoLocation(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const response = await desktopCommand<{
+          directoryPath: string
+          hostDirectoryPath: string | null
+        }>('reveal_location', { path: detail.summary.articlePath, launch: false })
+        if (cancelled) return
+        setInfoLocation({
+          directoryPath: response.directoryPath,
+          hostDirectoryPath: response.hostDirectoryPath,
+        })
+      } catch {
+        if (!cancelled) setInfoLocation(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [infoOpen, detail])
+
+  useEffect(() => {
     if (!focusMode) return
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
@@ -2007,7 +2059,7 @@ function App() {
 
   useEffect(() => {
     void runSearch()
-  }, [deferredSearch, selectedLabel, library.root, detail?.summary.articlePath])
+  }, [deferredSearch, selectedLabel, library.root])
 
   async function initializeLibrary() {
     try {
@@ -2110,8 +2162,11 @@ function App() {
       const loaded = await desktopCommand<DocumentDetail>('load_document', {
         articlePath,
       })
+      activeDocIdRef.current = loaded.summary.id
+      setActiveId(loaded.summary.id)
       setDetail(loaded)
       setNotesDraft(loaded.notesMarkdown)
+      setNotesPending(Boolean(loaded.summary.notesPending))
       setHighlights(loaded.highlights)
       setRelatedLinks(loaded.related ?? [])
       setRelatedSuggestions([])
@@ -2137,6 +2192,7 @@ function App() {
 
     if (!deferredSearch) {
       setSearchResults(null)
+      setSearchTotal(null)
       return
     }
 
@@ -2146,24 +2202,31 @@ function App() {
         root: library.root || null,
         query: deferredSearch,
         label: selectedLabel === 'all' ? null : selectedLabel,
-        activeArticlePath: detail?.summary.articlePath ?? null,
       }
-      const results = await desktopCommand<DocumentSummary[]>('search_documents', { request })
-      setSearchResults(results)
-      setStatus(`Found ${results.length} matches for “${search.trim()}”`)
+      const response = await desktopCommand<SearchResponse>('search_documents', { request })
+      setSearchResults(response.documents)
+      setSearchTotal(response.total)
+      if (response.truncated) {
+        setStatus(`Showing ${response.documents.length} of ${response.total} matches for “${search.trim()}”`)
+      } else {
+        setStatus(`Found ${response.total} matches for “${search.trim()}”`)
+      }
     } catch (error) {
       setSearchResults([])
+      setSearchTotal(0)
       setStatus(stringifyError(error))
     } finally {
       setSearching(false)
     }
   }
 
-  function applyNotesPathLocally(documentId: string, notesPath: string | null) {
+  function applyDocumentSummaryPatch(documentId: string, patch: Partial<DocumentSummary>) {
     const update = (doc: DocumentSummary) =>
-      doc.id === documentId ? { ...doc, notesPath } : doc
+      doc.id === documentId ? { ...doc, ...patch } : doc
     setDetail((current) =>
-      current ? { ...current, summary: { ...current.summary, notesPath } } : current,
+      current && current.summary.id === documentId
+        ? { ...current, summary: { ...current.summary, ...patch } }
+        : current,
     )
     setLibrary((current) => ({ ...current, documents: current.documents.map(update) }))
     setSearchResults((current) => (current ? current.map(update) : current))
@@ -2180,7 +2243,8 @@ function App() {
         articlePath: detail.summary.articlePath,
         notesMarkdown: notesDraft,
       })
-      applyNotesPathLocally(detail.summary.id, notesPath)
+      setNotesPending(false)
+      applyDocumentSummaryPatch(detail.summary.id, { notesPath, notesPending: false })
       setStatus(`Saved notes to ${notesPath}`)
     } catch (error) {
       setStatus(stringifyError(error))
@@ -2201,7 +2265,8 @@ function App() {
       })
       setNotesDraft(response.notesMarkdown)
       setNotesMode('preview')
-      applyNotesPathLocally(detail.summary.id, response.notesPath)
+      setNotesPending(false)
+      applyDocumentSummaryPatch(detail.summary.id, { notesPath: response.notesPath, notesPending: false })
       setStatus(`Generated notes at ${response.notesPath}`)
     } catch (error) {
       setStatus(stringifyError(error))
@@ -2209,6 +2274,50 @@ function App() {
       setGeneratingNotes(false)
     }
   }
+
+  useEffect(() => {
+    if (!detail || !notesPending) {
+      return
+    }
+
+    let cancelled = false
+    const articlePath = detail.summary.articlePath
+    const documentId = detail.summary.id
+
+    const poll = async () => {
+      try {
+        const loaded = await desktopCommand<DocumentDetail>('load_document', { articlePath })
+        if (cancelled || activeDocIdRef.current !== documentId) {
+          return
+        }
+        const pending = Boolean(loaded.summary.notesPending)
+        setNotesPending(pending)
+        applyDocumentSummaryPatch(documentId, {
+          notesPath: loaded.summary.notesPath,
+          notesPending: pending,
+        })
+        if (!pending && loaded.summary.notesPath) {
+          setNotesDraft((current) => (current.trim() ? current : loaded.notesMarkdown))
+          setStatus(`Working notes ready: ${loaded.summary.title}`)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setNotesPending(false)
+          setStatus(stringifyError(error))
+        }
+      }
+    }
+
+    void poll()
+    const intervalId = window.setInterval(() => {
+      void poll()
+    }, 2500)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
+  }, [detail, notesPending])
 
   async function persistHighlights(nextHighlights: Highlight[], successMessage: string) {
     if (!detail) {
@@ -2344,6 +2453,7 @@ function App() {
         {
           articlePath: detail.summary.articlePath,
           pageSize: readingPdfPageSize,
+          stripReferences: referencesAreNoise,
         },
       )
       setDetail((current) =>
@@ -3366,8 +3476,29 @@ function App() {
                 )
                 const frontmatterKeys = new Set(entries.map(([k]) => k))
                 const citationOnly = citationEntries.filter(([k]) => !frontmatterKeys.has(k))
+                const locationDisplay =
+                  infoLocation?.hostDirectoryPath || infoLocation?.directoryPath || ''
                 return (
                   <>
+                    <dl className="info-grid">
+                      <div className="info-row" key="__physical_location">
+                        <dt>Physical location</dt>
+                        <dd>
+                          {locationDisplay ? (
+                            <button
+                              type="button"
+                              className="info-link info-link-button"
+                              onClick={() => void handleRevealLocation()}
+                              title="Open in file manager (or copy path if unavailable)"
+                            >
+                              {locationDisplay}
+                            </button>
+                          ) : (
+                            <span className="muted">Loading…</span>
+                          )}
+                        </dd>
+                      </div>
+                    </dl>
                     {entries.length ? (
                       <dl className="info-grid">
                         {entries.map(([key, value]) => (
@@ -3543,18 +3674,29 @@ function App() {
 
           <div className="panel">
             <label className="field-label" htmlFor="search">Search</label>
-            <input
-              id="search"
-              className="text-input"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="term or (Tournier[Author] AND CSD[Title])"
-              title={
-                'Pubmed-style queries supported.\n' +
-                'Fields: [Author] [Title] [DOI] [Year] [Body] [Journal] [Publisher] [PMID] [PMCID] [Arxiv] [URL] [Label] [All]\n' +
-                'Operators: AND, OR, NOT, parentheses. Default field is All.'
-              }
-            />
+            <div className="search-input-row">
+              <input
+                id="search"
+                className="text-input search-input"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="term or (Tournier[Author] AND CSD[Title])"
+                title={
+                  'Pubmed-style queries supported.\n' +
+                  'Fields: [Author] [Title] [DOI] [Year] [Body] [Journal] [Publisher] [PMID] [PMCID] [Arxiv] [URL] [Label] [All]\n' +
+                  'Operators: AND, OR, NOT, parentheses. Default field is All.'
+                }
+              />
+              <button
+                className="ghost-button search-clear-button"
+                type="button"
+                onClick={() => setSearch('')}
+                disabled={!search}
+                title="Clear search"
+              >
+                Clear
+              </button>
+            </div>
 
             <label className="field-label" htmlFor="label-filter">Label</label>
             <select
@@ -3573,7 +3715,11 @@ function App() {
 
             {deferredSearch ? (
               <p className="search-hint">
-                {searching ? 'Searching local index…' : 'Using local full-text index.'}
+                {searching
+                  ? 'Searching local indexed corpus…'
+                  : searchTotal !== null
+                    ? `Using local indexed search. ${searchTotal} match${searchTotal === 1 ? '' : 'es'} found.`
+                    : 'Using local indexed search.'}
               </p>
             ) : (
               <p className="search-hint">Browsing current library snapshot.</p>
@@ -3719,17 +3865,6 @@ function App() {
                   aria-label="Show document metadata"
                 >
                   Info
-                </button>
-              ) : null}
-              {detail ? (
-                <button
-                  type="button"
-                  className="ghost-button reader-toolbar-button"
-                  onClick={() => void handleRevealLocation()}
-                  title="Reveal article bundle directory"
-                  aria-label="Open bundle location"
-                >
-                  Location
                 </button>
               ) : null}
               {detail?.bibliography ? (
@@ -4007,8 +4142,13 @@ function App() {
             <h2>Working notes</h2>
           </div>
           <div className="inline-row notes-actions">
-            <button className="ghost-button" onClick={() => void generateNotes()} disabled={!detail || generatingNotes}>
-              {generatingNotes ? 'Generating…' : 'Generate notes'}
+            {notesPending ? <span className="notes-status-pill" aria-live="polite">LLM working…</span> : null}
+            <button
+              className={`ghost-button ${generatingNotes || notesPending ? 'is-busy' : ''}`}
+              onClick={() => void generateNotes()}
+              disabled={!detail || generatingNotes || notesPending}
+            >
+              {generatingNotes ? 'Generating…' : notesPending ? 'LLM working…' : 'Generate notes'}
             </button>
             <button className="primary-button" onClick={() => void saveNotes()} disabled={!detail || savingNotes}>
               {savingNotes ? 'Saving…' : 'Save notes'}
