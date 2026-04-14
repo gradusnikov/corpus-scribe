@@ -1660,6 +1660,9 @@ function App() {
   const activeDocIdRef = useRef<string | null>(null)
   const settingsMenuRef = useRef<HTMLDivElement | null>(null)
   const hashRefreshAttemptedRef = useRef<string | null>(null)
+  const focusedArticlePathRef = useRef<string | null>(null)
+  const notesDirtyRef = useRef(false)
+  const sourceDirtyRef = useRef(false)
 
   useEffect(() => {
     void initializeLibrary()
@@ -1870,6 +1873,73 @@ function App() {
       return [activeId, ...filtered]
     })
   }, [activeId])
+
+  useEffect(() => {
+    focusedArticlePathRef.current = detail?.summary.articlePath ?? null
+  }, [detail?.summary.articlePath])
+
+  useEffect(() => {
+    notesDirtyRef.current = notesDraft.trimEnd() !== notesSavedSnapshot.trimEnd()
+  }, [notesDraft, notesSavedSnapshot])
+
+  useEffect(() => {
+    sourceDirtyRef.current = sourceDraft.trimEnd() !== sourceSavedSnapshot.trimEnd()
+  }, [sourceDraft, sourceSavedSnapshot])
+
+  // Silent refresh on backend-push events. A write from the MCP/CLI/another
+  // client triggers /desktop/events; if the event targets the focused doc, we
+  // refetch it. Dirty notes/source drafts are preserved so the user's
+  // in-flight edits are never clobbered.
+  useEffect(() => {
+    const source = new EventSource(`${browserApiBase}/desktop/events`)
+    const refetchTypes = new Set([
+      'notes_updated',
+      'highlights_updated',
+      'rating_updated',
+      'document_updated',
+      'related_updated',
+    ])
+    source.onmessage = (raw) => {
+      let event: { type?: string; articlePath?: string } | null = null
+      try {
+        event = JSON.parse(raw.data)
+      } catch {
+        return
+      }
+      if (!event || typeof event.type !== 'string') return
+      if (!refetchTypes.has(event.type)) return
+      const targetPath = event.articlePath
+      const currentPath = focusedArticlePathRef.current
+      if (!targetPath || !currentPath || targetPath !== currentPath) return
+      void (async () => {
+        try {
+          const loaded = await desktopCommand<DocumentDetail>('load_document', {
+            articlePath: targetPath,
+          })
+          if (focusedArticlePathRef.current !== targetPath) return
+          setDetail(loaded)
+          setHighlights(loaded.highlights)
+          setRelatedLinks(loaded.related ?? [])
+          if (!sourceDirtyRef.current) {
+            setSourceDraft(loaded.markdown)
+          }
+          setSourceSavedSnapshot(loaded.markdown)
+          if (!notesDirtyRef.current) {
+            setNotesDraft(loaded.notesMarkdown)
+          }
+          setNotesSavedSnapshot(loaded.notesMarkdown)
+        } catch {
+          // Silent — the user will see the stale state until next manual action.
+        }
+      })()
+    }
+    source.onerror = () => {
+      // EventSource auto-reconnects; nothing to do here.
+    }
+    return () => {
+      source.close()
+    }
+  }, [])
 
   useEffect(() => {
     const validIds = new Set(library.documents.map((doc) => doc.id))

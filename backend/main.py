@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import queue as _queue
 import re
 import shutil
 import sqlite3
@@ -14,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 from flask_cors import CORS
 from pathvalidate import sanitize_filename
 import pypandoc
@@ -51,6 +52,51 @@ def _pdf_ocr_available() -> bool:
 
 def _check_api_key(data: dict) -> bool:
     return data.get("apiKey") == API_KEY
+
+
+class _EventHub:
+    # Thread-safe fan-out for desktop SSE subscribers. Each subscriber gets
+    # its own bounded queue; slow consumers get dropped events rather than
+    # blocking writer threads.
+    def __init__(self) -> None:
+        self._subscribers: list[_queue.Queue] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> _queue.Queue:
+        q: _queue.Queue = _queue.Queue(maxsize=100)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: _queue.Queue) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def publish(self, event: dict) -> None:
+        with self._lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            try:
+                q.put_nowait(event)
+            except _queue.Full:
+                pass
+
+
+_event_hub = _EventHub()
+
+
+def _publish_desktop_event(event_type: str, article_path=None, **extra) -> None:
+    payload: dict = {
+        "type": event_type,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    if article_path is not None:
+        payload["articlePath"] = str(article_path)
+    payload.update(extra)
+    _event_hub.publish(payload)
 
 
 def _clean_label(label: str) -> str:
@@ -2251,6 +2297,7 @@ def desktop_save_notes():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _publish_desktop_event("notes_updated", article_path, notesPath=str(notes_path))
     return jsonify(success=True, notesPath=str(notes_path), notesMarkdown=notes_markdown, notesPending=False)
 
 
@@ -2270,6 +2317,7 @@ def desktop_save_document():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _publish_desktop_event("document_updated", article_path)
     return jsonify(success=True, articlePath=str(article_path), markdown=markdown)
 
 
@@ -2396,6 +2444,11 @@ def desktop_save_highlights():
         cleaned.append(cleaned_item)
 
     highlights_path = _write_highlights(article_path, cleaned)
+    _publish_desktop_event(
+        "highlights_updated",
+        article_path,
+        highlightCount=len(cleaned),
+    )
     return jsonify(success=True, highlightsPath=str(highlights_path), highlights=cleaned)
 
 
@@ -2649,6 +2702,7 @@ def desktop_save_related():
         cleaned.append(entry)
 
     related_path = _write_related(article_path, cleaned)
+    _publish_desktop_event("related_updated", article_path, count=len(cleaned))
     return jsonify(success=True, relatedPath=str(related_path), items=cleaned)
 
 
@@ -2777,6 +2831,7 @@ def desktop_save_rating():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _publish_desktop_event("rating_updated", article_path, rating=rating)
     return jsonify(success=True, articlePath=str(article_path), rating=rating)
 
 
@@ -3070,8 +3125,45 @@ def desktop_session():
             state["focusedNotesPath"] = str(notes_path) if notes_path else None
 
     _write_session_state(state)
+    _publish_desktop_event("session_updated", state.get("focusedDocumentPath"))
     return jsonify(success=True, session=state)
 
 
+@app.route("/desktop/events", methods=["GET"])
+def desktop_events():
+    """Server-Sent Events stream for desktop reader UI updates.
+
+    Publishes one event per mutating /desktop/* write (notes, highlights,
+    rating, document, related, session). Subscribers receive the ``ready``
+    event on connect and a periodic ``: keepalive`` comment every 25s so
+    proxies don't drop the connection. Event payload is JSON
+    ``{type, articlePath, ts, ...extras}``.
+    """
+
+    def stream():
+        q = _event_hub.subscribe()
+        try:
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                try:
+                    event = q.get(timeout=25.0)
+                except _queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            _event_hub.unsubscribe(q)
+
+    return Response(
+        stream_with_context(stream()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)

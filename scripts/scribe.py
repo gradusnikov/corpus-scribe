@@ -42,6 +42,61 @@ class ScribeError(RuntimeError):
     """Raised when the backend returns an error or is unreachable."""
 
 
+import re
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
+
+
+def _parse_sections(body: str) -> list[dict]:
+    # Returns a flat list of ATX headings with char offsets.
+    # In-code fences are skipped so ``` # not a heading ``` doesn't confuse us.
+    sections: list[dict] = []
+    fence_ranges: list[tuple[int, int]] = []
+    for m in re.finditer(r"```.*?```", body, flags=re.DOTALL):
+        fence_ranges.append((m.start(), m.end()))
+
+    def in_fence(pos: int) -> bool:
+        for start, end in fence_ranges:
+            if start <= pos < end:
+                return True
+        return False
+
+    for m in _HEADING_RE.finditer(body):
+        if in_fence(m.start()):
+            continue
+        sections.append(
+            {
+                "level": len(m.group(1)),
+                "heading": m.group(2).strip(),
+                "start": m.start(),
+            }
+        )
+    for i, section in enumerate(sections):
+        section["end"] = sections[i + 1]["start"] if i + 1 < len(sections) else len(body)
+    return sections
+
+
+def _find_section(body: str, heading: str) -> dict | None:
+    target = heading.strip().casefold()
+    for section in _parse_sections(body):
+        if section["heading"].casefold() == target:
+            return section
+    # Fall back to prefix match if no exact hit.
+    for section in _parse_sections(body):
+        if section["heading"].casefold().startswith(target):
+            return section
+    return None
+
+
+def _normalize_article_path(article_path: str) -> str:
+    # Callers (including get_current_context's focusedNotesPath) sometimes hand
+    # us the companion notes path instead of the article. The backend derives
+    # `<stem>.notes.md` itself, so a `.notes.md` input would double-suffix.
+    if article_path.endswith(".notes.md"):
+        return article_path[: -len(".notes.md")] + ".md"
+    return article_path
+
+
 @dataclass
 class ScribeClient:
     api_base: str = DEFAULT_API_BASE
@@ -103,6 +158,7 @@ class ScribeClient:
         return session if isinstance(session, dict) else {}
 
     def read_document(self, article_path: str, strip_noise: bool = True, strip_references: bool = True) -> dict:
+        article_path = _normalize_article_path(article_path)
         payload = self._request(
             "POST",
             "/desktop/document/read",
@@ -121,11 +177,42 @@ class ScribeClient:
         }
 
     def get_document_detail(self, article_path: str) -> dict:
+        article_path = _normalize_article_path(article_path)
         payload = self._request("GET", "/desktop/document", query={"articlePath": article_path})
         detail = payload.get("detail")
         return detail if isinstance(detail, dict) else {}
 
+    def get_highlights(self, article_path: str) -> list[dict]:
+        detail = self.get_document_detail(article_path)
+        highlights = detail.get("highlights")
+        return highlights if isinstance(highlights, list) else []
+
+    def list_library(self) -> dict:
+        query = {"root": self.corpus_root} if self.corpus_root else None
+        payload = self._request("GET", "/desktop/library", query=query)
+        return {
+            "labels": payload.get("labels") or [],
+            "documents": payload.get("documents") or [],
+        }
+
+    def read_notes(self, article_path: str) -> str:
+        detail = self.get_document_detail(article_path)
+        notes = detail.get("notesMarkdown")
+        return notes if isinstance(notes, str) else ""
+
+    def get_related(self, article_path: str) -> list[dict]:
+        detail = self.get_document_detail(article_path)
+        related = detail.get("related")
+        return related if isinstance(related, list) else []
+
+    def get_document_body(self, article_path: str, strip_noise: bool = True, strip_references: bool = True) -> str:
+        # Lightweight body fetch for client-side section slicing — body only,
+        # no title header prepended. Used by list_sections / read_section.
+        payload = self.read_document(article_path, strip_noise=strip_noise, strip_references=strip_references)
+        return payload.get("markdown") or ""
+
     def update_notes(self, article_path: str, notes_markdown: str) -> dict:
+        article_path = _normalize_article_path(article_path)
         payload = self._request(
             "POST",
             "/desktop/notes",
@@ -273,6 +360,184 @@ def build_mcp_server(client: ScribeClient):
         payload = client.read_document(articlePath, strip_noise=stripNoise, strip_references=stripReferences)
         header = f"# {payload['title']}\n\n" if payload.get("title") else ""
         return header + payload["markdown"]
+
+    @mcp.tool(
+        name="get_highlights",
+        description=(
+            "Return the content highlights a user has saved on a document, as a "
+            "JSON array of {id, text, createdAt, startOffset, endOffset}. "
+            "Noise-variant highlights (e.g. author affiliations marked for "
+            "stripping) are excluded."
+        ),
+    )
+    def get_highlights(articlePath: str) -> str:
+        articlePath = (articlePath or "").strip()
+        if not articlePath:
+            raise ValueError("get_highlights requires articlePath")
+        highlights = client.get_highlights(articlePath)
+        content_highlights = [h for h in highlights if h.get("variant") != "noise"]
+        return json.dumps(
+            [
+                {
+                    "id": h.get("id"),
+                    "text": h.get("text"),
+                    "comment": h.get("comment"),
+                    "createdAt": h.get("createdAt"),
+                    "startOffset": h.get("startOffset"),
+                    "endOffset": h.get("endOffset"),
+                }
+                for h in content_highlights
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @mcp.tool(
+        name="list_labels",
+        description=(
+            "List every label currently in use in the corpus. Labels are the "
+            "top-level folders under the library root and act as the primary "
+            "way to navigate a corpus by topic."
+        ),
+    )
+    def list_labels() -> str:
+        data = client.list_library()
+        labels = sorted(data.get("labels") or [], key=str.casefold)
+        return json.dumps(labels, ensure_ascii=False, indent=2)
+
+    @mcp.tool(
+        name="list_documents",
+        description=(
+            "List documents in the corpus, optionally filtered to a single "
+            "label. Returns compact metadata (title, label, rating, authors, "
+            "ingestedAt, articlePath, excerpt) — enough to triage without "
+            "reading bodies. Default limit is 50, pass limit=0 for all."
+        ),
+    )
+    def list_documents(label: str | None = None, limit: int = 50) -> str:
+        data = client.list_library()
+        docs = data.get("documents") or []
+        if label:
+            needle = label.strip().casefold()
+            docs = [d for d in docs if (d.get("label") or "").casefold() == needle]
+        if limit and limit > 0:
+            docs = docs[:limit]
+        return json.dumps(
+            [
+                {
+                    "title": d.get("title"),
+                    "label": d.get("label"),
+                    "rating": d.get("rating"),
+                    "authors": d.get("authors"),
+                    "year": d.get("year"),
+                    "doi": d.get("doi"),
+                    "ingestedAt": d.get("ingestedAt"),
+                    "articlePath": d.get("articlePath"),
+                    "highlightCount": d.get("highlightCount"),
+                    "excerpt": d.get("excerpt"),
+                }
+                for d in docs
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    @mcp.tool(
+        name="read_notes",
+        description=(
+            "Return the current companion .notes.md body for a document, or "
+            "an empty string if no notes exist yet. Use before update_notes "
+            "to avoid clobbering existing content."
+        ),
+    )
+    def read_notes(articlePath: str) -> str:
+        articlePath = (articlePath or "").strip()
+        if not articlePath:
+            raise ValueError("read_notes requires articlePath")
+        return client.read_notes(articlePath)
+
+    @mcp.tool(
+        name="append_notes",
+        description=(
+            "Append markdown to the end of a document's companion .notes.md "
+            "without replacing existing content. A blank line is inserted "
+            "between the existing body and the new content."
+        ),
+    )
+    def append_notes(articlePath: str, notesMarkdown: str) -> str:
+        articlePath = (articlePath or "").strip()
+        if not articlePath:
+            raise ValueError("append_notes requires articlePath")
+        addition = notesMarkdown or ""
+        if not addition.strip():
+            raise ValueError("append_notes requires non-empty notesMarkdown")
+        existing = client.read_notes(articlePath)
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        separator = "\n" if existing else ""
+        merged = f"{existing}{separator}{addition}"
+        if not merged.endswith("\n"):
+            merged += "\n"
+        result = client.update_notes(articlePath, merged)
+        return f"Appended to {result['notesPath']}"
+
+    @mcp.tool(
+        name="get_related",
+        description=(
+            "Return the user-curated list of related documents for an "
+            "article. Each item has targetPath, targetTitle, note, createdAt. "
+            "Use to pivot across a corpus during literature review."
+        ),
+    )
+    def get_related(articlePath: str) -> str:
+        articlePath = (articlePath or "").strip()
+        if not articlePath:
+            raise ValueError("get_related requires articlePath")
+        related = client.get_related(articlePath)
+        return json.dumps(related, ensure_ascii=False, indent=2)
+
+    @mcp.tool(
+        name="list_sections",
+        description=(
+            "Return the outline of a document as a flat list of {level, "
+            "heading, start, end} entries. Use before read_section to "
+            "discover available headings in a long paper without pulling "
+            "the full body into context."
+        ),
+    )
+    def list_sections(articlePath: str) -> str:
+        articlePath = (articlePath or "").strip()
+        if not articlePath:
+            raise ValueError("list_sections requires articlePath")
+        body = client.get_document_body(articlePath)
+        sections = [
+            {"level": s["level"], "heading": s["heading"], "chars": s["end"] - s["start"]}
+            for s in _parse_sections(body)
+        ]
+        return json.dumps(sections, ensure_ascii=False, indent=2)
+
+    @mcp.tool(
+        name="read_section",
+        description=(
+            "Return a single section of a document by heading. Matching is "
+            "case-insensitive and falls back to prefix match if no exact hit. "
+            "The slice runs from the target heading to the next heading of "
+            "any level, so nested subsections are included."
+        ),
+    )
+    def read_section(articlePath: str, heading: str) -> str:
+        articlePath = (articlePath or "").strip()
+        heading = (heading or "").strip()
+        if not articlePath or not heading:
+            raise ValueError("read_section requires articlePath and heading")
+        body = client.get_document_body(articlePath)
+        section = _find_section(body, heading)
+        if section is None:
+            available = [s["heading"] for s in _parse_sections(body)]
+            raise ValueError(
+                f"No section matched '{heading}'. Available: {', '.join(available) or '(none)'}"
+            )
+        return body[section["start"]:section["end"]].rstrip() + "\n"
 
     @mcp.tool(
         name="update_notes",
