@@ -1,4 +1,8 @@
 import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import CodeMirror from '@uiw/react-codemirror'
+import { keymap, EditorView } from '@codemirror/view'
+import { markdown } from '@codemirror/lang-markdown'
+import { EditorSelection } from '@codemirror/state'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
@@ -34,6 +38,19 @@ type DocumentSummary = {
   excerpt: string
   affinityScore?: number
 }
+
+type NotesGenerationStatus = {
+  state: 'idle' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'error'
+  notesMarkdown: string
+  previewAvailable: boolean
+  canStop: boolean
+  message: string | null
+  notesPath: string | null
+  error: string | null
+  updatedAt: string | null
+}
+
+type NotesGenerationStrategy = 'replace' | 'append' | 'fuse'
 
 type LibraryIndex = {
   root: string
@@ -93,10 +110,13 @@ type PendingSelection = {
 }
 
 type NotesMode = 'markdown' | 'preview'
+type ReaderMode = 'rendered' | 'source'
 type ThemeMode = 'light' | 'dark'
 type HighlightsView = 'list' | 'single'
 type NoiseVariant = 'highlight' | 'noise'
-type HeadingEntry = { level: number; text: string; index: number }
+type HeadingEntry = { level: number; text: string; index: number; offset: number }
+type SourceFindMatch = { from: number; to: number }
+type FindTarget = 'reader' | 'notes'
 
 const emptyLibrary: LibraryIndex = {
   root: '',
@@ -114,6 +134,7 @@ const persistedRightPaneKey = 'corpus-scribe.desktop.rightPaneWidth'
 const persistedNotesTopKey = 'corpus-scribe.desktop.notesTopHeight'
 const persistedLabelKey = 'corpus-scribe.desktop.selectedLabel'
 const persistedNotesModeKey = 'corpus-scribe.desktop.notesMode'
+const persistedReaderModeKey = 'corpus-scribe.desktop.readerMode'
 const persistedHighlightsViewKey = 'corpus-scribe.desktop.highlightsView'
 const persistedOpenTabsKey = 'corpus-scribe.desktop.openTabs'
 const persistedHideNoiseKey = 'corpus-scribe.desktop.hideNoise'
@@ -183,6 +204,21 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return data.detail as T
     }
+    case 'save_document': {
+      const response = await fetch(`${browserApiBase}/desktop/document`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+          markdown: payload.markdown,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to save document')
+      }
+      return data as T
+    }
     case 'save_notes': {
       const response = await fetch(`${browserApiBase}/desktop/notes`, {
         method: 'POST',
@@ -204,11 +240,39 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           articlePath: payload.articlePath,
+          strategy: payload.strategy ?? 'replace',
+          existingNotes: payload.existingNotes ?? '',
         }),
       })
       const data = await response.json()
       if (!response.ok || !data.success) {
         throw new Error(data.message ?? 'Failed to generate notes')
+      }
+      return data as T
+    }
+    case 'notes_status': {
+      const params = new URLSearchParams()
+      if (payload.articlePath) {
+        params.set('articlePath', String(payload.articlePath))
+      }
+      const response = await fetch(`${browserApiBase}/desktop/notes/status?${params.toString()}`)
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to load notes status')
+      }
+      return data as T
+    }
+    case 'cancel_notes': {
+      const response = await fetch(`${browserApiBase}/desktop/notes/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to stop notes generation')
       }
       return data as T
     }
@@ -530,21 +594,44 @@ function parseHeadings(markdown: string): HeadingEntry[] {
   const headings: HeadingEntry[] = []
   let inCodeBlock = false
   let occurrence = 0
+  let offset = 0
   for (const line of lines) {
     if (/^\s{0,3}```/.test(line)) {
       inCodeBlock = !inCodeBlock
+      offset += line.length + 1
       continue
     }
-    if (inCodeBlock) continue
+    if (inCodeBlock) {
+      offset += line.length + 1
+      continue
+    }
     const match = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line)
-    if (!match) continue
-    const level = match[1].length
-    const text = match[2].trim()
-    if (!text) continue
-    headings.push({ level, text, index: occurrence })
-    occurrence += 1
+    if (match) {
+      const level = match[1].length
+      const text = match[2].trim()
+      if (text) {
+        headings.push({ level, text, index: occurrence, offset })
+        occurrence += 1
+      }
+    }
+    offset += line.length + 1
   }
   return headings
+}
+
+function collectSourceFindMatches(value: string, needle: string): SourceFindMatch[] {
+  if (!value || !needle) return []
+  const haystack = value.toLocaleLowerCase()
+  const query = needle.toLocaleLowerCase()
+  const matches: SourceFindMatch[] = []
+  let searchFrom = 0
+  while (searchFrom <= haystack.length) {
+    const found = haystack.indexOf(query, searchFrom)
+    if (found < 0) break
+    matches.push({ from: found, to: found + query.length })
+    searchFrom = found + Math.max(1, query.length)
+  }
+  return matches
 }
 
 type NotesTransformResult = { value: string; selStart: number; selEnd: number }
@@ -656,104 +743,6 @@ function insertBlockquoteTransform(): NotesTransform {
       selEnd: lineStart + transformed.length,
     }
   }
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-}
-
-function highlightNotesMarkdown(source: string) {
-  if (!source) {
-    return ''
-  }
-  const lines = source.split('\n')
-  const out: string[] = []
-  let inFence = false
-  for (const line of lines) {
-    const fenceMatch = /^(\s{0,3})(```+|~~~+)(.*)$/.exec(line)
-    if (fenceMatch) {
-      inFence = !inFence
-      out.push(`<span class="md-code">${escapeHtml(line)}</span>`)
-      continue
-    }
-    if (inFence) {
-      out.push(`<span class="md-code">${escapeHtml(line)}</span>`)
-      continue
-    }
-    const headingMatch = /^(\s{0,3})(#{1,6})(\s+)(.*)$/.exec(line)
-    if (headingMatch) {
-      const level = headingMatch[2].length
-      out.push(
-        `${escapeHtml(headingMatch[1])}<span class="md-heading md-h${level}">${escapeHtml(
-          headingMatch[2] + headingMatch[3] + headingMatch[4],
-        )}</span>`,
-      )
-      continue
-    }
-    const quoteMatch = /^(\s{0,3})(>\s?.*)$/.exec(line)
-    if (quoteMatch) {
-      out.push(`${escapeHtml(quoteMatch[1])}<span class="md-quote">${escapeHtml(quoteMatch[2])}</span>`)
-      continue
-    }
-    if (/^(\s{0,3})([-*_])\2{2,}\s*$/.test(line)) {
-      out.push(`<span class="md-hr">${escapeHtml(line)}</span>`)
-      continue
-    }
-    const listMatch = /^(\s*)([-*+]|\d+[.)])(\s+)/.exec(line)
-    let rest = line
-    let prefix = ''
-    if (listMatch) {
-      prefix = `${escapeHtml(listMatch[1])}<span class="md-list">${escapeHtml(listMatch[2])}</span>${escapeHtml(listMatch[3])}`
-      rest = line.slice(listMatch[0].length)
-    }
-    out.push(prefix + highlightInline(rest))
-  }
-  return out.join('\n')
-}
-
-function highlightInline(text: string) {
-  if (!text) return ''
-  const tokens: Array<{ start: number; end: number; cls: string }> = []
-  const patterns: Array<{ re: RegExp; cls: string }> = [
-    { re: /`[^`\n]+`/g, cls: 'md-code' },
-    { re: /\*\*[^*\n]+\*\*/g, cls: 'md-bold' },
-    { re: /(^|[^*])\*(?!\s)([^*\n]+?)\*(?!\*)/g, cls: 'md-italic' },
-    { re: /(^|[^_])_(?!\s)([^_\n]+?)_(?!_)/g, cls: 'md-italic' },
-    { re: /!?\[[^\]\n]*\]\([^)\n]*\)/g, cls: 'md-link' },
-  ]
-  for (const { re, cls } of patterns) {
-    re.lastIndex = 0
-    let match: RegExpExecArray | null
-    while ((match = re.exec(text)) !== null) {
-      let start = match.index
-      const end = match.index + match[0].length
-      if ((cls === 'md-italic') && match[1] !== undefined) {
-        start = match.index + match[1].length
-      }
-      if (tokens.some((t) => start < t.end && end > t.start)) {
-        continue
-      }
-      tokens.push({ start, end, cls })
-    }
-  }
-  tokens.sort((a, b) => a.start - b.start)
-  const parts: string[] = []
-  let cursor = 0
-  for (const token of tokens) {
-    if (token.start < cursor) continue
-    if (token.start > cursor) {
-      parts.push(escapeHtml(text.slice(cursor, token.start)))
-    }
-    parts.push(`<span class="${token.cls}">${escapeHtml(text.slice(token.start, token.end))}</span>`)
-    cursor = token.end
-  }
-  if (cursor < text.length) {
-    parts.push(escapeHtml(text.slice(cursor)))
-  }
-  return parts.join('')
 }
 
 function splitLongSection(section: string, maxLength = 12000) {
@@ -1080,6 +1069,7 @@ type ReaderContentProps = {
   highlights: Highlight[]
   articlePath?: string | null
   sourceSite?: string | null
+  theme: ThemeMode
   fontSize: number
   scrollHeadingRequest?: { index: number; ts: number } | null
   hideNoise?: boolean
@@ -1094,17 +1084,27 @@ type ReaderContentProps = {
 function CodeBlock({
   children,
   className,
+  theme,
   onCopyText,
   ...rest
 }: {
   children?: React.ReactNode
   className?: string
+  theme: ThemeMode
   onCopyText: (text: string, label: string) => void
   [key: string]: unknown
 }) {
-  const codeRef = useRef<HTMLElement | null>(null)
+  const text = useMemo(() => {
+    if (typeof children === 'string') {
+      return children
+    }
+    if (Array.isArray(children)) {
+      return children.map((part: unknown) => (typeof part === 'string' ? part : '')).join('')
+    }
+    return ''
+  }, [children])
   return (
-    <pre className="code-block-wrapper">
+    <div className="code-block-wrapper">
       <button
         type="button"
         className="code-copy-button"
@@ -1112,16 +1112,26 @@ function CodeBlock({
         onClick={(event) => {
           event.preventDefault()
           event.stopPropagation()
-          const text = codeRef.current?.innerText ?? ''
           onCopyText(text, 'code block')
         }}
       >
         Copy
       </button>
-      <code ref={codeRef} className={className} {...rest}>
-        {children}
-      </code>
-    </pre>
+      <CodeMirror
+        className="code-block-editor"
+        value={text}
+        editable={false}
+        basicSetup={{
+          lineNumbers: false,
+          foldGutter: false,
+          highlightActiveLine: false,
+          highlightActiveLineGutter: false,
+        }}
+        extensions={[]}
+        theme={theme === 'dark' ? 'dark' : 'light'}
+        {...rest}
+      />
+    </div>
   )
 }
 
@@ -1207,6 +1217,7 @@ const ReaderContent = memo(function ReaderContent({
   highlights,
   articlePath,
   sourceSite,
+  theme,
   fontSize,
   scrollHeadingRequest,
   hideNoise,
@@ -1440,13 +1451,13 @@ const ReaderContent = memo(function ReaderContent({
           )
         }
         return (
-          <CodeBlock className={className} onCopyText={stableCopy} {...codeProps}>
+          <CodeBlock className={className} theme={theme} onCopyText={stableCopy} {...codeProps}>
             {children}
           </CodeBlock>
         )
       },
     }),
-    [articlePath, sourceSite, stableCopy, stableImageOpen],
+    [articlePath, sourceSite, stableCopy, stableImageOpen, theme],
   )
 
   const renderedChunks = useMemo(
@@ -1500,7 +1511,14 @@ function App() {
   const [searchTotal, setSearchTotal] = useState<number | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [detail, setDetail] = useState<DocumentDetail | null>(null)
+  const [sourceDraft, setSourceDraft] = useState('')
+  const [sourceSavedSnapshot, setSourceSavedSnapshot] = useState('')
+  const [readerMode, setReaderMode] = useState<ReaderMode>(() => {
+    if (typeof window === 'undefined') return 'rendered'
+    return window.localStorage.getItem(persistedReaderModeKey) === 'source' ? 'source' : 'rendered'
+  })
   const [notesDraft, setNotesDraft] = useState('')
+  const [notesSavedSnapshot, setNotesSavedSnapshot] = useState('')
   const [notesMode, setNotesMode] = useState<NotesMode>(() => {
     if (typeof window === 'undefined') return 'markdown'
     const stored = window.localStorage.getItem(persistedNotesModeKey)
@@ -1521,8 +1539,13 @@ function App() {
   const [searching, setSearching] = useState(false)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [savingNotes, setSavingNotes] = useState(false)
+  const [savingSource, setSavingSource] = useState(false)
   const [generatingNotes, setGeneratingNotes] = useState(false)
   const [notesPending, setNotesPending] = useState(false)
+  const [notesPreviewReady, setNotesPreviewReady] = useState(true)
+  const [notesGenerationState, setNotesGenerationState] = useState<NotesGenerationStatus['state']>('idle')
+  const [notesAutoFollow, setNotesAutoFollow] = useState(true)
+  const [notesEditorMountTick, setNotesEditorMountTick] = useState(0)
   const [savingHighlights, setSavingHighlights] = useState(false)
   const [status, setStatus] = useState('Loading library…')
   const [leftPaneWidth, setLeftPaneWidth] = useState<number>(() => {
@@ -1558,10 +1581,12 @@ function App() {
   const [rootPickerLoading, setRootPickerLoading] = useState(false)
   const [rootPickerError, setRootPickerError] = useState<string | null>(null)
   const [findOpen, setFindOpen] = useState(false)
+  const [findTarget, setFindTarget] = useState<FindTarget>('reader')
   const [findQuery, setFindQuery] = useState('')
   const [findMatchCount, setFindMatchCount] = useState(0)
   const [findCursor, setFindCursor] = useState(0)
   const findMatchesRef = useRef<Range[]>([])
+  const sourceFindMatchesRef = useRef<SourceFindMatch[]>([])
   const findInputRef = useRef<HTMLInputElement | null>(null)
   const highlightCardRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [theme, setTheme] = useState<ThemeMode>(() => {
@@ -1621,15 +1646,17 @@ function App() {
   const [tocQuery, setTocQuery] = useState('')
   const [tocCursor, setTocCursor] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [notesStrategyDialogOpen, setNotesStrategyDialogOpen] = useState(false)
   const [pendingHashPath, setPendingHashPath] = useState<string | null>(null)
   const [scrollHeadingRequest, setScrollHeadingRequest] = useState<{ index: number; ts: number } | null>(null)
   const deferredSearch = useDeferredValue(search.trim())
   const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
   const readerScrollRef = useRef<HTMLDivElement | null>(null)
   const notesScrollRef = useRef<HTMLDivElement | null>(null)
-  const notesTextareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const notesHighlightRef = useRef<HTMLDivElement | null>(null)
-  const pendingNotesSelectionRef = useRef<{ selStart: number; selEnd: number } | null>(null)
+  const notesPreviewRef = useRef<HTMLDivElement | null>(null)
+  const notesEditorViewRef = useRef<EditorView | null>(null)
+  const sourceEditorViewRef = useRef<EditorView | null>(null)
+  const notesAutoScrollingRef = useRef(false)
   const activeDocIdRef = useRef<string | null>(null)
   const settingsMenuRef = useRef<HTMLDivElement | null>(null)
   const hashRefreshAttemptedRef = useRef<string | null>(null)
@@ -1745,14 +1772,50 @@ function App() {
   }, [notesMode])
 
   useEffect(() => {
-    const pending = pendingNotesSelectionRef.current
-    if (!pending) return
-    const textarea = notesTextareaRef.current
-    pendingNotesSelectionRef.current = null
-    if (!textarea) return
-    textarea.focus()
-    textarea.setSelectionRange(pending.selStart, pending.selEnd)
-  }, [notesDraft])
+    window.localStorage.setItem(persistedReaderModeKey, readerMode)
+  }, [readerMode])
+
+  useEffect(() => {
+    if (readerMode === 'source') {
+      setPendingSelection(null)
+    }
+  }, [readerMode])
+
+  useEffect(() => {
+    if (!notesPending || !notesAutoFollow) {
+      return
+    }
+    const view = notesEditorViewRef.current
+    if (!view) {
+      return
+    }
+    notesAutoScrollingRef.current = true
+    const scrollDOM = view.scrollDOM
+    const nextScrollTop = Math.max(0, scrollDOM.scrollHeight - scrollDOM.clientHeight)
+    scrollDOM.scrollTop = nextScrollTop
+    window.requestAnimationFrame(() => {
+      notesAutoScrollingRef.current = false
+    })
+  }, [notesDraft, notesPending, notesAutoFollow, notesEditorMountTick])
+
+  useEffect(() => {
+    const view = notesEditorViewRef.current
+    if (!view) {
+      return
+    }
+    const handleScroll = () => {
+      if (!notesPending || notesAutoScrollingRef.current) {
+        return
+      }
+      const scrollDOM = view.scrollDOM
+      const distanceFromBottom = scrollDOM.scrollHeight - (scrollDOM.scrollTop + scrollDOM.clientHeight)
+      setNotesAutoFollow(distanceFromBottom <= 8)
+    }
+    view.scrollDOM.addEventListener('scroll', handleScroll, { passive: true })
+    return () => {
+      view.scrollDOM.removeEventListener('scroll', handleScroll)
+    }
+  }, [notesMode, notesPending, notesEditorMountTick])
 
   useEffect(() => {
     window.localStorage.setItem(persistedHighlightsViewKey, highlightsView)
@@ -1883,6 +1946,15 @@ function App() {
   }, [infoOpen])
 
   useEffect(() => {
+    if (!notesStrategyDialogOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setNotesStrategyDialogOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [notesStrategyDialogOpen])
+
+  useEffect(() => {
     if (!infoOpen || !detail) {
       setInfoLocation(null)
       return
@@ -1926,38 +1998,119 @@ function App() {
       setInfoOpen(false)
       setFindOpen(false)
       setFindQuery('')
+      setNotesStrategyDialogOpen(false)
     }
   }, [detail?.summary.id])
 
   useEffect(() => {
     if (!findOpen) {
       findMatchesRef.current = []
+      sourceFindMatchesRef.current = []
       setFindMatchCount(0)
       setFindCursor(0)
       clearFindHighlights()
       return
     }
-    const root = document.querySelector('.markdown-body')
-    if (!(root instanceof HTMLElement)) return
     const needle = findQuery.trim()
     if (!needle) {
       findMatchesRef.current = []
+      sourceFindMatchesRef.current = []
       setFindMatchCount(0)
       setFindCursor(0)
       clearFindHighlights()
       return
     }
+    if (findTarget === 'notes') {
+      if (notesMode === 'markdown') {
+        clearFindHighlights()
+        const matches = collectSourceFindMatches(notesDraft, needle)
+        findMatchesRef.current = []
+        sourceFindMatchesRef.current = matches
+        setFindMatchCount(matches.length)
+        setFindCursor((current) => {
+          if (!matches.length) return 0
+          return Math.min(current, matches.length - 1)
+        })
+        return
+      }
+      const root = notesPreviewRef.current
+      if (!(root instanceof HTMLElement)) return
+      const matches = collectFindRanges(root, needle)
+      findMatchesRef.current = matches
+      sourceFindMatchesRef.current = []
+      setFindMatchCount(matches.length)
+      setFindCursor((current) => {
+        if (!matches.length) return 0
+        return Math.min(current, matches.length - 1)
+      })
+      return
+    }
+    if (readerMode === 'source') {
+      clearFindHighlights()
+      const matches = collectSourceFindMatches(sourceDraft, needle)
+      findMatchesRef.current = []
+      sourceFindMatchesRef.current = matches
+      setFindMatchCount(matches.length)
+      setFindCursor((current) => {
+        if (!matches.length) return 0
+        return Math.min(current, matches.length - 1)
+      })
+      return
+    }
+    const root = document.querySelector('.reader-pane .markdown-body')
+    if (!(root instanceof HTMLElement)) return
     const matches = collectFindRanges(root, needle)
     findMatchesRef.current = matches
+    sourceFindMatchesRef.current = []
     setFindMatchCount(matches.length)
     setFindCursor((current) => {
       if (!matches.length) return 0
       return Math.min(current, matches.length - 1)
     })
-  }, [findOpen, findQuery, detail?.markdown, highlights, referencesAreNoise])
+  }, [findOpen, findQuery, findTarget, readerMode, sourceDraft, notesMode, notesDraft, detail?.markdown, highlights, referencesAreNoise])
 
   useEffect(() => {
     if (!findOpen) return
+    if (findTarget === 'notes') {
+      if (notesMode === 'markdown') {
+        const matches = sourceFindMatchesRef.current
+        const active = matches[findCursor]
+        const view = notesEditorViewRef.current
+        if (!view || !active) {
+          return
+        }
+        view.dispatch({
+          selection: EditorSelection.single(active.from, active.to),
+          effects: EditorView.scrollIntoView(active.from, { y: 'center' }),
+        })
+        return
+      }
+      const matches = findMatchesRef.current
+      if (!matches.length) {
+        setFindHighlights([], 0)
+        return
+      }
+      setFindHighlights(matches, findCursor)
+      const active = matches[findCursor]
+      const activeNode = active?.startContainer.parentElement
+      if (activeNode) {
+        activeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+      return
+    }
+    if (readerMode === 'source') {
+      const matches = sourceFindMatchesRef.current
+      const active = matches[findCursor]
+      const view = sourceEditorViewRef.current
+      if (!view || !active) {
+        return
+      }
+      view.dispatch({
+        selection: EditorSelection.single(active.from, active.to),
+        effects: EditorView.scrollIntoView(active.from, { y: 'center' }),
+      })
+      return
+    }
     const matches = findMatchesRef.current
     if (!matches.length) {
       setFindHighlights([], 0)
@@ -1969,7 +2122,7 @@ function App() {
     if (activeNode) {
       activeNode.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
-  }, [findOpen, findMatchCount, findCursor])
+  }, [findOpen, findMatchCount, findCursor, findTarget, readerMode, notesMode])
 
   useEffect(() => {
     if (!findOpen) return
@@ -1984,11 +2137,33 @@ function App() {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'f') return
       if (!detail) return
       event.preventDefault()
+      const active = document.activeElement
+      if (active instanceof HTMLElement && active.closest('.notes-pane')) {
+        setFindTarget('notes')
+      } else {
+        setFindTarget('reader')
+      }
       setFindOpen(true)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [detail])
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return
+      if (event.key.toLowerCase() !== 's') return
+      if (!detail) return
+      event.preventDefault()
+      if (readerMode === 'source') {
+        void saveSource()
+        return
+      }
+      void saveNotes()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [detail, readerMode, sourceDraft, notesDraft])
 
   useEffect(() => {
     return () => {
@@ -2165,8 +2340,14 @@ function App() {
       activeDocIdRef.current = loaded.summary.id
       setActiveId(loaded.summary.id)
       setDetail(loaded)
+      setSourceDraft(loaded.markdown)
+      setSourceSavedSnapshot(loaded.markdown)
       setNotesDraft(loaded.notesMarkdown)
+      setNotesSavedSnapshot(loaded.notesMarkdown)
       setNotesPending(Boolean(loaded.summary.notesPending))
+      setNotesPreviewReady(!loaded.summary.notesPending)
+      setNotesGenerationState(loaded.summary.notesPending ? 'running' : 'idle')
+      setNotesAutoFollow(Boolean(loaded.summary.notesPending))
       setHighlights(loaded.highlights)
       setRelatedLinks(loaded.related ?? [])
       setRelatedSuggestions([])
@@ -2243,7 +2424,10 @@ function App() {
         articlePath: detail.summary.articlePath,
         notesMarkdown: notesDraft,
       })
+      setNotesSavedSnapshot(notesDraft)
       setNotesPending(false)
+      setNotesPreviewReady(true)
+      setNotesGenerationState('completed')
       applyDocumentSummaryPatch(detail.summary.id, { notesPath, notesPending: false })
       setStatus(`Saved notes to ${notesPath}`)
     } catch (error) {
@@ -2253,25 +2437,76 @@ function App() {
     }
   }
 
-  async function generateNotes() {
+  async function saveSource() {
+    if (!detail) {
+      return
+    }
+    setSavingSource(true)
+    setStatus('Saving article…')
+    try {
+      await desktopCommand<{ articlePath: string; markdown: string }>('save_document', {
+        articlePath: detail.summary.articlePath,
+        markdown: sourceDraft,
+      })
+      setSourceSavedSnapshot(sourceDraft)
+      setDetail((current) => (current ? { ...current, markdown: sourceDraft } : current))
+      setStatus(`Saved ${detail.summary.title}`)
+    } catch (error) {
+      setStatus(stringifyError(error))
+    } finally {
+      setSavingSource(false)
+    }
+  }
+
+  async function startNotesGeneration(strategy: NotesGenerationStrategy) {
     if (!detail) {
       return
     }
     setGeneratingNotes(true)
     setStatus('Generating notes…')
     try {
-      const response = await desktopCommand<{ notesPath: string; notesMarkdown: string }>('generate_notes', {
+      const response = await desktopCommand<NotesGenerationStatus & { started?: boolean }>('generate_notes', {
         articlePath: detail.summary.articlePath,
+        strategy,
+        existingNotes: notesDraft,
       })
-      setNotesDraft(response.notesMarkdown)
-      setNotesMode('preview')
-      setNotesPending(false)
-      applyDocumentSummaryPatch(detail.summary.id, { notesPath: response.notesPath, notesPending: false })
-      setStatus(`Generated notes at ${response.notesPath}`)
+      setNotesDraft(response.notesMarkdown || '')
+      setNotesPending(true)
+      setNotesPreviewReady(false)
+      setNotesGenerationState(response.state)
+      setNotesAutoFollow(true)
+      applyDocumentSummaryPatch(detail.summary.id, { notesPending: true })
+      setStatus(response.message ?? 'Generating notes…')
     } catch (error) {
       setStatus(stringifyError(error))
     } finally {
       setGeneratingNotes(false)
+    }
+  }
+
+  function generateNotes() {
+    if (!detail) {
+      return
+    }
+    if (notesDraft.trim()) {
+      setNotesStrategyDialogOpen(true)
+      return
+    }
+    void startNotesGeneration('replace')
+  }
+
+  async function stopNotesGeneration() {
+    if (!detail || !notesPending) {
+      return
+    }
+    try {
+      const response = await desktopCommand<{ state: NotesGenerationStatus['state'] }>('cancel_notes', {
+        articlePath: detail.summary.articlePath,
+      })
+      setNotesGenerationState(response.state)
+      setStatus('Stopping LLM…')
+    } catch (error) {
+      setStatus(stringifyError(error))
     }
   }
 
@@ -2286,23 +2521,46 @@ function App() {
 
     const poll = async () => {
       try {
-        const loaded = await desktopCommand<DocumentDetail>('load_document', { articlePath })
+        const generation = await desktopCommand<NotesGenerationStatus>('notes_status', { articlePath })
         if (cancelled || activeDocIdRef.current !== documentId) {
           return
         }
-        const pending = Boolean(loaded.summary.notesPending)
+        const pending = generation.state === 'running' || generation.state === 'cancelling'
         setNotesPending(pending)
+        setNotesGenerationState(generation.state)
+        if (generation.notesMarkdown) {
+          setNotesDraft(generation.notesMarkdown)
+        }
         applyDocumentSummaryPatch(documentId, {
-          notesPath: loaded.summary.notesPath,
+          notesPath: generation.notesPath,
           notesPending: pending,
         })
-        if (!pending && loaded.summary.notesPath) {
-          setNotesDraft((current) => (current.trim() ? current : loaded.notesMarkdown))
-          setStatus(`Working notes ready: ${loaded.summary.title}`)
+        if (generation.state === 'completed' && generation.notesPath) {
+          setNotesPending(false)
+          setNotesPreviewReady(Boolean(generation.previewAvailable))
+          setNotesSavedSnapshot(generation.notesMarkdown || '')
+          setNotesAutoFollow(false)
+          setStatus(`Working notes ready: ${detail.summary.title}`)
+        } else if (generation.state === 'cancelled') {
+          setNotesPending(false)
+          setNotesPreviewReady(false)
+          setNotesAutoFollow(false)
+          setStatus(generation.message ?? 'LLM generation stopped.')
+        } else if (generation.state === 'error') {
+          setNotesPending(false)
+          setNotesPreviewReady(false)
+          setNotesAutoFollow(false)
+          setStatus(generation.error ?? generation.message ?? 'Notes generation failed.')
+        } else {
+          setNotesPreviewReady(false)
+          if (generation.message) {
+            setStatus(generation.message)
+          }
         }
       } catch (error) {
         if (!cancelled) {
           setNotesPending(false)
+          setNotesPreviewReady(false)
           setStatus(stringifyError(error))
         }
       }
@@ -2929,60 +3187,91 @@ function App() {
   }
 
   function applyNotesTransform(transform: NotesTransform) {
-    const textarea = notesTextareaRef.current
-    if (!textarea) return
-    const { value, selectionStart, selectionEnd } = textarea
-    const result = transform(value, selectionStart ?? 0, selectionEnd ?? 0)
-    pendingNotesSelectionRef.current = { selStart: result.selStart, selEnd: result.selEnd }
-    setNotesDraft(result.value)
+    const view = notesEditorViewRef.current
+    if (!view) return
+    const state = view.state
+    const selection = state.selection.main
+    const value = state.doc.toString()
+    const result = transform(value, selection.from, selection.to)
+    view.dispatch({
+      changes: { from: 0, to: state.doc.length, insert: result.value },
+      selection: EditorSelection.single(result.selStart, result.selEnd),
+    })
+    view.focus()
   }
 
-  function onNotesKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (!(event.ctrlKey || event.metaKey)) return
-    if (event.altKey) return
-    const key = event.key.toLowerCase()
-    const shift = event.shiftKey
-
-    if (!shift) {
-      if (/^[0-6]$/.test(key)) {
-        event.preventDefault()
-        applyNotesTransform(setLineHeadingTransform(Number(key)))
-        return
-      }
-      if (key === 'b') {
-        event.preventDefault()
-        applyNotesTransform(wrapSelectionTransform('**', '**', 'bold text'))
-        return
-      }
-      if (key === 'i') {
-        event.preventDefault()
-        applyNotesTransform(wrapSelectionTransform('*', '*', 'italic text'))
-        return
-      }
-      if (key === 'k') {
-        event.preventDefault()
-        applyNotesTransform(insertLinkTransform())
-        return
-      }
-      return
-    }
-
-    if (key === 'k') {
-      event.preventDefault()
-      applyNotesTransform(insertCodeBlockTransform())
-      return
-    }
-    if (key === 'q') {
-      event.preventDefault()
-      applyNotesTransform(insertBlockquoteTransform())
-      return
-    }
-    if (key === 'c') {
-      event.preventDefault()
-      applyNotesTransform(wrapSelectionTransform('`', '`', 'code'))
-      return
-    }
-  }
+  const notesEditorExtensions = useMemo(
+    () => [
+      markdown(),
+      EditorView.lineWrapping,
+      keymap.of([
+        {
+          key: 'Mod-0',
+          run: () => {
+            applyNotesTransform(setLineHeadingTransform(0))
+            return true
+          },
+        },
+        ...['1', '2', '3', '4', '5', '6'].map((digit) => ({
+          key: `Mod-${digit}`,
+          run: () => {
+            applyNotesTransform(setLineHeadingTransform(Number(digit)))
+            return true
+          },
+        })),
+        {
+          key: 'Mod-b',
+          run: () => {
+            applyNotesTransform(wrapSelectionTransform('**', '**', 'bold text'))
+            return true
+          },
+        },
+        {
+          key: 'Mod-i',
+          run: () => {
+            applyNotesTransform(wrapSelectionTransform('*', '*', 'italic text'))
+            return true
+          },
+        },
+        {
+          key: 'Mod-k',
+          run: () => {
+            applyNotesTransform(insertLinkTransform())
+            return true
+          },
+        },
+        {
+          key: 'Mod-Shift-k',
+          run: () => {
+            applyNotesTransform(insertCodeBlockTransform())
+            return true
+          },
+        },
+        {
+          key: 'Mod-Shift-q',
+          run: () => {
+            applyNotesTransform(insertBlockquoteTransform())
+            return true
+          },
+        },
+        {
+          key: 'Mod-Shift-c',
+          run: () => {
+            applyNotesTransform(wrapSelectionTransform('`', '`', 'code'))
+            return true
+          },
+        },
+      ]),
+    ],
+    [],
+  )
+  const sourceEditorExtensions = useMemo(
+    () => [
+      markdown(),
+      EditorView.lineWrapping,
+    ],
+    [],
+  )
 
   function insertHighlightAsQuote(highlight: Highlight) {
     const quoted = quoteMarkdown(highlight.text)
@@ -3064,15 +3353,20 @@ function App() {
         return true
       })
 
+  const effectiveArticleMarkdown = useMemo(
+    () => (detail ? sourceDraft : ''),
+    [detail, sourceDraft],
+  )
+
   const articleHeadings = useMemo(
-    () => parseHeadings(detail?.markdown ?? ''),
-    [detail?.markdown],
+    () => parseHeadings(effectiveArticleMarkdown),
+    [effectiveArticleMarkdown],
   )
 
   const [noisyHeadingIndexes, setNoisyHeadingIndexes] = useState<Set<number>>(() => new Set())
 
   useEffect(() => {
-    if (!detail?.markdown) {
+    if (!effectiveArticleMarkdown) {
       setNoisyHeadingIndexes(new Set())
       return
     }
@@ -3102,7 +3396,7 @@ function App() {
     }
     const frame = window.requestAnimationFrame(compute)
     return () => window.cancelAnimationFrame(frame)
-  }, [detail?.markdown, highlights, referencesAreNoise])
+  }, [effectiveArticleMarkdown, highlights, referencesAreNoise])
 
   const visibleHeadings = useMemo(() => {
     if (!noisyHeadingIndexes.size) return articleHeadings
@@ -3126,6 +3420,17 @@ function App() {
     setTocOpen(false)
     setTocQuery('')
     setTocCursor(0)
+    if (readerMode === 'source') {
+      const view = sourceEditorViewRef.current
+      if (view) {
+        view.dispatch({
+          selection: EditorSelection.cursor(entry.offset),
+          effects: EditorView.scrollIntoView(entry.offset, { y: 'start' }),
+        })
+        view.focus()
+      }
+      return
+    }
     setScrollHeadingRequest({ index: entry.index, ts: Date.now() })
   }
 
@@ -3168,17 +3473,15 @@ function App() {
     '--notes-top-height': `${notesTopHeight}px`,
   } as CSSProperties & Record<'--left-pane-width' | '--right-pane-width' | '--notes-top-height', string>
   const renderedMarkdown = useMemo(
-    () => (detail ? normalizeReaderMarkdown(detail.markdown) : ''),
-    [detail?.markdown],
+    () => (detail ? normalizeReaderMarkdown(effectiveArticleMarkdown) : ''),
+    [detail, effectiveArticleMarkdown],
   )
   const renderedNotesMarkdown = useMemo(
     () => normalizeReaderMarkdown(notesDraft),
     [notesDraft],
   )
-  const notesHighlightHtml = useMemo(() => {
-    const rendered = highlightNotesMarkdown(notesDraft)
-    return rendered + (notesDraft.endsWith('\n') || !notesDraft ? '\n ' : '')
-  }, [notesDraft])
+  const notesDirty = notesDraft.trimEnd() !== notesSavedSnapshot.trimEnd()
+  const sourceDirty = sourceDraft.trimEnd() !== sourceSavedSnapshot.trimEnd()
   const visibleHighlights = useMemo(
     () => highlights.filter((entry) => entry.variant !== 'noise' && entry.kind !== 'element'),
     [highlights],
@@ -3539,6 +3842,88 @@ function App() {
           </div>
         </div>
       ) : null}
+      {notesStrategyDialogOpen && detail ? (
+        <div
+          className="info-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Choose notes generation strategy"
+          onClick={() => setNotesStrategyDialogOpen(false)}
+        >
+          <div
+            className="info-panel notes-strategy-panel"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="info-header notes-strategy-header">
+              <div>
+                <h2>Notes already exist</h2>
+                <p className="notes-strategy-copy">
+                  Choose how the model should handle the current notes draft.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setNotesStrategyDialogOpen(false)}
+                aria-label="Close notes strategy dialog"
+              >
+                Close
+              </button>
+            </header>
+            <div className="info-body notes-strategy-body">
+              <button
+                type="button"
+                className="ghost-button notes-strategy-button"
+                onClick={() => {
+                  setNotesStrategyDialogOpen(false)
+                  void startNotesGeneration('replace')
+                }}
+              >
+                <span className="notes-strategy-title">Replace</span>
+                <span className="notes-strategy-description">
+                  Discard the current notes draft and generate a fresh one.
+                </span>
+              </button>
+              <button
+                type="button"
+                className="ghost-button notes-strategy-button"
+                onClick={() => {
+                  setNotesStrategyDialogOpen(false)
+                  void startNotesGeneration('append')
+                }}
+              >
+                <span className="notes-strategy-title">Append</span>
+                <span className="notes-strategy-description">
+                  Keep the current notes and add a newly generated section below them.
+                </span>
+              </button>
+              <button
+                type="button"
+                className="primary-button notes-strategy-button"
+                autoFocus
+                onClick={() => {
+                  setNotesStrategyDialogOpen(false)
+                  void startNotesGeneration('fuse')
+                }}
+              >
+                <span className="notes-strategy-title">Fuse</span>
+                <span className="notes-strategy-description">
+                  Merge the current draft with a new pass into one cleaned-up notes document.
+                </span>
+              </button>
+              <div className="notes-strategy-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => setNotesStrategyDialogOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {rootPickerOpen ? (
         <div
           className="info-overlay"
@@ -3878,6 +4263,31 @@ function App() {
                   Cite
                 </button>
               ) : null}
+              {detail ? (
+                <button
+                  type="button"
+                  className={`ghost-button reader-toolbar-button${readerMode === 'source' ? ' is-active' : ''}`}
+                  onClick={() => setReaderMode((current) => (current === 'rendered' ? 'source' : 'rendered'))}
+                  aria-pressed={readerMode === 'source'}
+                  title={readerMode === 'source' ? 'Switch to reader view' : 'Switch to source view'}
+                >
+                  {readerMode === 'source' ? 'Reader' : 'Source'}
+                </button>
+              ) : null}
+              {detail && readerMode === 'source' ? (
+                <button
+                  type="button"
+                  className={`ghost-button reader-toolbar-button reader-icon-button${sourceDirty ? ' is-dirty' : ''}`}
+                  onClick={() => void saveSource()}
+                  disabled={savingSource}
+                  title={savingSource ? 'Saving article…' : 'Save article source'}
+                  aria-label={savingSource ? 'Saving article' : 'Save article source'}
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M2.5 1h8.8l2.7 2.7V14a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1Zm1 1.5V6h8V3.8L10.7 2.5H9.5V5h-4V2.5h-2Zm1 8.5v2.5h7V11h-7Z" fill="currentColor" />
+                  </svg>
+                </button>
+              ) : null}
               <div className="settings-wrap" ref={settingsMenuRef}>
                 <button
                   type="button"
@@ -4015,7 +4425,7 @@ function App() {
           </div>
         </header>
 
-        {pendingSelection ? (
+        {pendingSelection && readerMode === 'rendered' ? (
           <div className="selection-banner">
             <span>Selection ready to save or quote.</span>
             <div className="inline-row">
@@ -4037,13 +4447,13 @@ function App() {
           </div>
         ) : null}
 
-        {findOpen && detail ? (
-          <div className="find-bar" role="search" aria-label="Find in document">
+        {findOpen && detail && findTarget === 'reader' ? (
+          <div className="find-bar" role="search" aria-label="Find in article">
             <input
               ref={findInputRef}
               type="text"
               className="find-input"
-              placeholder="Find in document…"
+              placeholder={readerMode === 'source' ? 'Find in article source…' : 'Find in article…'}
               value={findQuery}
               onChange={(event) => setFindQuery(event.target.value)}
               onKeyDown={(event) => {
@@ -4107,22 +4517,52 @@ function App() {
         ) : null}
 
         <section className="markdown-card" ref={readerScrollRef}>
-          <ReaderContent
-            loading={loadingDetail}
-            markdown={renderedMarkdown}
-            highlights={highlights}
-            articlePath={detail?.summary.articlePath}
-            sourceSite={detail?.summary.sourceSite}
-            fontSize={readerFontSize}
-            scrollHeadingRequest={scrollHeadingRequest}
-            hideNoise={hideNoise}
-            referencesAreNoise={referencesAreNoise}
-            onCopy={copyTextToClipboard}
-            onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
-            onImageOpen={(src, alt, imageIndex) => setLightbox({ src, alt, imageIndex })}
-            onDeleteNoise={(id) => void deleteHighlight(id)}
-            onToggleElementNoise={(type, index) => void toggleElementNoise(type, index)}
-          />
+          {readerMode === 'source' ? (
+            <div className="reader-source-wrap">
+              <CodeMirror
+                className="reader-source-editor"
+                value={sourceDraft}
+                height="100%"
+                basicSetup={{
+                  lineNumbers: false,
+                  foldGutter: false,
+                  highlightActiveLine: false,
+                  highlightActiveLineGutter: false,
+                }}
+                extensions={sourceEditorExtensions}
+                onCreateEditor={(view) => {
+                  sourceEditorViewRef.current = view
+                }}
+                onChange={(value) => setSourceDraft(value)}
+                onUpdate={(update) => {
+                  if (!update.docChanged && !update.focusChanged) {
+                    return
+                  }
+                  sourceEditorViewRef.current = update.view
+                }}
+                theme={theme === 'dark' ? 'dark' : 'light'}
+                placeholder="Edit canonical article markdown here."
+              />
+            </div>
+          ) : (
+            <ReaderContent
+              loading={loadingDetail}
+              markdown={renderedMarkdown}
+              highlights={highlights}
+              articlePath={detail?.summary.articlePath}
+              sourceSite={detail?.summary.sourceSite}
+              theme={theme}
+              fontSize={readerFontSize}
+              scrollHeadingRequest={scrollHeadingRequest}
+              hideNoise={hideNoise}
+              referencesAreNoise={referencesAreNoise}
+              onCopy={copyTextToClipboard}
+              onHighlightClick={(id) => setFocusedHighlight({ id, ts: Date.now() })}
+              onImageOpen={(src, alt, imageIndex) => setLightbox({ src, alt, imageIndex })}
+              onDeleteNoise={(id) => void deleteHighlight(id)}
+              onToggleElementNoise={(type, index) => void toggleElementNoise(type, index)}
+            />
+          )}
         </section>
       </main>
 
@@ -4141,19 +4581,6 @@ function App() {
             <p className="eyebrow">Notes</p>
             <h2>Working notes</h2>
           </div>
-          <div className="inline-row notes-actions">
-            {notesPending ? <span className="notes-status-pill" aria-live="polite">LLM working…</span> : null}
-            <button
-              className={`ghost-button ${generatingNotes || notesPending ? 'is-busy' : ''}`}
-              onClick={() => void generateNotes()}
-              disabled={!detail || generatingNotes || notesPending}
-            >
-              {generatingNotes ? 'Generating…' : notesPending ? 'LLM working…' : 'Generate notes'}
-            </button>
-            <button className="primary-button" onClick={() => void saveNotes()} disabled={!detail || savingNotes}>
-              {savingNotes ? 'Saving…' : 'Save notes'}
-            </button>
-          </div>
         </header>
 
         <div className="notes-scroll" ref={notesScrollRef}>
@@ -4162,51 +4589,190 @@ function App() {
             <div className="notes-mode-row">
               <div className="notes-mode-toggle">
                 <button
-                  className={`ghost-button ${notesMode === 'markdown' ? 'is-active' : ''}`}
-                  onClick={() => setNotesMode('markdown')}
+                  type="button"
+                  className={`ghost-button reader-toolbar-button${findOpen && findTarget === 'notes' ? ' is-active' : ''}`}
+                  onClick={() => {
+                    setFindTarget('notes')
+                    setFindOpen((current) => !current || findTarget !== 'notes')
+                  }}
+                  title="Find in working notes (Ctrl+F while notes are focused)"
+                  aria-label="Find in working notes"
+                  aria-pressed={findOpen && findTarget === 'notes'}
                 >
-                  Markdown
+                  Find
                 </button>
                 <button
-                  className={`ghost-button ${notesMode === 'preview' ? 'is-active' : ''}`}
-                  onClick={() => setNotesMode('preview')}
+                  className={`ghost-button reader-toolbar-button ${notesMode === 'preview' ? 'is-active' : ''}`}
+                  onClick={() => {
+                    if (notesMode === 'preview') {
+                      setNotesMode('markdown')
+                      return
+                    }
+                    if (notesPreviewReady) {
+                      setNotesMode('preview')
+                    }
+                  }}
+                  disabled={notesMode === 'markdown' && !notesPreviewReady}
+                  aria-pressed={notesMode === 'preview'}
                 >
-                  Preview
+                  {notesMode === 'preview' ? 'Markdown' : 'Preview'}
+                </button>
+                <button
+                  type="button"
+                  className={`ghost-button reader-toolbar-button${generatingNotes || notesPending ? ' is-busy' : ''}${notesPending ? ' is-active' : ''}`}
+                  onClick={() => {
+                    if (notesPending) {
+                      void stopNotesGeneration()
+                      return
+                    }
+                    void generateNotes()
+                  }}
+                  disabled={!detail || generatingNotes || notesGenerationState === 'cancelling'}
+                  aria-pressed={notesPending}
+                  title={
+                    generatingNotes
+                      ? 'Starting notes generation…'
+                      : notesGenerationState === 'cancelling'
+                      ? 'Stopping notes generation…'
+                      : notesPending
+                      ? 'Stop notes generation'
+                      : 'Generate notes'
+                  }
+                >
+                  {generatingNotes
+                    ? 'Starting…'
+                    : notesGenerationState === 'cancelling'
+                    ? 'Stopping…'
+                    : notesPending
+                    ? 'Generating'
+                    : 'Generate'}
+                </button>
+                <button
+                  type="button"
+                  className={`ghost-button reader-toolbar-button reader-icon-button${notesDirty ? ' is-dirty' : ''}`}
+                  onClick={() => void saveNotes()}
+                  disabled={!detail || savingNotes}
+                  title={savingNotes ? 'Saving notes…' : 'Save notes'}
+                  aria-label={savingNotes ? 'Saving notes' : 'Save notes'}
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                    <path d="M2.5 1h8.8l2.7 2.7V14a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1Zm1 1.5V6h8V3.8L10.7 2.5H9.5V5h-4V2.5h-2Zm1 8.5v2.5h7V11h-7Z" fill="currentColor" />
+                  </svg>
                 </button>
               </div>
-              <span className="search-hint">Markdown is canonical. Preview is read-only.</span>
+              <span className="search-hint">
+                {notesPending
+                  ? 'Markdown streams live while the LLM works. Preview unlocks when generation finishes.'
+                  : 'Markdown is canonical. Preview is read-only.'}
+              </span>
             </div>
+
+            {findOpen && detail && findTarget === 'notes' ? (
+              <div className="find-bar" role="search" aria-label="Find in working notes">
+                <input
+                  ref={findInputRef}
+                  type="text"
+                  className="find-input"
+                  placeholder={notesMode === 'markdown' ? 'Find in notes markdown…' : 'Find in notes preview…'}
+                  value={findQuery}
+                  onChange={(event) => setFindQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setFindOpen(false)
+                      return
+                    }
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      if (!findMatchCount) return
+                      const step = event.shiftKey ? -1 : 1
+                      setFindCursor((current) => (current + step + findMatchCount) % findMatchCount)
+                    }
+                  }}
+                  aria-label="Search notes"
+                />
+                <span className="find-count" aria-live="polite">
+                  {findQuery.trim()
+                    ? findMatchCount
+                      ? `${findCursor + 1} / ${findMatchCount}`
+                      : '0 / 0'
+                    : ''}
+                </span>
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => {
+                    if (!findMatchCount) return
+                    setFindCursor((current) => (current - 1 + findMatchCount) % findMatchCount)
+                  }}
+                  disabled={!findMatchCount}
+                  aria-label="Previous match"
+                  title="Previous match (Shift+Enter)"
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => {
+                    if (!findMatchCount) return
+                    setFindCursor((current) => (current + 1) % findMatchCount)
+                  }}
+                  disabled={!findMatchCount}
+                  aria-label="Next match"
+                  title="Next match (Enter)"
+                >
+                  ↓
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button reader-toolbar-button"
+                  onClick={() => setFindOpen(false)}
+                  aria-label="Close find bar"
+                  title="Close (Esc)"
+                >
+                  ✕
+                </button>
+              </div>
+            ) : null}
 
             {notesMode === 'markdown' ? (
               <div className="notes-editor-wrap">
-                <div
-                  ref={notesHighlightRef}
-                  className="notes-editor-highlights"
-                  aria-hidden="true"
-                  dangerouslySetInnerHTML={{ __html: notesHighlightHtml }}
-                />
-                <textarea
-                  ref={notesTextareaRef}
-                  className="notes-editor"
+                <CodeMirror
+                  className="notes-code-editor"
                   value={notesDraft}
-                  onChange={(event) => setNotesDraft(event.target.value)}
-                  onKeyDown={onNotesKeyDown}
-                  onScroll={(event) => {
-                    const target = event.currentTarget
-                    const overlay = notesHighlightRef.current
-                    if (overlay) {
-                      overlay.scrollTop = target.scrollTop
-                      overlay.scrollLeft = target.scrollLeft
+                  height="100%"
+                  basicSetup={{
+                    lineNumbers: false,
+                    foldGutter: false,
+                    highlightActiveLine: false,
+                    highlightActiveLineGutter: false,
+                  }}
+                  extensions={notesEditorExtensions}
+                  onCreateEditor={(view) => {
+                    notesEditorViewRef.current = view
+                    setNotesEditorMountTick((current) => current + 1)
+                  }}
+                  onChange={(value) => setNotesDraft(value)}
+                  onBlur={() => {
+                    if (notesEditorViewRef.current && notesEditorViewRef.current.hasFocus) {
+                      notesEditorViewRef.current.contentDOM.blur()
                     }
                   }}
-                  spellCheck={false}
+                  onUpdate={(update) => {
+                    if (!update.docChanged && !update.focusChanged) {
+                      return
+                    }
+                    notesEditorViewRef.current = update.view
+                  }}
+                  theme={theme === 'dark' ? 'dark' : 'light'}
                   placeholder="Write notes here. Markdown shortcuts: Ctrl+1..6 headings, Ctrl+B bold, Ctrl+I italic, Ctrl+K link, Ctrl+Shift+K code block, Ctrl+Shift+Q quote, Ctrl+Shift+C inline code."
                 />
               </div>
             ) : (
               <div className="notes-preview markdown-card">
                 {notesDraft.trim() ? (
-                  <div className="markdown-body notes-preview-body">
+                  <div className="markdown-body notes-preview-body" ref={notesPreviewRef}>
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm, remarkMath]}
                       rehypePlugins={[[rehypeKatex, { output: 'htmlAndMathml', throwOnError: false, strict: 'ignore' }]]}

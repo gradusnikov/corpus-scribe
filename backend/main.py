@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1103,19 +1104,98 @@ def _notes_pending_path(article_path: Path) -> Path:
     return article_path.with_name(article_path.stem + ".notes.pending")
 
 
+def _notes_status_path(article_path: Path) -> Path:
+    return article_path.with_name(article_path.stem + ".notes.status.json")
+
+
+def _notes_cancel_path(article_path: Path) -> Path:
+    return article_path.with_name(article_path.stem + ".notes.cancel")
+
+
 def _notes_generation_pending(article_path: Path) -> bool:
     return _notes_pending_path(article_path).exists()
 
 
 def _mark_notes_generation_pending(article_path: Path) -> None:
+    _notes_cancel_path(article_path).unlink(missing_ok=True)
     _notes_pending_path(article_path).write_text(
         datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         encoding="utf-8",
+    )
+    _write_notes_generation_status(
+        article_path,
+        state="running",
+        notes_markdown="",
+        preview_available=False,
+        can_stop=True,
+        message="LLM working…",
+        notes_path=None,
     )
 
 
 def _clear_notes_generation_pending(article_path: Path) -> None:
     _notes_pending_path(article_path).unlink(missing_ok=True)
+    _notes_cancel_path(article_path).unlink(missing_ok=True)
+
+
+def _write_notes_generation_status(
+    article_path: Path,
+    *,
+    state: str,
+    notes_markdown: str,
+    preview_available: bool,
+    can_stop: bool,
+    message: str | None = None,
+    notes_path: str | None = None,
+    error: str | None = None,
+) -> None:
+    payload = {
+        "state": state,
+        "notesMarkdown": notes_markdown,
+        "previewAvailable": preview_available,
+        "canStop": can_stop,
+        "message": message,
+        "notesPath": notes_path,
+        "error": error,
+        "updatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    _notes_status_path(article_path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_notes_generation_status(article_path: Path) -> dict:
+    status_path = _notes_status_path(article_path)
+    if status_path.exists():
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    notes_path = article_path.with_name(article_path.stem + ".notes.md")
+    return {
+        "state": "running" if _notes_generation_pending(article_path) else ("completed" if notes_path.exists() else "idle"),
+        "notesMarkdown": _read_markdown_body(notes_path) if notes_path.exists() else "",
+        "previewAvailable": notes_path.exists() and not _notes_generation_pending(article_path),
+        "canStop": _notes_generation_pending(article_path),
+        "message": "LLM working…" if _notes_generation_pending(article_path) else None,
+        "notesPath": str(notes_path) if notes_path.exists() else None,
+        "error": None,
+        "updatedAt": None,
+    }
+
+
+def _cancel_notes_generation(article_path: Path) -> None:
+    _notes_cancel_path(article_path).write_text(
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        encoding="utf-8",
+    )
+
+
+def _notes_generation_cancel_requested(article_path: Path) -> bool:
+    return _notes_cancel_path(article_path).exists()
 
 
 def _build_existing_article_payload(article_path: Path) -> dict:
@@ -1166,9 +1246,18 @@ def _build_existing_article_payload(article_path: Path) -> dict:
     return payload
 
 
-def _generate_existing_notes(article_path: Path, notes_config: dict | None = None) -> dict:
+def _generate_existing_notes(
+    article_path: Path,
+    notes_config: dict | None = None,
+    strategy: str = "replace",
+    existing_notes_override: str | None = None,
+    progress_callback=None,
+    cancel_requested=None,
+) -> dict:
     article_text = article_path.read_text(encoding="utf-8")
     article_frontmatter, article_body = _split_frontmatter(article_text)
+    notes_path = article_path.with_name(article_path.stem + ".notes.md")
+    existing_notes = existing_notes_override if existing_notes_override is not None else (_read_markdown_body(notes_path) if notes_path.exists() else "")
     notes_file = _generate_companion_notes(
         md_text=article_body,
         article_dir=article_path.parent,
@@ -1182,8 +1271,12 @@ def _generate_existing_notes(article_path: Path, notes_config: dict | None = Non
             "label": _frontmatter_string(article_frontmatter, "label"),
             "language": _frontmatter_string(article_frontmatter, "language"),
             "ingested_at": _frontmatter_string(article_frontmatter, "ingested_at"),
+            "existing_notes": existing_notes,
+            "notes_strategy": strategy,
             "notes_config": notes_config or {},
         },
+        progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
     )
     article_frontmatter["notes_file"] = notes_file.name
     if article_frontmatter.get("doc_id"):
@@ -1195,15 +1288,76 @@ def _generate_existing_notes(article_path: Path, notes_config: dict | None = Non
     return payload
 
 
-def _spawn_async_notes_generation(article_path: Path, notes_config: dict | None = None) -> None:
+def _spawn_async_notes_generation(
+    article_path: Path,
+    notes_config: dict | None = None,
+    strategy: str = "replace",
+    existing_notes_override: str | None = None,
+) -> None:
     """Kick off companion-notes generation in a background thread."""
     _mark_notes_generation_pending(article_path)
 
     def _run():
+        last_emit = 0.0
+
+        def on_progress(markdown: str) -> None:
+            nonlocal last_emit
+            now = time.monotonic()
+            if now - last_emit < 0.25 and len(markdown) < 240:
+                return
+            last_emit = now
+            _write_notes_generation_status(
+                article_path,
+                state="running",
+                notes_markdown=markdown,
+                preview_available=False,
+                can_stop=True,
+                message="LLM working…",
+                notes_path=None,
+            )
+
         try:
-            _generate_existing_notes(article_path, notes_config)
+            payload = _generate_existing_notes(
+                article_path,
+                notes_config,
+                strategy=strategy,
+                existing_notes_override=existing_notes_override,
+                progress_callback=on_progress,
+                cancel_requested=lambda: _notes_generation_cancel_requested(article_path),
+            )
+            notes_markdown = _read_markdown_body(Path(payload["notes"])) if payload.get("notes") else ""
+            _write_notes_generation_status(
+                article_path,
+                state="completed",
+                notes_markdown=notes_markdown,
+                preview_available=True,
+                can_stop=False,
+                message="Working notes ready.",
+                notes_path=payload.get("notes"),
+            )
         except Exception:
-            app.logger.exception("Async notes generation failed for %s", article_path)
+            if _notes_generation_cancel_requested(article_path):
+                _write_notes_generation_status(
+                    article_path,
+                    state="cancelled",
+                    notes_markdown=_read_notes_generation_status(article_path).get("notesMarkdown", ""),
+                    preview_available=False,
+                    can_stop=False,
+                    message="LLM generation stopped.",
+                    notes_path=None,
+                )
+            else:
+                app.logger.exception("Async notes generation failed for %s", article_path)
+                _write_notes_generation_status(
+                    article_path,
+                    state="error",
+                    notes_markdown=_read_notes_generation_status(article_path).get("notesMarkdown", ""),
+                    preview_available=False,
+                    can_stop=False,
+                    message="LLM generation failed.",
+                    notes_path=None,
+                    error="Notes generation failed",
+                )
         finally:
             _clear_notes_generation_pending(article_path)
 
@@ -2100,29 +2254,74 @@ def desktop_save_notes():
     return jsonify(success=True, notesPath=str(notes_path), notesMarkdown=notes_markdown, notesPending=False)
 
 
+@app.route("/desktop/document", methods=["POST"])
+def desktop_save_document():
+    data = request.get_json(silent=True) or {}
+    article_path = Path((data.get("articlePath") or "").strip())
+    markdown = data.get("markdown") or ""
+    if not article_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+
+    article_text = article_path.read_text(encoding="utf-8")
+    article_frontmatter, _article_body = _split_frontmatter(article_text)
+    _write_article_frontmatter(article_path, article_frontmatter, markdown)
+
+    payload = _build_existing_article_payload(article_path)
+    _upsert_index_records(_build_index_records(payload, payload["label"]))
+    return jsonify(success=True, articlePath=str(article_path), markdown=markdown)
+
+
 @app.route("/desktop/notes/generate", methods=["POST"])
 def desktop_generate_notes():
+    data = request.get_json(silent=True) or {}
+    article_path = Path((data.get("articlePath") or "").strip())
+    strategy = str(data.get("strategy") or "replace").strip().lower()
+    existing_notes = data.get("existingNotes")
+    if existing_notes is not None:
+        existing_notes = str(existing_notes)
+    if not article_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+    if strategy not in {"replace", "append", "fuse"}:
+        return jsonify(success=False, message=f"Unsupported notes strategy: {strategy}"), 400
+    if not _notes_generation_pending(article_path):
+        _spawn_async_notes_generation(article_path, strategy=strategy, existing_notes_override=existing_notes)
+    status = _read_notes_generation_status(article_path)
+    return jsonify(success=True, started=True, **status)
+
+
+@app.route("/desktop/notes/status", methods=["GET"])
+def desktop_notes_status():
+    article_path = Path((request.args.get("articlePath") or "").strip())
+    if not article_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+    return jsonify(success=True, **_read_notes_generation_status(article_path))
+
+
+@app.route("/desktop/notes/cancel", methods=["POST"])
+def desktop_cancel_notes():
     data = request.get_json(silent=True) or {}
     article_path = Path((data.get("articlePath") or "").strip())
     if not article_path:
         return jsonify(success=False, message="Missing articlePath"), 400
     if not article_path.exists():
         return jsonify(success=False, message=f"Document not found: {article_path}"), 404
-
-    try:
-        payload = _generate_existing_notes(article_path)
-    except Exception as error:
-        return jsonify(success=False, message=str(error)), 500
-    _clear_notes_generation_pending(article_path)
-
-    notes_markdown = _read_markdown_body(Path(payload["notes"])) if payload.get("notes") else ""
-    return jsonify(
-        success=True,
-        notesPath=payload.get("notes"),
-        notesMarkdown=notes_markdown,
-        notesDocId=payload.get("notesDocId"),
-        notesPending=False,
+    _cancel_notes_generation(article_path)
+    _write_notes_generation_status(
+        article_path,
+        state="cancelling",
+        notes_markdown=_read_notes_generation_status(article_path).get("notesMarkdown", ""),
+        preview_available=False,
+        can_stop=False,
+        message="Stopping LLM…",
+        notes_path=None,
     )
+    return jsonify(success=True, state="cancelling")
 
 
 @app.route("/desktop/notes/render", methods=["POST"])
