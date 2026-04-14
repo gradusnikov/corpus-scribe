@@ -2097,9 +2097,20 @@ def _generate_companion_notes(
     article_dir: Path,
     article_basename: str,
     metadata: dict,
+    progress_callback=None,
+    cancel_requested=None,
 ) -> Path:
     notes_client = _resolve_notes_client_config(metadata.get("notes_config") or {})
-    notes_body = _generate_companion_notes_body_with_config(md_text, notes_client)
+    existing_notes = str(metadata.get("existing_notes") or "")
+    notes_strategy = str(metadata.get("notes_strategy") or "replace")
+    notes_body = _generate_companion_notes_body_with_config(
+        md_text,
+        notes_client,
+        existing_notes=existing_notes,
+        strategy=notes_strategy,
+        progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
+    )
     notes_frontmatter = _build_frontmatter(
         {
             "title": f"{metadata['title']} Notes",
@@ -2159,9 +2170,18 @@ def _resolve_notes_client_config(overrides: dict) -> dict:
     return config
 
 
-def _generate_companion_notes_body_with_config(md_text: str, notes_client: dict) -> str:
+def _generate_companion_notes_body_with_config(
+    md_text: str,
+    notes_client: dict,
+    existing_notes: str = "",
+    strategy: str = "replace",
+    progress_callback=None,
+    cancel_requested=None,
+) -> str:
     md_text = _strip_reference_sections_for_notes(md_text)
-    prompt = (
+    strategy = (strategy or "replace").strip().lower()
+    existing_notes = existing_notes.strip()
+    base_prompt = (
         "Read the article markdown inside <article_markdown>. "
         "Write extractive companion notes in markdown only, with these sections exactly in this order:\n"
         "# Notes\n"
@@ -2185,21 +2205,54 @@ def _generate_companion_notes_body_with_config(md_text: str, notes_client: dict)
         "- If a section has no relevant content, write a single bullet: `- None.`\n"
         "- Do not include YAML frontmatter.\n"
         "- Do not wrap the answer in code fences.\n\n"
-        f"<article_markdown>\n{md_text[:30000]}\n</article_markdown>"
     )
+    prompt = base_prompt + f"<article_markdown>\n{md_text[:30000]}\n</article_markdown>"
+    progress_handler = progress_callback
+
+    if strategy == "append" and existing_notes:
+        prefix = existing_notes.rstrip() + "\n\n---\n\n"
+        if progress_callback:
+            def progress_handler(markdown: str) -> None:
+                progress_callback(prefix + markdown)
+    elif strategy == "fuse" and existing_notes:
+        prompt = (
+            base_prompt
+            + "You are also given <existing_notes>. Fuse the existing notes with the article into one improved notes document.\n"
+              "Preserve useful faithful content from the existing notes, remove redundancy, and keep the exact required section order.\n\n"
+            + f"<existing_notes>\n{existing_notes[:20000]}\n</existing_notes>\n\n"
+            + f"<article_markdown>\n{md_text[:30000]}\n</article_markdown>"
+        )
+
     if notes_client["provider"] in {"openai_compatible", "openai"}:
-        content = _generate_notes_via_openai_compatible(prompt, notes_client)
+        content = _generate_notes_via_openai_compatible(
+            prompt,
+            notes_client,
+            progress_callback=progress_handler,
+            cancel_requested=cancel_requested,
+        )
     else:
-        content = _generate_notes_via_anthropic(prompt, notes_client)
+        content = _generate_notes_via_anthropic(
+            prompt,
+            notes_client,
+            progress_callback=progress_handler,
+            cancel_requested=cancel_requested,
+        )
 
     content = re.sub(r"^```(?:markdown)?\s*", "", content)
     content = re.sub(r"\s*```$", "", content)
     if not content:
         raise RuntimeError("Local notes model returned empty content")
+    if strategy == "append" and existing_notes:
+        return existing_notes.rstrip() + "\n\n---\n\n" + content
     return content
 
 
-def _generate_notes_via_openai_compatible(prompt: str, notes_client: dict) -> str:
+def _generate_notes_via_openai_compatible(
+    prompt: str,
+    notes_client: dict,
+    progress_callback=None,
+    cancel_requested=None,
+) -> str:
     headers = {"Content-Type": "application/json"}
     if notes_client.get("api_key"):
         headers["Authorization"] = f"Bearer {notes_client['api_key']}"
@@ -2218,15 +2271,47 @@ def _generate_notes_via_openai_compatible(prompt: str, notes_client: dict) -> st
             ],
             "max_tokens": 1400,
             "temperature": 0.0,
+            "stream": True,
         },
         timeout=notes_client["timeout"],
+        stream=True,
     )
     response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    parts: list[str] = []
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if cancel_requested and cancel_requested():
+                response.close()
+                raise RuntimeError("Notes generation cancelled")
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            delta = _openai_stream_delta_text(data)
+            if not delta:
+                continue
+            parts.append(delta)
+            if progress_callback:
+                progress_callback("".join(parts))
+    finally:
+        response.close()
+    return "".join(parts).strip()
 
 
-def _generate_notes_via_anthropic(prompt: str, notes_client: dict) -> str:
+def _generate_notes_via_anthropic(
+    prompt: str,
+    notes_client: dict,
+    progress_callback=None,
+    cancel_requested=None,
+) -> str:
     if not notes_client.get("api_key"):
         raise RuntimeError("Anthropic notes provider requires api_key")
 
@@ -2243,14 +2328,69 @@ def _generate_notes_via_anthropic(prompt: str, notes_client: dict) -> str:
             "temperature": 0.0,
             "system": "You are a precise research note generator. Output markdown only.",
             "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
         },
         timeout=notes_client["timeout"],
+        stream=True,
     )
     response.raise_for_status()
-    data = response.json()
-    parts = data.get("content", [])
-    text_parts = [part.get("text", "") for part in parts if part.get("type") == "text"]
-    return "\n".join(text_parts).strip()
+    parts: list[str] = []
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if cancel_requested and cancel_requested():
+                response.close()
+                raise RuntimeError("Notes generation cancelled")
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            delta = _anthropic_stream_delta_text(data)
+            if not delta:
+                continue
+            parts.append(delta)
+            if progress_callback:
+                progress_callback("".join(parts))
+    finally:
+        response.close()
+    return "".join(parts).strip()
+
+
+def _openai_stream_delta_text(data: dict) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        fragments: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                fragments.append(item["text"])
+        return "".join(fragments)
+    return ""
+
+
+def _anthropic_stream_delta_text(data: dict) -> str:
+    payload_type = data.get("type")
+    if payload_type == "content_block_delta":
+        delta = data.get("delta") or {}
+        if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+            return delta["text"]
+    if payload_type == "content_block_start":
+        block = data.get("content_block") or {}
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            return block["text"]
+    return ""
 
 
 def _fetch_and_inject_mathml(soup: BeautifulSoup, url: str,
@@ -2389,20 +2529,56 @@ def _normalize_display_formula_tables(soup: BeautifulSoup) -> None:
 
 
 def _normalize_latexml_equation_tables(soup: BeautifulSoup) -> None:
-    """Unwrap arXiv/LaTeXML equation tables into plain MathML blocks."""
+    """Unwrap arXiv/LaTeXML equation tables into plain display equations."""
     for table in list(soup.find_all("table")):
         classes = set(table.get("class", []))
         if "ltx_eqn_table" not in classes and "ltx_equation" not in classes:
             continue
 
-        math_node = table.find("math")
-        if not math_node:
-            continue
+        replacements = []
+        row_groups = table.find_all("tbody", recursive=False) or [table]
 
-        extracted = math_node.extract()
-        if getattr(extracted, "name", None) == "math":
-            extracted["display"] = "block"
-        _replace_with_sequence(table, [extracted])
+        for row_group in row_groups:
+            row = row_group.find("tr")
+            if not row:
+                continue
+
+            math_tags = row.find_all("math")
+            if not math_tags:
+                continue
+
+            tex_parts = []
+            for math_tag in math_tags:
+                tex = _tex_from_math_tag(math_tag)
+                if not tex:
+                    continue
+                tex = tex.strip()
+                tex = re.sub(r"^\\displaystyle\s*", "", tex)
+                if tex:
+                    tex_parts.append(tex)
+
+            if not tex_parts:
+                continue
+
+            combined_tex = " ".join(tex_parts).strip()
+            if not combined_tex:
+                continue
+
+            math_node = soup.new_tag("math")
+            math_node["display"] = "block"
+            row_id = row_group.get("id") or row.get("id") or table.get("id")
+            if row_id:
+                math_node["id"] = row_id
+            semantics = soup.new_tag("semantics")
+            annotation = soup.new_tag("annotation", attrs={"encoding": "application/x-tex"})
+            annotation.append(NavigableString(combined_tex))
+            semantics.append(annotation)
+            math_node.append(semantics)
+            replacements.append(math_node)
+
+        if not replacements:
+            continue
+        _replace_with_sequence(table, replacements)
 
 
 def _normalize_labeled_formula_blocks(soup: BeautifulSoup) -> None:
@@ -2505,6 +2681,9 @@ def _cleanup_latex(latex: str) -> str:
     import unicodedata
 
     latex = unicodedata.normalize("NFKC", latex)
+    # Drop TeX line-continuation comments introduced by HTML/MathML converters.
+    # These show up as `\Big%\n{(}` or `\rightarrow%\n\mathbb{R}` and break KaTeX.
+    latex = re.sub(r"(?<!\\)%[ \t]*(?:\r?\n)[ \t]*", "", latex)
 
     # Fix broken \left(\right. ... \left.\right) pairs → plain ( ... )
     latex = latex.replace(r"\left(\right.", "(")
@@ -2535,7 +2714,7 @@ def _cleanup_latex(latex: str) -> str:
     latex = re.sub(r"\\{3,}", r"\\\\", latex)
     # Collapse excessive whitespace
     latex = re.sub(r"  +", " ", latex)
-    latex = _normalize_tex_delimiters(latex)
+    latex = _normalize_katex_compatible_tex(latex)
     return latex.strip()
 
 
@@ -2638,6 +2817,7 @@ def _should_render_math_as_display(math_tag, tex: str) -> bool:
 
 def _restore_tex_placeholders(text: str, replacements: dict[str, tuple[str, bool]], target: str) -> str:
     """Restore placeholder math markers into markdown or LaTeX output."""
+    text = _merge_adjacent_display_tex_placeholders(text, replacements)
     for placeholder, (tex, display) in replacements.items():
         while placeholder in text:
             idx = text.find(placeholder)
@@ -2656,6 +2836,51 @@ def _restore_tex_placeholders(text: str, replacements: dict[str, tuple[str, bool
                 rendered = _surround_restored_markdown_math(rendered, display, before, after)
 
             text = text[:idx] + rendered + text[after_idx:]
+
+    return text
+
+
+def _merge_adjacent_display_tex_placeholders(
+    text: str,
+    replacements: dict[str, tuple[str, bool]],
+) -> str:
+    """Merge consecutive display-math placeholders into one renderable block.
+
+    Some HTML sources, especially arXiv/LaTeXML, emit one visual equation as a
+    run of adjacent display-math fragments with no prose between them. If we
+    restore each fragment independently, the markdown ends up as
+    `$$ ... $$ $$ ... $$`, which KaTeX cannot render as a single equation.
+    """
+    pattern = re.compile(r"(SCRIBE_TEX_\d+)(\s*)(SCRIBE_TEX_\d+)")
+
+    def join_tex(left: str, right: str) -> str:
+        left = left.rstrip()
+        right = right.lstrip()
+        if not left:
+            return right
+        if not right:
+            return left
+        return f"{left}\n{right}"
+
+    changed = True
+    while changed:
+        changed = False
+
+        def replace(match: re.Match) -> str:
+            nonlocal changed
+            left_key, _, right_key = match.groups()
+            left = replacements.get(left_key)
+            right = replacements.get(right_key)
+            if not left or not right:
+                return match.group(0)
+            if not left[1] or not right[1]:
+                return match.group(0)
+            replacements[left_key] = (join_tex(left[0], right[0]), True)
+            replacements.pop(right_key, None)
+            changed = True
+            return left_key
+
+        text = pattern.sub(replace, text)
 
     return text
 
@@ -3305,8 +3530,13 @@ def _unwrap_trivial_matrix_displays(markdown_text: str) -> str:
     return pattern.sub(replace, markdown_text)
 
 
-def _normalize_tex_delimiters(markdown_text: str) -> str:
-    """Normalize bracket/brace control words into KaTeX-friendly delimiters."""
+def _normalize_katex_compatible_tex(text: str) -> str:
+    """Normalize converter-produced TeX into forms KaTeX can parse reliably.
+
+    This is the main compatibility pass for TeX emitted by MathML/HTML
+    converters. It intentionally fixes recurring syntax that is accepted by
+    upstream converters but rejected by KaTeX, such as `\\Big{(}`.
+    """
     replacements = {
         r"\left\lbrack": r"\left[",
         r"\right\rbrack": r"\right]",
@@ -3318,8 +3548,18 @@ def _normalize_tex_delimiters(markdown_text: str) -> str:
         r"\rbrace": r"\}",
     }
     for source, target in replacements.items():
-        markdown_text = markdown_text.replace(source, target)
-    return markdown_text
+        text = text.replace(source, target)
+    text = re.sub(
+        r"\\(big|Big|bigg|Bigg)(l|r)?\{\s*(\\[\{\}]|[()\[\]])\s*\}",
+        lambda match: f"\\{match.group(1)}{match.group(2) or ''}{match.group(3)}",
+        text,
+    )
+    return text
+
+
+def _normalize_tex_delimiters(markdown_text: str) -> str:
+    """Backwards-compatible wrapper around KaTeX-oriented TeX normalization."""
+    return _normalize_katex_compatible_tex(markdown_text)
 
 
 def _normalize_inline_display_math_environments(markdown_text: str) -> str:
@@ -3609,6 +3849,29 @@ def _normalize_tables_for_markdown(soup: BeautifulSoup) -> None:
         text = cell.get_text(" ", strip=True)
         if cell.find("hr") or (text and set(text) <= {"-", "=", " "}):
             row.decompose()
+
+
+def _extract_single_image_from_table(table):
+    """Return the image from a table that is only being used as layout."""
+    images = table.find_all("img")
+    if len(images) != 1:
+        return None
+
+    image = images[0]
+    for child in table.descendants:
+        if child is image:
+            continue
+        if isinstance(child, NavigableString):
+            if str(child).strip():
+                return None
+            continue
+        if not getattr(child, "name", None):
+            continue
+        if child.name in {"table", "tbody", "tr", "td", "img"}:
+            continue
+        if child.get_text(" ", strip=True):
+            return None
+    return image
 
 
 def _node_has_substantive_content(node) -> bool:
@@ -3999,7 +4262,11 @@ def _normalize_figures_for_markdown(soup: BeautifulSoup) -> None:
         tables = list(figure.find_all("table"))
         if tables:
             for table in tables:
-                replacements.append(table.extract())
+                table_image = _extract_single_image_from_table(table)
+                if table_image:
+                    replacements.append(table_image.extract())
+                else:
+                    replacements.append(table.extract())
         else:
             img = _standalone_block_image(figure)
             if img:

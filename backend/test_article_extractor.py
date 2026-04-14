@@ -25,6 +25,8 @@ from article_extractor import (
     _generate_notes_via_anthropic,
     _generate_notes_via_openai_compatible,
     _normalize_code_listing_tables,
+    _normalize_katex_compatible_tex,
+    _normalize_latexml_equation_tables,
     _postprocess_markdown,
     _postprocess_markdown_before_math_restore,
     _postprocess_mistral_markdown,
@@ -419,6 +421,63 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
         self.assertIn("$$e = f$$", cleaned)
         self.assertNotIn("$$a = b^2$$ with", cleaned)
 
+    def test_prepare_html_for_markdown_unwraps_single_image_latexml_figure_tables(self):
+        soup = BeautifulSoup(
+            """
+            <article>
+              <figure class="ltx_figure">
+                <table class="ltx_tabular">
+                  <tbody><tr><td><img src="x1.png" alt="Refer to caption" /></td></tr></tbody>
+                </table>
+                <figcaption>Figure 1: Model overview.</figcaption>
+              </figure>
+            </article>
+            """,
+            "html.parser",
+        )
+
+        _prepare_html_for_markdown(soup)
+        html = str(soup)
+
+        self.assertIn('<img alt="Refer to caption" src="x1.png"/>', html)
+        self.assertIn("Figure 1: Model overview.", html)
+        self.assertNotIn("<table", html)
+
+    def test_normalize_latexml_equation_tables_preserves_full_row_tex(self):
+        soup = BeautifulSoup(
+            """
+            <article>
+              <table class="ltx_equationgroup ltx_eqn_align ltx_eqn_table">
+                <tbody id="S3.E1">
+                  <tr class="ltx_equation ltx_eqn_row ltx_align_baseline">
+                    <td class="ltx_td ltx_align_right ltx_eqn_cell">
+                      <math><semantics><mi>z</mi><annotation encoding="application/x-tex">\\displaystyle\\mathbf{z}_{0}</annotation></semantics></math>
+                    </td>
+                    <td class="ltx_td ltx_align_left ltx_eqn_cell">
+                      <math><semantics><mi>=</mi><annotation encoding="application/x-tex">\\displaystyle=[\\mathbf{x}]+\\mathbf{E}_{pos},</annotation></semantics></math>
+                    </td>
+                    <td class="ltx_td ltx_align_left ltx_eqn_cell">
+                      <math><semantics><mi>E</mi><annotation encoding="application/x-tex">\\displaystyle\\mathbf{E}\\in\\mathbb{R}^{D}</annotation></semantics></math>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </article>
+            """,
+            "html.parser",
+        )
+
+        _normalize_latexml_equation_tables(soup)
+        placeholders = _replace_problem_math_with_tex_placeholders(soup)
+
+        self.assertEqual(len(placeholders), 1)
+        tex, is_display = placeholders["SCRIBE_TEX_0001"]
+        self.assertEqual(
+            tex,
+            "\\mathbf{z}_{0} = [\\mathbf{x}]+\\mathbf{E}_{pos}, \\mathbf{E}\\in\\mathbb{R}^{D}",
+        )
+        self.assertTrue(is_display)
+
     def test_pdf_markdown_postprocess_normalizes_ocr_latex_and_entities(self):
         text = (
             "At timestep  $t$ , draw  $k _ {\\mathrm {i n i t}}$ . "
@@ -664,6 +723,22 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
         self.assertIn("\\begin{aligned}", restored)
         self.assertIn("\n$$\n\nwhere λ is fixed.", restored)
 
+    def test_restore_tex_placeholders_merges_adjacent_display_fragments(self):
+        markdown = "Based on these patches:\n\nSCRIBE_TEX_0001SCRIBE_TEX_0002\n\nwhere x is fixed."
+        replacements = {
+            "SCRIBE_TEX_0001": (r"\mathcal{S}(I_F, I_M \circ T_\theta) =", True),
+            "SCRIBE_TEX_0002": (r"\frac{1}{NC}\sum_{i=1}^{N} x_i", True),
+        }
+
+        restored = _restore_tex_placeholders(markdown, replacements, target="markdown")
+
+        self.assertIn(
+            "$$\n\\mathcal{S}(I_F, I_M \\circ T_\\theta) =\n\\frac{1}{NC}\\sum_{i=1}^{N} x_i\n$$",
+            restored,
+        )
+        self.assertNotIn("$$\n\\mathcal{S}(I_F, I_M \\circ T_\\theta) =\n$$", restored)
+        self.assertNotIn("$$\n\\frac{1}{NC}\\sum_{i=1}^{N} x_i\n$$", restored)
+
     def test_cleanup_latex_normalizes_invalid_norm_delimiters(self):
         source = r"\left∥E \rho - b\right∥_{2}^{2} + \left{x\right}"
 
@@ -671,6 +746,22 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
 
         self.assertIn(r"\left\lVert E \rho - b\right\rVert _{2}^{2}", cleaned)
         self.assertIn(r"\left\{x\right\}", cleaned)
+
+    def test_cleanup_latex_removes_line_continuation_comment_artifacts(self):
+        source = "\\mathcal{D}\\Big%\n{(}x,y\\Big{)} + A\\rightarrow%\n\\mathbb{R}^{C}"
+
+        cleaned = _cleanup_latex(source)
+
+        self.assertNotIn("%", cleaned)
+        self.assertIn(r"\mathcal{D}\Big(x,y\Big)", cleaned)
+        self.assertIn(r"A\rightarrow\mathbb{R}^{C}", cleaned)
+
+    def test_normalize_katex_compatible_tex_rewrites_sized_braced_delimiters(self):
+        source = r"\Big{(}x+y\Big{)} + \bigl{[}z\biggr{]}"
+
+        cleaned = _normalize_katex_compatible_tex(source)
+
+        self.assertEqual(cleaned, r"\Big(x+y\Big) + \bigl[z\biggr]")
 
     def test_html_markdown_pipeline_restores_math_as_last_step(self):
         markdown = (
