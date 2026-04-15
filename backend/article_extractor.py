@@ -16,7 +16,7 @@ import tarfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import pypandoc
 import requests
@@ -55,12 +55,14 @@ def _make_session(cookies: dict | None = None) -> requests.Session:
 
 
 _PAGE_SIZES = {
-    "a4": {"papersize": "a4", "max_img_width": 670},   # 210mm - 2×10mm = 190mm ≈ 670px
-    "a5": {"papersize": "a5", "max_img_width": 484},   # 148mm - 2×10mm = 128mm ≈ 484px
+    "a4": {"papersize": "a4", "max_img_width": 670},  # 210mm - 2×10mm = 190mm ≈ 670px
+    "a5": {"papersize": "a5", "max_img_width": 484},  # 148mm - 2×10mm = 128mm ≈ 484px
 }
 _MAX_OUTPUT_NAME_LEN = 96
 _DEFAULT_NOTES_PROVIDER = os.environ.get("NOTES_LLM_PROVIDER", "anthropic")
-_DEFAULT_NOTES_BASE_URL = os.environ.get("NOTES_LLM_BASE_URL", "http://172.24.208.1:1234/v1")
+_DEFAULT_NOTES_BASE_URL = os.environ.get(
+    "NOTES_LLM_BASE_URL", "http://172.24.208.1:1234/v1"
+)
 _DEFAULT_NOTES_MODEL = os.environ.get("NOTES_LLM_MODEL", "claude-sonnet-4-20250514")
 _DEFAULT_NOTES_API_KEY = os.environ.get("NOTES_LLM_API_KEY", "")
 _DEFAULT_NOTES_TIMEOUT = int(os.environ.get("NOTES_LLM_TIMEOUT", "120"))
@@ -68,6 +70,32 @@ _DEFAULT_ANTHROPIC_VERSION = os.environ.get("NOTES_ANTHROPIC_VERSION", "2023-06-
 _DEFAULT_MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 _DEFAULT_MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai")
 _DEFAULT_MISTRAL_OCR_MODEL = os.environ.get("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+
+
+def _resolve_document_relative_url(base_url: str, target: str) -> str:
+    """Resolve publisher asset URLs relative to the current document path.
+
+    Some article pages, notably arXiv HTML, reference assets like
+    `extracted/.../figure.png` relative to the current document URL. Python's
+    plain `urljoin()` treats a base such as `/html/2503.24121v3` as a file, so
+    `urljoin(base, "extracted/...")` incorrectly collapses to `/html/extracted/...`.
+    We treat non-slash-prefixed targets as document-relative by adding a virtual
+    trailing slash to the base path first.
+    """
+    if not base_url or not target:
+        return target
+    if target.startswith(("http://", "https://", "data:")):
+        return target
+    if target.startswith("//"):
+        return "https:" + target
+    if target.startswith(("/", "#", "?")):
+        return urljoin(base_url, target)
+    parts = urlsplit(base_url)
+    base_path = parts.path or "/"
+    if not base_path.endswith("/"):
+        base_path += "/"
+    normalized_base = urlunsplit((parts.scheme, parts.netloc, base_path, "", ""))
+    return urljoin(normalized_base, target)
 
 
 def _safe_output_name(title: str) -> str:
@@ -86,7 +114,20 @@ def _safe_output_name(title: str) -> str:
     return f"{head}-{digest}"
 
 
-def _ensure_article_dir(output_dir: str | Path, safe_name: str, uniqueness_basis: str) -> Path:
+def _safe_asset_name(name: str) -> str:
+    """Build a filesystem-safe asset name without spaces."""
+    from pathvalidate import sanitize_filename
+
+    path = Path(name)
+    ascii_name = path.stem.encode("ascii", "ignore").decode("ascii").strip()
+    safe_name = sanitize_filename(ascii_name) or str(uuid.uuid4())
+    safe_name = "_".join(safe_name.split())
+    return f"{safe_name}{path.suffix}"
+
+
+def _ensure_article_dir(
+    output_dir: str | Path, safe_name: str, uniqueness_basis: str
+) -> Path:
     base_dir = Path(output_dir)
     article_dir = base_dir / safe_name
     if article_dir.exists() and not article_dir.is_dir():
@@ -96,10 +137,18 @@ def _ensure_article_dir(output_dir: str | Path, safe_name: str, uniqueness_basis
     return article_dir
 
 
-def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = None,
-                    url: str = "", page_size: str = "a5", label: str = "",
-                    render_pdf: bool = True, pdf_required: bool = True,
-                    generate_notes: bool = False, notes_config: dict | None = None) -> dict:
+def extract_article(
+    html: str,
+    output_dir: str = "/tmp",
+    cookies: dict | None = None,
+    url: str = "",
+    page_size: str = "a5",
+    label: str = "",
+    render_pdf: bool = True,
+    pdf_required: bool = True,
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+) -> dict:
     """Extract article from raw HTML into output_dir/{safe_title}/.
 
     Returns dict with title, dir, file-path (pdf, optional), md-path, md-text.
@@ -128,7 +177,9 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
     # Build per-article output directory with bounded path length so
     # Windows apps opening files via \\wsl$ can still resolve assets.
     safe_name = _safe_output_name(title)
-    article_dir = _ensure_article_dir(output_dir, safe_name, meta.get("canonical_url") or meta.get("url") or title)
+    article_dir = _ensure_article_dir(
+        output_dir, safe_name, meta.get("canonical_url") or meta.get("url") or title
+    )
     assets_dir = article_dir / "assets"
     if assets_dir.exists():
         shutil.rmtree(assets_dir)
@@ -173,7 +224,7 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
         if not src:
             continue
         # Resolve relative URLs
-        abs_src = urljoin(url, src) if url else src
+        abs_src = _resolve_document_relative_url(url, src) if url else src
         local_path = _download_image(abs_src, assets_dir, session)
         if local_path:
             img["src"] = str(local_path)
@@ -221,7 +272,9 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
 
     ingested_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     clean_text = md_soup.get_text(" ", strip=True)
-    article_doc_id = _stable_doc_id(meta["title"], meta.get("canonical_url") or meta.get("url"))
+    article_doc_id = _stable_doc_id(
+        meta["title"], meta.get("canonical_url") or meta.get("url")
+    )
     article_fields = {
         "title": meta["title"],
         "doc_id": article_doc_id,
@@ -258,7 +311,9 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
     md_file = article_dir / f"{safe_name}.md"
     md_text = _build_frontmatter(article_fields) + "\n\n" + md_body
     md_file.write_text(md_text, encoding="utf-8")
-    bib_file = _write_bibliography_file(article_dir, safe_name, citation_metadata["bibtex"])
+    bib_file = _write_bibliography_file(
+        article_dir, safe_name, citation_metadata["bibtex"]
+    )
     article_fields["bib_file"] = bib_file.name
     md_text = _build_frontmatter(article_fields) + "\n\n" + md_body
     md_file.write_text(md_text, encoding="utf-8")
@@ -323,7 +378,9 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
         except Exception:
             if pdf_required:
                 raise
-            log.exception("PDF generation failed for %s; markdown was still saved", title)
+            log.exception(
+                "PDF generation failed for %s; markdown was still saved", title
+            )
 
     return {
         "title": title,
@@ -342,16 +399,33 @@ def extract_article(html: str, output_dir: str = "/tmp", cookies: dict | None = 
 
 _SOURCE_FAMILY_PATTERNS = (
     ("arxiv", re.compile(r"(?:^|://)(?:[^/]+\.)?arxiv\.org/", re.IGNORECASE)),
-    ("pmc", re.compile(r"(?:^|://)(?:[^/]+\.)?pmc\.ncbi\.nlm\.nih\.gov/", re.IGNORECASE)),
-    ("pubmed", re.compile(r"(?:^|://)(?:[^/]+\.)?pubmed\.ncbi\.nlm\.nih\.gov/", re.IGNORECASE)),
-    ("sciencedirect", re.compile(r"(?:^|://)(?:[^/]+\.)?sciencedirect\.com/", re.IGNORECASE)),
+    (
+        "pmc",
+        re.compile(r"(?:^|://)(?:[^/]+\.)?pmc\.ncbi\.nlm\.nih\.gov/", re.IGNORECASE),
+    ),
+    (
+        "pubmed",
+        re.compile(r"(?:^|://)(?:[^/]+\.)?pubmed\.ncbi\.nlm\.nih\.gov/", re.IGNORECASE),
+    ),
+    (
+        "sciencedirect",
+        re.compile(r"(?:^|://)(?:[^/]+\.)?sciencedirect\.com/", re.IGNORECASE),
+    ),
 )
 
 
-def extract_url(html: str, output_dir: str = "/tmp", cookies: dict | None = None,
-                url: str = "", page_size: str = "a5", label: str = "",
-                render_pdf: bool = True, pdf_required: bool = True,
-                generate_notes: bool = False, notes_config: dict | None = None) -> dict:
+def extract_url(
+    html: str,
+    output_dir: str = "/tmp",
+    cookies: dict | None = None,
+    url: str = "",
+    page_size: str = "a5",
+    label: str = "",
+    render_pdf: bool = True,
+    pdf_required: bool = True,
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+) -> dict:
     """Extract a URL using the best available source-family adapter."""
     family = _detect_source_family(url, html)
     if family == "arxiv":
@@ -381,10 +455,17 @@ def extract_url(html: str, output_dir: str = "/tmp", cookies: dict | None = None
     )
 
 
-def extract_pdf_url(url: str, output_dir: str = "/tmp", cookies: dict | None = None,
-                    source_name: str = "", label: str = "", page_size: str = "a5",
-                    generate_notes: bool = False, notes_config: dict | None = None,
-                    render_pdf: bool = False) -> dict:
+def extract_pdf_url(
+    url: str,
+    output_dir: str = "/tmp",
+    cookies: dict | None = None,
+    source_name: str = "",
+    label: str = "",
+    page_size: str = "a5",
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+    render_pdf: bool = False,
+) -> dict:
     """Download a source PDF and extract it into markdown-first local output."""
     session = _make_session(cookies)
     response = session.get(url, timeout=120)
@@ -425,7 +506,9 @@ def _extract_arxiv_like_canonical_url(html_text: str) -> str | None:
         soup = BeautifulSoup(html_text, "html.parser")
     except Exception:
         return None
-    canonical = soup.find("link", attrs={"rel": lambda value: value and "canonical" in value})
+    canonical = soup.find(
+        "link", attrs={"rel": lambda value: value and "canonical" in value}
+    )
     if canonical and canonical.get("href"):
         return canonical["href"].strip()
     og_url = soup.find("meta", attrs={"property": "og:url"})
@@ -434,12 +517,22 @@ def _extract_arxiv_like_canonical_url(html_text: str) -> str | None:
     return None
 
 
-def _extract_arxiv_url(html: str, output_dir: str = "/tmp", cookies: dict | None = None,
-                       url: str = "", page_size: str = "a5", label: str = "",
-                       render_pdf: bool = True, pdf_required: bool = True,
-                       generate_notes: bool = False, notes_config: dict | None = None) -> dict:
+def _extract_arxiv_url(
+    html: str,
+    output_dir: str = "/tmp",
+    cookies: dict | None = None,
+    url: str = "",
+    page_size: str = "a5",
+    label: str = "",
+    render_pdf: bool = True,
+    pdf_required: bool = True,
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+) -> dict:
     """Prefer scraped arXiv HTML, then fall back to PDF."""
-    arxiv_id = _extract_arxiv_id(url) or _extract_arxiv_id(_extract_arxiv_like_canonical_url(html))
+    arxiv_id = _extract_arxiv_id(url) or _extract_arxiv_id(
+        _extract_arxiv_like_canonical_url(html)
+    )
     if not arxiv_id:
         return extract_article(
             html=html,
@@ -511,14 +604,18 @@ def _extract_arxiv_url(html: str, output_dir: str = "/tmp", cookies: dict | None
     return pdf_result
 
 
-def _discover_arxiv_html_url(session: requests.Session, arxiv_id: str, page_html: str | None, abs_url: str) -> str | None:
+def _discover_arxiv_html_url(
+    session: requests.Session, arxiv_id: str, page_html: str | None, abs_url: str
+) -> str | None:
     candidates: list[str] = []
     if page_html:
         try:
             soup = BeautifulSoup(page_html, "html.parser")
             html_link = soup.find("a", href=re.compile(r"/html/"))
             if html_link and html_link.get("href"):
-                candidates.append(urljoin(abs_url, html_link["href"]))
+                candidates.append(
+                    _resolve_document_relative_url(abs_url, html_link["href"])
+                )
         except Exception:
             pass
 
@@ -529,7 +626,9 @@ def _discover_arxiv_html_url(session: requests.Session, arxiv_id: str, page_html
             soup = BeautifulSoup(response.text, "html.parser")
             html_link = soup.find("a", href=re.compile(r"/html/"))
             if html_link and html_link.get("href"):
-                candidates.append(urljoin(abs_url, html_link["href"]))
+                candidates.append(
+                    _resolve_document_relative_url(abs_url, html_link["href"])
+                )
         except Exception:
             log.exception("Failed to discover arXiv HTML URL for %s", arxiv_id)
 
@@ -556,11 +655,18 @@ def _arxiv_pdf_url(arxiv_id: str) -> str:
     return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
 
-def _extract_arxiv_source_bytes(source_bytes: bytes, output_dir: str, url: str, arxiv_id: str,
-                                label: str = "", page_size: str = "a5",
-                                generate_notes: bool = False, notes_config: dict | None = None,
-                                render_pdf: bool = True,
-                                fallback_chain: list[str] | None = None) -> dict:
+def _extract_arxiv_source_bytes(
+    source_bytes: bytes,
+    output_dir: str,
+    url: str,
+    arxiv_id: str,
+    label: str = "",
+    page_size: str = "a5",
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+    render_pdf: bool = True,
+    fallback_chain: list[str] | None = None,
+) -> dict:
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     fallback_steps = list(fallback_chain or [])
 
@@ -615,7 +721,9 @@ def _extract_arxiv_source_bytes(source_bytes: bytes, output_dir: str, url: str, 
             "image_count": len(list(assets_dir.glob("*"))),
             "ingested_at": ingested_at,
             "extraction_adapter": "arxiv",
-            "extraction_fallback_chain": " > ".join(fallback_steps or ["arxiv_source_latex"]),
+            "extraction_fallback_chain": " > ".join(
+                fallback_steps or ["arxiv_source_latex"]
+            ),
         }
         citation_metadata = _derive_citation_metadata(
             title=title,
@@ -629,7 +737,9 @@ def _extract_arxiv_source_bytes(source_bytes: bytes, output_dir: str, url: str, 
         )
         article_fields.update(citation_metadata["frontmatter"])
         md_file = article_dir / f"{safe_name}.md"
-        bib_file = _write_bibliography_file(article_dir, safe_name, citation_metadata["bibtex"])
+        bib_file = _write_bibliography_file(
+            article_dir, safe_name, citation_metadata["bibtex"]
+        )
         article_fields["bib_file"] = bib_file.name
         md_text = _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
         md_file.write_text(md_text, encoding="utf-8")
@@ -680,7 +790,9 @@ def _extract_arxiv_source_bytes(source_bytes: bytes, output_dir: str, url: str, 
         if notes_file:
             article_fields["notes_file"] = notes_file.name
             article_fields["notes_doc_id"] = notes_doc_id
-            md_text = _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
+            md_text = (
+                _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
+            )
             md_file.write_text(md_text, encoding="utf-8")
 
         pdf_file = None
@@ -701,8 +813,9 @@ def _extract_arxiv_source_bytes(source_bytes: bytes, output_dir: str, url: str, 
         }
 
 
-def _append_extraction_provenance(result: dict, adapter: str, source_format: str,
-                                  fallback_chain: list[str]) -> None:
+def _append_extraction_provenance(
+    result: dict, adapter: str, source_format: str, fallback_chain: list[str]
+) -> None:
     metadata = result.setdefault("metadata", {})
     chain_text = " > ".join(step for step in fallback_chain if step)
     metadata["extraction_adapter"] = adapter
@@ -722,7 +835,9 @@ def _append_extraction_provenance(result: dict, adapter: str, source_format: str
     frontmatter["extraction_fallback_chain"] = chain_text
     if source_format and not frontmatter.get("source_format"):
         frontmatter["source_format"] = source_format
-    path.write_text(_build_frontmatter(frontmatter) + "\n\n" + body.lstrip("\n"), encoding="utf-8")
+    path.write_text(
+        _build_frontmatter(frontmatter) + "\n\n" + body.lstrip("\n"), encoding="utf-8"
+    )
 
 
 def _override_saved_urls(result: dict, url: str, canonical_url: str) -> None:
@@ -740,14 +855,16 @@ def _override_saved_urls(result: dict, url: str, canonical_url: str) -> None:
     frontmatter, body = _split_markdown_frontmatter(text)
     frontmatter["url"] = url
     frontmatter["canonical_url"] = canonical_url
-    path.write_text(_build_frontmatter(frontmatter) + "\n\n" + body.lstrip("\n"), encoding="utf-8")
+    path.write_text(
+        _build_frontmatter(frontmatter) + "\n\n" + body.lstrip("\n"), encoding="utf-8"
+    )
 
 
 def _split_markdown_frontmatter(text: str) -> tuple[dict, str]:
     match = re.match(r"^---\n(.*?)\n---\n?", text, re.DOTALL)
     if not match:
         return {}, text
-    body = text[match.end():]
+    body = text[match.end() :]
     frontmatter: dict[str, object] = {}
     for raw_line in match.group(1).splitlines():
         if ":" not in raw_line:
@@ -764,21 +881,52 @@ def _split_markdown_frontmatter(text: str) -> tuple[dict, str]:
     return frontmatter, body
 
 
-def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
-                      source_name: str = "", label: str = "", page_size: str = "a5",
-                      generate_notes: bool = False, notes_config: dict | None = None,
-                      render_pdf: bool = False) -> dict:
+def extract_pdf_bytes(
+    pdf_bytes: bytes,
+    output_dir: str = "/tmp",
+    url: str = "",
+    source_name: str = "",
+    label: str = "",
+    page_size: str = "a5",
+    generate_notes: bool = False,
+    notes_config: dict | None = None,
+    render_pdf: bool = False,
+    citation_overrides: dict | None = None,
+) -> dict:
     """Extract markdown and notes from a source PDF."""
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
+    overrides = citation_overrides or {}
+    override_title = (overrides.get("title") or "").strip()
+    override_author = overrides.get("author")
+    override_date = overrides.get("date")
+    override_doi = overrides.get("doi")
+    override_url = (overrides.get("url") or "").strip() or url
+    override_canonical_url = (
+        overrides.get("canonical_url") or ""
+    ).strip() or override_url
+    override_container = overrides.get("container_title")
+    override_publisher = overrides.get("publisher")
+    override_volume = overrides.get("volume")
+    override_issue = overrides.get("issue")
+    override_pages = overrides.get("pages")
+    override_description = overrides.get("abstract") or overrides.get("description")
+    override_source_site = (
+        urlparse(override_url).netloc.lower() if override_url else None
+    )
+
     with tempfile.TemporaryDirectory(prefix="scribe-pdf-src-") as tmpdir:
         temp_pdf = Path(tmpdir) / (source_name or "document.pdf")
         temp_pdf.write_bytes(pdf_bytes)
 
         pdf_meta = _extract_pdf_metadata(temp_pdf)
-        title = _choose_pdf_title(pdf_meta.get("title"), source_name, url)
+        title = override_title or _choose_pdf_title(
+            pdf_meta.get("title"), source_name, url
+        )
         safe_name = _safe_output_name(title)
 
-        article_dir = _ensure_article_dir(output_dir, safe_name, url or source_name or title)
+        article_dir = _ensure_article_dir(
+            output_dir, safe_name, override_url or url or source_name or title
+        )
         source_pdf = article_dir / f"{safe_name}.source.pdf"
         source_pdf.write_bytes(pdf_bytes)
         assets_dir = article_dir / "assets"
@@ -795,31 +943,33 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
             )
         except Exception as exc:
             mistral_error = str(exc)
-            log.exception("Mistral OCR failed for PDF %s; falling back to pdftotext", title)
+            log.exception(
+                "Mistral OCR failed for PDF %s; falling back to pdftotext", title
+            )
 
-        if not md_body:
+        if md_body:
+            md_body = _postprocess_mistral_pdf_markdown(_sanitize_unicode_text(md_body))
+        else:
             text = _extract_pdf_text(temp_pdf)
             md_body = _pdf_text_to_markdown(text)
-        else:
             md_body = _postprocess_pdf_markdown(_sanitize_unicode_text(md_body))
 
-        if not ocr_response:
-            md_body = _postprocess_pdf_markdown(md_body)
-
         ingested_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        article_doc_id = _stable_doc_id(title, url or source_name or title)
+        article_doc_id = _stable_doc_id(
+            title, override_url or url or source_name or title
+        )
 
         article_fields = {
             "title": title,
             "doc_id": article_doc_id,
             "doc_type": "article",
-            "url": url or None,
-            "canonical_url": url or None,
-            "source_site": urlparse(url).netloc.lower() if url else None,
+            "url": override_url or None,
+            "canonical_url": override_canonical_url or None,
+            "source_site": override_source_site,
             "label": label.strip() or None,
             "language": "en",
             "source_format": "pdf",
-            "source_file": source_name or article_pdf.name,
+            "source_file": source_name or source_pdf.name,
             "ocr_engine": "mistral" if ocr_response else "pdftotext",
             "page_count": pdf_meta.get("pages"),
             "word_count": _count_words(md_body),
@@ -828,14 +978,20 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         }
         citation_metadata = _derive_citation_metadata(
             title=title,
-            author=pdf_meta.get("author"),
-            date=pdf_meta.get("creationdate"),
-            url=url or None,
-            canonical_url=url or None,
-            source_site=urlparse(url).netloc.lower() if url else None,
-            description=None,
+            author=override_author or pdf_meta.get("author"),
+            date=override_date or pdf_meta.get("creationdate"),
+            url=override_url or None,
+            canonical_url=override_canonical_url or None,
+            source_site=override_source_site,
+            description=override_description,
             doc_id=article_doc_id,
-            pages=str(pdf_meta.get("pages")) if pdf_meta.get("pages") else None,
+            doi=override_doi,
+            container_title=override_container,
+            publisher=override_publisher,
+            volume=override_volume,
+            issue=override_issue,
+            pages=override_pages
+            or (str(pdf_meta.get("pages")) if pdf_meta.get("pages") else None),
         )
         article_fields.update(citation_metadata["frontmatter"])
         if mistral_error and not ocr_response:
@@ -843,7 +999,9 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         md_file = article_dir / f"{safe_name}.md"
         md_text = _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
         md_file.write_text(md_text, encoding="utf-8")
-        bib_file = _write_bibliography_file(article_dir, safe_name, citation_metadata["bibtex"])
+        bib_file = _write_bibliography_file(
+            article_dir, safe_name, citation_metadata["bibtex"]
+        )
         article_fields["bib_file"] = bib_file.name
         md_text = _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
         md_file.write_text(md_text, encoding="utf-8")
@@ -851,12 +1009,17 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         reading_pdf = None
         if render_pdf:
             try:
-                generated_pdf = _generate_pdf(md_text, title, article_dir, page_cfg["papersize"])
+                generated_pdf = _generate_pdf(
+                    md_text, title, article_dir, page_cfg["papersize"]
+                )
                 reading_pdf = article_dir / f"{safe_name}.reading.pdf"
                 if generated_pdf != reading_pdf:
                     generated_pdf.replace(reading_pdf)
             except Exception:
-                log.exception("Reading PDF generation failed for source PDF %s; source PDF was still saved", title)
+                log.exception(
+                    "Reading PDF generation failed for source PDF %s; source PDF was still saved",
+                    title,
+                )
 
         notes_file = None
         notes_doc_id = None
@@ -908,7 +1071,9 @@ def extract_pdf_bytes(pdf_bytes: bytes, output_dir: str = "/tmp", url: str = "",
         if notes_file:
             article_fields["notes_file"] = notes_file.name
             article_fields["notes_doc_id"] = notes_doc_id
-            md_text = _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
+            md_text = (
+                _build_frontmatter(article_fields) + "\n\n" + md_body.strip() + "\n"
+            )
             md_file.write_text(md_text, encoding="utf-8")
 
         return {
@@ -937,7 +1102,9 @@ def _extract_meta(html: str, title: str, url: str) -> dict:
     def meta_values(*attrs: str) -> list[str]:
         values = []
         for attr in attrs:
-            tags = soup.find_all("meta", attrs={"name": attr}) + soup.find_all("meta", attrs={"property": attr})
+            tags = soup.find_all("meta", attrs={"name": attr}) + soup.find_all(
+                "meta", attrs={"property": attr}
+            )
             for tag in tags:
                 content = (tag.get("content") or "").strip()
                 if content:
@@ -1010,14 +1177,18 @@ def _extract_meta(html: str, title: str, url: str) -> dict:
 
     # Description
     for attr in ("description", "og:description"):
-        tag = soup.find("meta", attrs={"name": attr}) or soup.find("meta", attrs={"property": attr})
+        tag = soup.find("meta", attrs={"name": attr}) or soup.find(
+            "meta", attrs={"property": attr}
+        )
         if tag and tag.get("content"):
             desc = tag["content"].strip()
             meta["description"] = desc
             break
 
     for attr in ("citation_doi", "dc.identifier", "doi", "dc.Identifier"):
-        tag = soup.find("meta", attrs={"name": attr}) or soup.find("meta", attrs={"property": attr})
+        tag = soup.find("meta", attrs={"name": attr}) or soup.find(
+            "meta", attrs={"property": attr}
+        )
         if tag and tag.get("content"):
             content = tag["content"].strip()
             doi_match = re.search(r"10\.\d{4,9}/\S+", content)
@@ -1025,7 +1196,9 @@ def _extract_meta(html: str, title: str, url: str) -> dict:
                 meta["doi"] = doi_match.group(0).rstrip(" .;,)")
                 break
 
-    container_title = first_meta_value("citation_journal_title", "citation_conference_title")
+    container_title = first_meta_value(
+        "citation_journal_title", "citation_conference_title"
+    )
     if container_title:
         meta["container_title"] = container_title
 
@@ -1051,9 +1224,15 @@ def _extract_meta(html: str, title: str, url: str) -> dict:
     elif article_number:
         meta["pages"] = article_number
 
-    canonical = soup.find("link", rel=lambda value: value and "canonical" in str(value).lower())
+    canonical = soup.find(
+        "link", rel=lambda value: value and "canonical" in str(value).lower()
+    )
     if canonical and canonical.get("href"):
-        meta["canonical_url"] = urljoin(url, canonical["href"].strip()) if url else canonical["href"].strip()
+        meta["canonical_url"] = (
+            _resolve_document_relative_url(url, canonical["href"].strip())
+            if url
+            else canonical["href"].strip()
+        )
     else:
         og_url = soup.find("meta", attrs={"property": "og:url"})
         if og_url and og_url.get("content"):
@@ -1064,9 +1243,13 @@ def _extract_meta(html: str, title: str, url: str) -> dict:
         meta["language"] = html_tag["lang"].split("-", 1)[0].strip().lower()
     else:
         for attr in ("language", "og:locale"):
-            tag = soup.find("meta", attrs={"name": attr}) or soup.find("meta", attrs={"property": attr})
+            tag = soup.find("meta", attrs={"name": attr}) or soup.find(
+                "meta", attrs={"property": attr}
+            )
             if tag and tag.get("content"):
-                meta["language"] = tag["content"].split("_", 1)[0].split("-", 1)[0].strip().lower()
+                meta["language"] = (
+                    tag["content"].split("_", 1)[0].split("-", 1)[0].strip().lower()
+                )
                 break
 
     return meta
@@ -1084,7 +1267,11 @@ def _pdf_source_name_from_url(url: str) -> str:
 
 def _choose_pdf_title(pdf_title: str | None, source_name: str, url: str) -> str:
     cleaned_title = (pdf_title or "").strip()
-    if cleaned_title and cleaned_title.lower() not in {"untitled", "microsoft word -", "about:blank"}:
+    if cleaned_title and cleaned_title.lower() not in {
+        "untitled",
+        "microsoft word -",
+        "about:blank",
+    }:
         return cleaned_title
 
     candidate = Path(source_name or _pdf_source_name_from_url(url)).stem.strip()
@@ -1096,13 +1283,17 @@ def _choose_pdf_title(pdf_title: str | None, source_name: str, url: str) -> str:
 def _extract_arxiv_id(canonical_or_url: str | None) -> str | None:
     if not canonical_or_url:
         return None
-    match = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", canonical_or_url)
+    match = re.search(
+        r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", canonical_or_url
+    )
     if match:
         return match.group(1)
     return None
 
 
-def _extract_arxiv_source_archive(source_bytes: bytes, target_dir: Path, arxiv_id: str) -> str:
+def _extract_arxiv_source_archive(
+    source_bytes: bytes, target_dir: Path, arxiv_id: str
+) -> str:
     raw_path = target_dir / f"{arxiv_id}.source"
     raw_path.write_bytes(source_bytes)
 
@@ -1134,7 +1325,10 @@ def _safe_extract_tar(archive_path: Path, target_dir: Path) -> None:
     with tarfile.open(archive_path) as archive:
         for member in archive.getmembers():
             member_path = (target_dir / member.name).resolve()
-            if target_dir.resolve() not in member_path.parents and member_path != target_dir.resolve():
+            if (
+                target_dir.resolve() not in member_path.parents
+                and member_path != target_dir.resolve()
+            ):
                 raise RuntimeError(f"Unsafe path in archive: {member.name}")
         archive.extractall(target_dir)
 
@@ -1232,7 +1426,7 @@ def _replace_latex_macro_call(text: str, macro_name: str, renderer) -> str:
         if not match:
             pieces.append(text[cursor:])
             break
-        pieces.append(text[cursor:match.start()])
+        pieces.append(text[cursor : match.start()])
         body, end = _extract_latex_braced_group(text, match.end())
         if body is None:
             pieces.append(match.group(0))
@@ -1280,7 +1474,7 @@ def _extract_simple_latex_macros(text: str) -> dict[str, str]:
             if end == -1:
                 continue
             try:
-                nargs = int(text[index + 1:end].strip() or "0")
+                nargs = int(text[index + 1 : end].strip() or "0")
             except ValueError:
                 nargs = 0
             index = end + 1
@@ -1314,12 +1508,12 @@ def _strip_simple_latex_macro_definitions(text: str) -> str:
             pieces.append(text[cursor:])
             break
         match = min(candidates, key=lambda item: item.start())
-        pieces.append(text[cursor:match.start()])
+        pieces.append(text[cursor : match.start()])
         if match.re is newcommand_pattern:
             index = match.end()
             macro_group, index = _extract_latex_braced_group(text, index)
             if macro_group is None:
-                pieces.append(text[match.start():match.end()])
+                pieces.append(text[match.start() : match.end()])
                 cursor = match.end()
                 continue
             while index < len(text) and text[index].isspace():
@@ -1344,7 +1538,8 @@ def _extract_latex_metadata(tex_source: str) -> dict[str, str | None]:
         "title": _extract_latex_command(tex_source, "title"),
         "author": _extract_latex_command(tex_source, "author"),
         "date": _extract_latex_command(tex_source, "date"),
-        "abstract": _extract_latex_environment(tex_source, "abstract") or _extract_latex_command(tex_source, "abstract"),
+        "abstract": _extract_latex_environment(tex_source, "abstract")
+        or _extract_latex_command(tex_source, "abstract"),
     }
 
 
@@ -1384,7 +1579,9 @@ def _latex_file_to_markdown(main_tex: Path, source_root: Path, assets_dir: Path)
     try:
         with tempfile.TemporaryDirectory(prefix="scribe-latex-md-") as tmpdir:
             staged_root = Path(tmpdir) / "source"
-            staged_main = _prepare_sanitized_latex_tree(main_tex, source_root, staged_root)
+            staged_main = _prepare_sanitized_latex_tree(
+                main_tex, source_root, staged_root
+            )
             markdown = pypandoc.convert_file(
                 str(staged_main),
                 "gfm+tex_math_dollars",
@@ -1404,7 +1601,9 @@ def _latex_file_to_markdown(main_tex: Path, source_root: Path, assets_dir: Path)
         return ""
 
 
-def _prepare_sanitized_latex_tree(main_tex: Path, source_root: Path, staged_root: Path) -> Path:
+def _prepare_sanitized_latex_tree(
+    main_tex: Path, source_root: Path, staged_root: Path
+) -> Path:
     shutil.copytree(source_root, staged_root)
     for tex_path in staged_root.rglob("*.tex"):
         text = tex_path.read_text(encoding="utf-8", errors="ignore")
@@ -1412,15 +1611,22 @@ def _prepare_sanitized_latex_tree(main_tex: Path, source_root: Path, staged_root
     return staged_root / main_tex.relative_to(source_root)
 
 
-def _collect_markdown_image_assets(markdown_text: str, source_dir: Path, assets_dir: Path) -> str:
+def _collect_markdown_image_assets(
+    markdown_text: str, source_dir: Path, assets_dir: Path
+) -> str:
     markdown_pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
     html_pattern = re.compile(r'(<img\b[^>]*\bsrc=")([^"]+)(")')
     embed_pattern = re.compile(r'<embed\b[^>]*\bsrc="([^"]+)"[^>]*/?>')
-    seen: dict[Path, tuple[str, str]] = {}
+    seen_local: dict[Path, tuple[str, str]] = {}
+    seen_remote: dict[str, tuple[str, str]] = {}
 
     def resolve_asset(target: str) -> tuple[str, str] | None:
         target = html.unescape(target)
-        if target.startswith(("http://", "https://", "#")):
+        if target.startswith(("http://", "https://")):
+            if target not in seen_remote:
+                seen_remote[target] = _download_markdown_asset(target, assets_dir)
+            return seen_remote[target]
+        if target.startswith("#"):
             return None
         clean_target = target.split("#", 1)[0].split("?", 1)[0]
         source_path = (source_dir / clean_target).resolve()
@@ -1430,9 +1636,9 @@ def _collect_markdown_image_assets(markdown_text: str, source_dir: Path, assets_
             return None
         if not source_path.exists() or not source_path.is_file():
             return None
-        if source_path not in seen:
-            seen[source_path] = _copy_markdown_asset(source_path, assets_dir)
-        return seen[source_path]
+        if source_path not in seen_local:
+            seen_local[source_path] = _copy_markdown_asset(source_path, assets_dir)
+        return seen_local[source_path]
 
     def replace_markdown(match: re.Match) -> str:
         alt = match.group(1)
@@ -1449,7 +1655,7 @@ def _collect_markdown_image_assets(markdown_text: str, source_dir: Path, assets_
         if not resolved:
             return match.group(0)
         asset_name, _ = resolved
-        return f'{match.group(1)}assets/{asset_name}{match.group(3)}'
+        return f"{match.group(1)}assets/{asset_name}{match.group(3)}"
 
     def replace_embed(match: re.Match) -> str:
         resolved = resolve_asset(match.group(1))
@@ -1466,17 +1672,32 @@ def _collect_markdown_image_assets(markdown_text: str, source_dir: Path, assets_
     return markdown_text
 
 
+def _download_markdown_asset(
+    target_url: str, assets_dir: Path
+) -> tuple[str, str] | None:
+    session = requests.Session()
+    try:
+        local_path = _download_image(target_url, assets_dir, session)
+    finally:
+        session.close()
+    if not local_path:
+        return None
+    return local_path.name, "image"
+
+
 def _copy_markdown_asset(source_path: Path, assets_dir: Path) -> tuple[str, str]:
     suffix = source_path.suffix.lower()
     if suffix == ".pdf":
         rendered = _render_pdf_asset_for_markdown(source_path, assets_dir)
         if rendered:
             return rendered, "image"
-    destination_name = source_path.name
+    destination_name = _safe_asset_name(source_path.name)
     destination = assets_dir / destination_name
     counter = 1
     while destination.exists() and destination.read_bytes() != source_path.read_bytes():
-        destination = assets_dir / f"{source_path.stem}_{counter}{source_path.suffix}"
+        destination = assets_dir / _safe_asset_name(
+            f"{source_path.stem}_{counter}{source_path.suffix}"
+        )
         counter += 1
     if not destination.exists():
         shutil.copy2(source_path, destination)
@@ -1484,10 +1705,10 @@ def _copy_markdown_asset(source_path: Path, assets_dir: Path) -> tuple[str, str]
 
 
 def _render_pdf_asset_for_markdown(source_path: Path, assets_dir: Path) -> str | None:
-    destination = assets_dir / f"{source_path.stem}.png"
+    destination = assets_dir / _safe_asset_name(f"{source_path.stem}.png")
     counter = 1
     while destination.exists():
-        destination = assets_dir / f"{source_path.stem}_{counter}.png"
+        destination = assets_dir / _safe_asset_name(f"{source_path.stem}_{counter}.png")
         counter += 1
     prefix = destination.with_suffix("")
     proc = subprocess.run(
@@ -1497,7 +1718,11 @@ def _render_pdf_asset_for_markdown(source_path: Path, assets_dir: Path) -> str |
         text=True,
     )
     if proc.returncode != 0 or not destination.exists():
-        log.warning("pdftoppm failed for %s: %s", source_path, (proc.stderr or proc.stdout).strip())
+        log.warning(
+            "pdftoppm failed for %s: %s",
+            source_path,
+            (proc.stderr or proc.stdout).strip(),
+        )
         return None
     return destination.name
 
@@ -1512,7 +1737,9 @@ def _latex_to_markdown(tex_source: str) -> str:
             extra_args=["--wrap=none"],
         )
     except RuntimeError:
-        log.exception("Pandoc failed to convert arXiv LaTeX source; using text fallback")
+        log.exception(
+            "Pandoc failed to convert arXiv LaTeX source; using text fallback"
+        )
         markdown = _latex_to_plain_markdown(sanitized)
     markdown = re.sub(r",\s*\n\\label\{[^}]+\}\$\$", "\n$$", markdown)
     markdown = re.sub(r"\n\\label\{[^}]+\}", "", markdown)
@@ -1539,11 +1766,13 @@ def _sanitize_latex_for_markdown(tex_source: str) -> str:
 
 
 def _postprocess_source_markdown(markdown_text: str) -> str:
-    markdown_text = html.unescape(markdown_text)
+    markdown_text = _fully_unescape_html(markdown_text)
     markdown_text = _postprocess_markdown(markdown_text)
     markdown_text = re.sub(r"\$\$\s*(@[^$]+?)\s*\$\$", r"[\1]", markdown_text)
     markdown_text = re.sub(r"\$\s*(@[^$\n]+?)\s*\$", r"[\1]", markdown_text)
-    markdown_text = re.sub(r"(?m)^[ \t]*<div class=\"(?:figure|table)\*?\">\s*$", "", markdown_text)
+    markdown_text = re.sub(
+        r"(?m)^[ \t]*<div class=\"(?:figure|table)\*?\">\s*$", "", markdown_text
+    )
     markdown_text = re.sub(r"(?m)^[ \t]*</div>\s*$", "", markdown_text)
     markdown_text = re.sub(r"(?m)^[ \t]*<span\b[^>]*></span>\s*$", "", markdown_text)
     markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text)
@@ -1653,15 +1882,24 @@ def _fetch_doi_metadata(doi: str) -> dict:
         "publisher": (payload.get("publisher") or "").strip() or None,
         "volume": (payload.get("volume") or "").strip() or None,
         "issue": (payload.get("issue") or "").strip() or None,
-        "pages": (payload.get("page") or payload.get("article-number") or "").strip() or None,
-        "source_site": urlparse(((payload.get("resource") or {}).get("primary", {}).get("URL") or "")).netloc.lower() or None,
+        "pages": (payload.get("page") or payload.get("article-number") or "").strip()
+        or None,
+        "source_site": urlparse(
+            ((payload.get("resource") or {}).get("primary", {}).get("URL") or "")
+        ).netloc.lower()
+        or None,
     }
 
 
 def _looks_like_site_title(title: str | None) -> bool:
     if not title:
         return False
-    return bool(re.search(r"\s[-|]\s(?:ScienceDirect|arXiv|Medium|Substack|PMC|PubMed|MachineLearningMastery\.com)\s*$", title))
+    return bool(
+        re.search(
+            r"\s[-|]\s(?:ScienceDirect|arXiv|Medium|Substack|PMC|PubMed|MachineLearningMastery\.com)\s*$",
+            title,
+        )
+    )
 
 
 def _enrich_meta_with_doi(meta: dict) -> dict:
@@ -1686,7 +1924,16 @@ def _enrich_meta_with_doi(meta: dict) -> dict:
     enriched = dict(meta)
     if doi_meta.get("title"):
         enriched["title"] = doi_meta["title"]
-    for field in ("author", "date", "canonical_url", "container_title", "publisher", "volume", "issue", "pages"):
+    for field in (
+        "author",
+        "date",
+        "canonical_url",
+        "container_title",
+        "publisher",
+        "volume",
+        "issue",
+        "pages",
+    ):
         if doi_meta.get(field):
             enriched[field] = doi_meta[field]
     if doi_meta.get("source_site"):
@@ -1710,12 +1957,22 @@ def _citation_key(title: str, author: str | None, date: str | None, doc_id: str)
     return f"{author_token}{title_token[:24]}"
 
 
-def _derive_citation_metadata(title: str, author: str | None, date: str | None, url: str | None,
-                              canonical_url: str | None, source_site: str | None,
-                              description: str | None, doc_id: str, doi: str | None = None,
-                              container_title: str | None = None, publisher: str | None = None,
-                              volume: str | None = None, issue: str | None = None,
-                              pages: str | None = None) -> dict:
+def _derive_citation_metadata(
+    title: str,
+    author: str | None,
+    date: str | None,
+    url: str | None,
+    canonical_url: str | None,
+    source_site: str | None,
+    description: str | None,
+    doc_id: str,
+    doi: str | None = None,
+    container_title: str | None = None,
+    publisher: str | None = None,
+    volume: str | None = None,
+    issue: str | None = None,
+    pages: str | None = None,
+) -> dict:
     if not doi and canonical_url:
         doi_match = re.search(r"10\.\d{4,9}/\S+", canonical_url)
         if doi_match:
@@ -1762,12 +2019,23 @@ def _bibtex_escape(value: str) -> str:
     )
 
 
-def _build_bibtex_entry(entry_type: str, citation_key: str, title: str, author: str | None,
-                        date: str | None, url: str | None, source_site: str | None,
-                        description: str | None, doi: str | None, arxiv_id: str | None,
-                        container_title: str | None = None, publisher: str | None = None,
-                        volume: str | None = None, issue: str | None = None,
-                        pages: str | None = None) -> str:
+def _build_bibtex_entry(
+    entry_type: str,
+    citation_key: str,
+    title: str,
+    author: str | None,
+    date: str | None,
+    url: str | None,
+    source_site: str | None,
+    description: str | None,
+    doi: str | None,
+    arxiv_id: str | None,
+    container_title: str | None = None,
+    publisher: str | None = None,
+    volume: str | None = None,
+    issue: str | None = None,
+    pages: str | None = None,
+) -> str:
     fields = []
     fields.append(("title", title))
     if author:
@@ -1781,7 +2049,9 @@ def _build_bibtex_entry(entry_type: str, citation_key: str, title: str, author: 
     if url:
         fields.append(("url", url))
     if container_title:
-        fields.append(("journal" if entry_type == "article" else "booktitle", container_title))
+        fields.append(
+            ("journal" if entry_type == "article" else "booktitle", container_title)
+        )
     if publisher:
         fields.append(("publisher", publisher))
     if volume:
@@ -1806,7 +2076,9 @@ def _build_bibtex_entry(entry_type: str, citation_key: str, title: str, author: 
     return f"@{entry_type}{{{citation_key},\n{rendered_fields}\n}}\n"
 
 
-def _write_bibliography_file(article_dir: Path, article_basename: str, bibtex: str) -> Path:
+def _write_bibliography_file(
+    article_dir: Path, article_basename: str, bibtex: str
+) -> Path:
     bib_file = article_dir / f"{article_basename}.bib"
     bib_file.write_text(bibtex, encoding="utf-8")
     return bib_file
@@ -1853,7 +2125,9 @@ def _extract_pdf_text(pdf_path: Path) -> str:
     return proc.stdout
 
 
-def _extract_pdf_markdown_via_mistral(pdf_bytes: bytes, article_dir: Path, safe_name: str) -> tuple[str, dict]:
+def _extract_pdf_markdown_via_mistral(
+    pdf_bytes: bytes, article_dir: Path, safe_name: str
+) -> tuple[str, dict]:
     if not _DEFAULT_MISTRAL_API_KEY:
         raise RuntimeError("MISTRAL_API_KEY is not configured")
 
@@ -1890,24 +2164,24 @@ def _extract_pdf_markdown_via_mistral(pdf_bytes: bytes, article_dir: Path, safe_
     assets_dir = article_dir / "assets"
     parts = []
     for page_index, page in enumerate(pages, start=1):
-        page_markdown = (page.get("markdown") or "").strip()
+        page_markdown = page.get("markdown") or ""
         page_markdown = _save_mistral_page_images(
             page_markdown=page_markdown,
             page=page,
             assets_dir=assets_dir,
-            safe_name=safe_name,
             page_index=page_index,
         )
         if page_markdown:
             parts.append(page_markdown)
-    markdown = _postprocess_mistral_markdown(parts, pages)
+    markdown = _postprocess_mistral_markdown(parts)
     if not markdown:
         raise RuntimeError("Mistral OCR returned empty markdown")
     return markdown, data
 
 
-def _save_mistral_page_images(page_markdown: str, page: dict, assets_dir: Path,
-                              safe_name: str, page_index: int) -> str:
+def _save_mistral_page_images(
+    page_markdown: str, page: dict, assets_dir: Path, page_index: int
+) -> str:
     images = page.get("images") or []
     updated_markdown = page_markdown
 
@@ -1915,7 +2189,9 @@ def _save_mistral_page_images(page_markdown: str, page: dict, assets_dir: Path,
         image_base64 = image.get("image_base64") or ""
         if not image_base64.startswith("data:"):
             continue
-        match = re.match(r"data:(image/[^;]+);base64,(.+)", image_base64, flags=re.DOTALL)
+        match = re.match(
+            r"data:(image/[^;]+);base64,(.+)", image_base64, flags=re.DOTALL
+        )
         if not match:
             continue
         mime_type = match.group(1)
@@ -1926,111 +2202,34 @@ def _save_mistral_page_images(page_markdown: str, page: dict, assets_dir: Path,
             "image/webp": ".webp",
             "image/gif": ".gif",
         }.get(mime_type.lower(), ".img")
-        file_name = f"{safe_name}_p{page_index:03d}_img{image_index:02d}{ext}"
-        out_path = assets_dir / file_name
-        out_path.write_bytes(base64.b64decode(raw_data))
-
         image_id = image.get("id") or image.get("name") or ""
+        candidate_name = Path(image_id).name if image_id else ""
+        if candidate_name:
+            root, suffix = os.path.splitext(candidate_name)
+            file_name = candidate_name if suffix else f"{candidate_name}{ext}"
+        else:
+            file_name = f"img-{image_index - 1}{ext}"
+        out_path = assets_dir / file_name
+        payload = base64.b64decode(raw_data)
+        if out_path.exists() and out_path.read_bytes() != payload:
+            root, suffix = os.path.splitext(file_name)
+            file_name = f"{root}-p{page_index:03d}-{image_index:02d}{suffix or ext}"
+            out_path = assets_dir / file_name
+        out_path.write_bytes(payload)
+
         if image_id:
-            updated_markdown = updated_markdown.replace(f"]({image_id})", f"](assets/{file_name})")
-            updated_markdown = updated_markdown.replace(f"![]({image_id})", f"![]({('assets/' + file_name)})")
+            updated_markdown = updated_markdown.replace(
+                f"]({image_id})", f"](assets/{file_name})"
+            )
+            updated_markdown = updated_markdown.replace(
+                f"![]({image_id})", f"![]({('assets/' + file_name)})"
+            )
 
     return updated_markdown
 
 
-def _postprocess_mistral_markdown(page_markdowns: list[str], pages: list[dict]) -> str:
-    cleaned_pages = []
-    repeated_boundary_lines = _infer_repeated_mistral_boundary_lines(page_markdowns)
-    for page_markdown, page in zip(page_markdowns, pages):
-        cleaned = _strip_mistral_header_footer_blocks(page_markdown, page)
-        cleaned = _strip_repeated_mistral_boundary_lines(cleaned, repeated_boundary_lines)
-        cleaned = _normalize_mistral_citation_markers(cleaned)
-        cleaned = _normalize_mistral_section_headings(cleaned)
-        cleaned = cleaned.strip()
-        if cleaned:
-            cleaned_pages.append(cleaned)
-    return "\n\n---\n\n".join(cleaned_pages).strip()
-
-
-def _infer_repeated_mistral_boundary_lines(page_markdowns: list[str], window: int = 3) -> set[str]:
-    counts: Counter[str] = Counter()
-    for page_markdown in page_markdowns:
-        boundary_lines = _mistral_boundary_lines(page_markdown, window=window)
-        seen = set()
-        for line in boundary_lines:
-            if line in seen:
-                continue
-            seen.add(line)
-            if _looks_like_mistral_running_boilerplate(line):
-                counts[line] += 1
-    return {line for line, count in counts.items() if count >= 2}
-
-
-def _mistral_boundary_lines(page_markdown: str, window: int = 3) -> list[str]:
-    lines = [line.strip() for line in page_markdown.splitlines() if line.strip()]
-    if not lines:
-        return []
-    if len(lines) <= window * 2:
-        return lines
-    return lines[:window] + lines[-window:]
-
-
-def _looks_like_mistral_running_boilerplate(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped or len(stripped) > 120:
-        return False
-    if stripped.startswith(("#", "!", "|", "```", "<")):
-        return False
-    if re.fullmatch(r"\d+", stripped):
-        return False
-    if not re.search(r"[A-Za-z]", stripped):
-        return False
-    word_count = len(re.findall(r"\b\w+\b", stripped))
-    if word_count == 0 or word_count > 18:
-        return False
-    return True
-
-
-def _strip_mistral_header_footer_blocks(page_markdown: str, page: dict, window: int = 3) -> str:
-    candidates = []
-    for key in ("header", "footer"):
-        value = page.get(key)
-        if isinstance(value, str) and value.strip():
-            candidates.extend(line.strip() for line in value.splitlines() if line.strip())
-    if not candidates:
-        return page_markdown
-    return _strip_repeated_mistral_boundary_lines(page_markdown, set(candidates), window=window)
-
-
-def _strip_repeated_mistral_boundary_lines(page_markdown: str, candidates: set[str], window: int = 3) -> str:
-    if not candidates:
-        return page_markdown
-
-    lines = page_markdown.splitlines()
-    nonempty_indexes = [idx for idx, line in enumerate(lines) if line.strip()]
-    if not nonempty_indexes:
-        return page_markdown
-
-    top_indexes = set(nonempty_indexes[:window])
-    bottom_indexes = set(nonempty_indexes[-window:])
-    boundary_indexes = top_indexes | bottom_indexes
-
-    cleaned_lines = []
-    for idx, line in enumerate(lines):
-        if idx in boundary_indexes and line.strip() in candidates:
-            continue
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines)
-
-
-def _normalize_mistral_citation_markers(markdown_text: str) -> str:
-    markdown_text = re.sub(r"\*\[(\d[\d,\s-]*)\]\*", r"[\1]", markdown_text)
-    markdown_text = re.sub(r"(?<=[A-Za-z0-9)])\[(\d[\d,\s-]*)\]", r" [\1]", markdown_text)
-    return markdown_text
-
-
-def _normalize_mistral_section_headings(markdown_text: str) -> str:
-    return re.sub(r"(?mi)^#{4,6}\s+abstract\s*$", "## Abstract", markdown_text)
+def _postprocess_mistral_markdown(page_markdowns: list[str]) -> str:
+    return "".join(page_markdown for page_markdown in page_markdowns if page_markdown)
 
 
 def _pdf_text_to_markdown(text: str) -> str:
@@ -2125,17 +2324,23 @@ def _generate_companion_notes(
             "label": metadata.get("label"),
             "language": metadata.get("language"),
             "generated_by": f"{notes_client['provider']}:{notes_client['model']}",
-            "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "generated_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
             "ingested_at": metadata.get("ingested_at"),
         }
     )
     notes_file = article_dir / f"{article_basename}.notes.md"
-    notes_file.write_text(notes_frontmatter + "\n\n" + notes_body.strip() + "\n", encoding="utf-8")
+    notes_file.write_text(
+        notes_frontmatter + "\n\n" + notes_body.strip() + "\n", encoding="utf-8"
+    )
     return notes_file
 
 
 def _generate_companion_notes_body(md_text: str) -> str:
-    return _generate_companion_notes_body_with_config(md_text, _resolve_notes_client_config({}))
+    return _generate_companion_notes_body_with_config(
+        md_text, _resolve_notes_client_config({})
+    )
 
 
 def _strip_reference_sections_for_notes(md_text: str) -> str:
@@ -2150,7 +2355,7 @@ def _strip_reference_sections_for_notes(md_text: str) -> str:
             cut_positions.append(match.start())
     if not cut_positions:
         return md_text
-    return md_text[:min(cut_positions)].rstrip() + "\n"
+    return md_text[: min(cut_positions)].rstrip() + "\n"
 
 
 def _resolve_notes_client_config(overrides: dict) -> dict:
@@ -2159,7 +2364,9 @@ def _resolve_notes_client_config(overrides: dict) -> dict:
         "provider": provider,
         "model": (overrides.get("model") or _DEFAULT_NOTES_MODEL).strip(),
         "base_url": (overrides.get("base_url") or _DEFAULT_NOTES_BASE_URL).strip(),
-        "api_key": overrides.get("api_key") if overrides.get("api_key") is not None else _DEFAULT_NOTES_API_KEY,
+        "api_key": overrides.get("api_key")
+        if overrides.get("api_key") is not None
+        else _DEFAULT_NOTES_API_KEY,
         "timeout": int(overrides.get("timeout") or _DEFAULT_NOTES_TIMEOUT),
         "anthropic_version": (
             overrides.get("anthropic_version") or _DEFAULT_ANTHROPIC_VERSION
@@ -2212,13 +2419,14 @@ def _generate_companion_notes_body_with_config(
     if strategy == "append" and existing_notes:
         prefix = existing_notes.rstrip() + "\n\n---\n\n"
         if progress_callback:
+
             def progress_handler(markdown: str) -> None:
                 progress_callback(prefix + markdown)
     elif strategy == "fuse" and existing_notes:
         prompt = (
             base_prompt
             + "You are also given <existing_notes>. Fuse the existing notes with the article into one improved notes document.\n"
-              "Preserve useful faithful content from the existing notes, remove redundancy, and keep the exact required section order.\n\n"
+            "Preserve useful faithful content from the existing notes, remove redundancy, and keep the exact required section order.\n\n"
             + f"<existing_notes>\n{existing_notes[:20000]}\n</existing_notes>\n\n"
             + f"<article_markdown>\n{md_text[:30000]}\n</article_markdown>"
         )
@@ -2374,7 +2582,11 @@ def _openai_stream_delta_text(data: dict) -> str:
     if isinstance(content, list):
         fragments: list[str] = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
                 fragments.append(item["text"])
         return "".join(fragments)
     return ""
@@ -2393,8 +2605,9 @@ def _anthropic_stream_delta_text(data: dict) -> str:
     return ""
 
 
-def _fetch_and_inject_mathml(soup: BeautifulSoup, url: str,
-                              session: requests.Session) -> None:
+def _fetch_and_inject_mathml(
+    soup: BeautifulSoup, url: str, session: requests.Session
+) -> None:
     """Fetch the server-side HTML to get original <math> MathML tags.
 
     MathJax replaces <math> with <mjx-container> in the browser DOM.
@@ -2426,8 +2639,11 @@ def _fetch_and_inject_mathml(soup: BeautifulSoup, url: str,
             math_by_id[id_match.group(1)] = m_str
 
     containers = soup.find_all("mjx-container")
-    log.info("Injecting %d server-side MathML tags into %d mjx-containers",
-             len(raw_math), len(containers))
+    log.info(
+        "Injecting %d server-side MathML tags into %d mjx-containers",
+        len(raw_math),
+        len(containers),
+    )
 
     positional_idx = 0
     for container in containers:
@@ -2485,9 +2701,12 @@ def _convert_mathjax_fallback(soup: BeautifulSoup) -> None:
             # Last-resort fallback when the generated MathML is malformed.
             try:
                 from mathml_to_latex import MathMLToLaTeX
+
                 latex = _cleanup_latex(MathMLToLaTeX.convert(mathml_str))
                 is_block = container.get("display") == "true"
-                container.replace_with(f"\n\n$${latex}$$\n\n" if is_block else f"${latex}$")
+                container.replace_with(
+                    f"\n\n$${latex}$$\n\n" if is_block else f"${latex}$"
+                )
                 converted += 1
             except Exception as inner:
                 log.warning("Failed fallback MathJax conversion: %s", inner)
@@ -2519,11 +2738,17 @@ def _normalize_display_formula_tables(soup: BeautifulSoup) -> None:
 
         math_node = _extract_preferred_math_node(formula_cell)
         if math_node:
-            if getattr(math_node, "name", None) and table.get("id") and not math_node.get("id"):
+            if (
+                getattr(math_node, "name", None)
+                and table.get("id")
+                and not math_node.get("id")
+            ):
                 math_node["id"] = table["id"]
             replacements.append(math_node)
         else:
-            replacements.extend(child.extract() for child in list(formula_cell.contents))
+            replacements.extend(
+                child.extract() for child in list(formula_cell.contents)
+            )
 
         _replace_with_sequence(table, replacements)
 
@@ -2570,7 +2795,9 @@ def _normalize_latexml_equation_tables(soup: BeautifulSoup) -> None:
             if row_id:
                 math_node["id"] = row_id
             semantics = soup.new_tag("semantics")
-            annotation = soup.new_tag("annotation", attrs={"encoding": "application/x-tex"})
+            annotation = soup.new_tag(
+                "annotation", attrs={"encoding": "application/x-tex"}
+            )
             annotation.append(NavigableString(combined_tex))
             semantics.append(annotation)
             math_node.append(semantics)
@@ -2590,10 +2817,10 @@ def _normalize_labeled_formula_blocks(soup: BeautifulSoup) -> None:
             continue
 
         has_math = (
-            formula.find("math") or
-            formula.find("script", attrs={"type": "math/mml"}) or
-            formula.find(attrs={"data-mathml": True}) or
-            formula.find("mjx-container")
+            formula.find("math")
+            or formula.find("script", attrs={"type": "math/mml"})
+            or formula.find(attrs={"data-mathml": True})
+            or formula.find("mjx-container")
         )
         if not has_math:
             continue
@@ -2603,7 +2830,14 @@ def _normalize_labeled_formula_blocks(soup: BeautifulSoup) -> None:
         if (
             getattr(parent, "name", None) in {"span", "div"}
             and "display" in parent.get("class", [])
-            and len([c for c in parent.contents if getattr(c, "name", None) or str(c).strip()]) == 1
+            and len(
+                [
+                    c
+                    for c in parent.contents
+                    if getattr(c, "name", None) or str(c).strip()
+                ]
+            )
+            == 1
         ):
             container = parent
 
@@ -2614,7 +2848,11 @@ def _normalize_labeled_formula_blocks(soup: BeautifulSoup) -> None:
             continue
 
         replacements = []
-        if getattr(math_node, "name", None) and formula.get("id") and not math_node.get("id"):
+        if (
+            getattr(math_node, "name", None)
+            and formula.get("id")
+            and not math_node.get("id")
+        ):
             math_node["id"] = formula["id"]
         replacements.append(math_node)
 
@@ -2720,14 +2958,29 @@ def _cleanup_latex(latex: str) -> str:
 
 # MathJax CHTML tag → standard MathML tag
 _MJX_TAG_MAP = {
-    "mjx-math": "math", "mjx-mi": "mi", "mjx-mo": "mo", "mjx-mn": "mn",
-    "mjx-ms": "ms", "mjx-mtext": "mtext", "mjx-mrow": "mrow",
-    "mjx-msub": "msub", "mjx-msup": "msup", "mjx-msubsup": "msubsup",
-    "mjx-mfrac": "mfrac", "mjx-msqrt": "msqrt", "mjx-mroot": "mroot",
-    "mjx-mover": "mover", "mjx-munder": "munder", "mjx-munderover": "munderover",
-    "mjx-mtable": "mtable", "mjx-mtr": "mtr", "mjx-mtd": "mtd",
-    "mjx-mfenced": "mfenced", "mjx-mspace": "mspace",
-    "mjx-mpadded": "mpadded", "mjx-mphantom": "mphantom",
+    "mjx-math": "math",
+    "mjx-mi": "mi",
+    "mjx-mo": "mo",
+    "mjx-mn": "mn",
+    "mjx-ms": "ms",
+    "mjx-mtext": "mtext",
+    "mjx-mrow": "mrow",
+    "mjx-msub": "msub",
+    "mjx-msup": "msup",
+    "mjx-msubsup": "msubsup",
+    "mjx-mfrac": "mfrac",
+    "mjx-msqrt": "msqrt",
+    "mjx-mroot": "mroot",
+    "mjx-mover": "mover",
+    "mjx-munder": "munder",
+    "mjx-munderover": "munderover",
+    "mjx-mtable": "mtable",
+    "mjx-mtr": "mtr",
+    "mjx-mtd": "mtd",
+    "mjx-mfenced": "mfenced",
+    "mjx-mspace": "mspace",
+    "mjx-mpadded": "mpadded",
+    "mjx-mphantom": "mphantom",
 }
 
 # Leaf elements that contain text (via <mjx-c> children)
@@ -2735,8 +2988,15 @@ _MJX_LEAF = {"mjx-mi", "mjx-mo", "mjx-mn", "mjx-ms", "mjx-mtext"}
 
 # Elements where <mjx-script> packs multiple script children
 # msub/msup: script has 1 child; msubsup: 2; munder/mover: 1; munderover: 2
-_MJX_SCRIPT_TAGS = {"mjx-msub", "mjx-msup", "mjx-msubsup",
-                     "mjx-munder", "mjx-mover", "mjx-munderover"}
+_MJX_SCRIPT_TAGS = {
+    "mjx-msub",
+    "mjx-msup",
+    "mjx-msubsup",
+    "mjx-munder",
+    "mjx-mover",
+    "mjx-munderover",
+}
+
 
 def _normalize_math_text(text: str) -> str:
     """Normalize MathJax text content without hardcoded symbol tables."""
@@ -2752,7 +3012,9 @@ def _normalize_math_text(text: str) -> str:
     return "".join(cleaned)
 
 
-def _replace_problem_math_with_tex_placeholders(soup: BeautifulSoup) -> dict[str, tuple[str, bool]]:
+def _replace_problem_math_with_tex_placeholders(
+    soup: BeautifulSoup,
+) -> dict[str, tuple[str, bool]]:
     """Replace normalized MathML with stable TeX placeholders before markdown conversion.
 
     Pandoc's MathML -> markdown conversion is prone to broken inline/display
@@ -2815,7 +3077,9 @@ def _should_render_math_as_display(math_tag, tex: str) -> bool:
     return False
 
 
-def _restore_tex_placeholders(text: str, replacements: dict[str, tuple[str, bool]], target: str) -> str:
+def _restore_tex_placeholders(
+    text: str, replacements: dict[str, tuple[str, bool]], target: str
+) -> str:
     """Restore placeholder math markers into markdown or LaTeX output."""
     text = _merge_adjacent_display_tex_placeholders(text, replacements)
     for placeholder, (tex, display) in replacements.items():
@@ -2833,7 +3097,9 @@ def _restore_tex_placeholders(text: str, replacements: dict[str, tuple[str, bool
                 rendered = tex
 
             if target == "markdown":
-                rendered = _surround_restored_markdown_math(rendered, display, before, after)
+                rendered = _surround_restored_markdown_math(
+                    rendered, display, before, after
+                )
 
             text = text[:idx] + rendered + text[after_idx:]
 
@@ -2895,14 +3161,18 @@ def _render_markdown_math(tex: str, display: bool) -> str:
 
 def _wrap_aligned_display_math(tex: str) -> str:
     """Wrap multiline alignment-style display math in an explicit environment."""
-    if re.search(r"\\begin\{(?:aligned|align|matrix|array|cases|split|gathered)\}", tex):
+    if re.search(
+        r"\\begin\{(?:aligned|align|matrix|array|cases|split|gathered)\}", tex
+    ):
         return tex
     if "\\\\" not in tex and "&" not in tex:
         return tex
     return "\\begin{aligned}\n" + tex + "\n\\end{aligned}"
 
 
-def _surround_restored_markdown_math(rendered: str, display: bool, before: str, after: str) -> str:
+def _surround_restored_markdown_math(
+    rendered: str, display: bool, before: str, after: str
+) -> str:
     if display:
         prefix = "" if not before else ("\n\n" if before != "\n" else "\n")
         suffix = "" if not after else ("\n\n" if after != "\n" else "\n")
@@ -2999,8 +3269,7 @@ def _mjx_script_element(node, mathml_tag: str) -> str:
         return f"<{mathml_tag}{attrs}>{base}</{mathml_tag}>"
 
     # Collect direct element children of <mjx-script>
-    script_kids = [c for c in script_node.children
-                   if hasattr(c, "name") and c.name]
+    script_kids = [c for c in script_node.children if hasattr(c, "name") and c.name]
 
     if needs_two and len(script_kids) >= 2:
         # Two script slots — first child is sub/under, second is sup/over
@@ -3041,8 +3310,15 @@ def _mjx_mathml_attrs(node, mathml_tag: str) -> str:
         if parent and parent.get("display") == "true":
             attrs.append('display="block"')
     font = node.get("data-semantic-font", "")
-    if font in ("bold-italic", "bold", "italic", "normal",
-                 "double-struck", "script", "fraktur"):
+    if font in (
+        "bold-italic",
+        "bold",
+        "italic",
+        "normal",
+        "double-struck",
+        "script",
+        "fraktur",
+    ):
         attrs.append(f'mathvariant="{font}"')
     return (" " + " ".join(attrs)) if attrs else ""
 
@@ -3061,7 +3337,9 @@ def _extract_article_tag(html: str) -> str | None:
     for tag in article.find_all(["nav", "footer", "header", "aside"]):
         tag.decompose()
     # Remove hidden elements
-    for tag in article.find_all(style=lambda s: s and "display:none" in s.replace(" ", "")):
+    for tag in article.find_all(
+        style=lambda s: s and "display:none" in s.replace(" ", "")
+    ):
         tag.decompose()
     # Remove Medium's "sign up" / "follow" button containers
     for tag in article.find_all("button"):
@@ -3100,7 +3378,7 @@ def _collect_images(html: str, url: str) -> list[str]:
             if source and source.get("srcset"):
                 src = _best_srcset_url(source["srcset"])
         if src:
-            abs_src = urljoin(url, src) if url else src
+            abs_src = _resolve_document_relative_url(url, src) if url else src
             if abs_src not in seen:
                 seen.add(abs_src)
                 images.append(abs_src)
@@ -3111,7 +3389,7 @@ def _collect_images(html: str, url: str) -> list[str]:
             src = _best_srcset_url(img["srcset"])
         if not src:
             continue
-        abs_src = urljoin(url, src) if url else src
+        abs_src = _resolve_document_relative_url(url, src) if url else src
         if abs_src not in seen and not abs_src.startswith("data:"):
             seen.add(abs_src)
             images.append(abs_src)
@@ -3129,14 +3407,28 @@ def _preferred_figure_image_url(figure, base_url: str) -> str | None:
             continue
         title = (anchor.get("title") or "").lower()
         text = anchor.get_text(" ", strip=True).lower()
-        if "download" not in title and "download" not in text and not anchor.has_attr("download"):
+        if (
+            "download" not in title
+            and "download" not in text
+            and not anchor.has_attr("download")
+        ):
             continue
         rank = 1
-        if "high-res" in title or "high resolution" in title or "high-res" in text or "high resolution" in text:
+        if (
+            "high-res" in title
+            or "high resolution" in title
+            or "high-res" in text
+            or "high resolution" in text
+        ):
             rank = 3
-        elif "full-size" in title or "full size" in title or "full-size" in text or "full size" in text:
+        elif (
+            "full-size" in title
+            or "full size" in title
+            or "full-size" in text
+            or "full size" in text
+        ):
             rank = 2
-        abs_href = urljoin(base_url, href) if base_url else href
+        abs_href = _resolve_document_relative_url(base_url, href) if base_url else href
         if rank > best_rank:
             best_rank = rank
             best_url = abs_href
@@ -3174,7 +3466,7 @@ def _reinject_images(soup: BeautifulSoup, original_images: list[str]) -> Beautif
             fig.append(new_img)
 
     # Append any remaining images at the end
-    remaining = missing[len(empty_figures):]
+    remaining = missing[len(empty_figures) :]
     if remaining:
         body = soup.find("body") or soup
         for img_url in remaining:
@@ -3220,7 +3512,9 @@ def _resize_images_for_pdf(assets_dir: Path, max_width: int = 484) -> None:
                     ratio = max_width / im.width
                     new_size = (max_width, int(im.height * ratio))
                     resized = im.resize(new_size, Image.LANCZOS)
-                    save_format = _detect_raster_format(img_path)[1] or im.format or "PNG"
+                    save_format = (
+                        _detect_raster_format(img_path)[1] or im.format or "PNG"
+                    )
                     if save_format == "JPEG" and resized.mode in {"RGBA", "LA"}:
                         resized = resized.convert("RGB")
                     fd, temp_name = tempfile.mkstemp(
@@ -3231,15 +3525,22 @@ def _resize_images_for_pdf(assets_dir: Path, max_width: int = 484) -> None:
                     temp_path = Path(temp_name)
                     resized.save(temp_path, format=save_format)
                     temp_path.replace(img_path)
-                    log.debug("Resized %s: %dx%d -> %dx%d",
-                              img_path.name, im.width, im.height, *new_size)
+                    log.debug(
+                        "Resized %s: %dx%d -> %dx%d",
+                        img_path.name,
+                        im.width,
+                        im.height,
+                        *new_size,
+                    )
         except Exception as e:
             log.warning("Failed to resize %s: %s", img_path.name, e)
             if temp_path:
                 temp_path.unlink(missing_ok=True)
 
 
-def _download_image(img_url: str, assets_dir: Path, session: requests.Session) -> Path | None:
+def _download_image(
+    img_url: str, assets_dir: Path, session: requests.Session
+) -> Path | None:
     if img_url.startswith("//"):
         img_url = "https:" + img_url
     if img_url.startswith("data:"):
@@ -3427,7 +3728,7 @@ def _html_figure_to_markdown(html_figure: str) -> str | None:
     if img is None or not img.get("src"):
         return None
 
-    parts = [f'![{img.get("alt", "")}]({img["src"]})']
+    parts = [f"![{img.get('alt', '')}]({img['src']})"]
 
     heading = figure.find(["h1", "h2", "h3", "h4", "h5", "h6"])
     if heading:
@@ -3450,7 +3751,7 @@ def _html_figure_to_markdown(html_figure: str) -> str | None:
 
     if caption_text:
         if len(parts) > 1 and caption_text.startswith(parts[1]):
-            caption_text = caption_text[len(parts[1]):].lstrip(":.- \u2013\u2014")
+            caption_text = caption_text[len(parts[1]) :].lstrip(":.- \u2013\u2014")
         if caption_text:
             parts.append(caption_text)
 
@@ -3518,7 +3819,9 @@ def _normalize_escaped_markdown_links(markdown_text: str) -> str:
 
 def _unwrap_trivial_matrix_displays(markdown_text: str) -> str:
     """Simplify single-cell display matrices that Pandoc emits from block MathML."""
-    pattern = re.compile(r"\$\$\s*\\begin\{matrix\}\s*([\s\S]*?)\s*\\end\{matrix\}\s*\$\$")
+    pattern = re.compile(
+        r"\$\$\s*\\begin\{matrix\}\s*([\s\S]*?)\s*\\end\{matrix\}\s*\$\$"
+    )
 
     def replace(match: re.Match) -> str:
         body = match.group(1).strip()
@@ -3564,7 +3867,9 @@ def _normalize_tex_delimiters(markdown_text: str) -> str:
 
 def _normalize_inline_display_math_environments(markdown_text: str) -> str:
     """Promote display-style TeX environments out of inline math fences."""
-    env = r"\\begin\{(?:matrix|aligned|array)\}[\s\S]*?\\end\{(?:matrix|aligned|array)\}"
+    env = (
+        r"\\begin\{(?:matrix|aligned|array)\}[\s\S]*?\\end\{(?:matrix|aligned|array)\}"
+    )
     patterns = [
         re.compile(rf"(?<!\$)\$({env})\$\$", re.MULTILINE),
         re.compile(rf"(?<!\$)\$({env})\$(?!\$)", re.MULTILINE),
@@ -3602,8 +3907,9 @@ def _normalize_inline_display_math_environments(markdown_text: str) -> str:
 
 def _remove_stray_inline_math_dollars(markdown_text: str) -> str:
     """Drop lone `$` tokens accidentally left between prose and punctuation."""
+
     def strip_when_truly_stray(match: re.Match) -> str:
-        prefix = match.string[:match.start()]
+        prefix = match.string[: match.start()]
         if _count_inline_dollar_markers(prefix) % 2 == 1:
             return match.group(0)
         return match.group(1) + match.group(2)
@@ -3645,7 +3951,9 @@ def _split_inline_math_from_following_prose(markdown_text: str) -> str:
         lambda m: f"${m.group(1)}$ {m.group(2)} $",
         markdown_text,
     )
-    markdown_text = re.sub(r"(?<=[a-z0-9])\.(?=(Step|We|To|Given|The|Here|Where)\b)", ". ", markdown_text)
+    markdown_text = re.sub(
+        r"(?<=[a-z0-9])\.(?=(Step|We|To|Given|The|Here|Where)\b)", ". ", markdown_text
+    )
     return markdown_text
 
 
@@ -3653,10 +3961,16 @@ def _normalize_bullet_artifacts_in_markdown(markdown_text: str) -> str:
     """Collapse literal LaTeX bullet markers leaked by HTML conversion."""
     markdown_text = re.sub(r"[∙•]\s*\\\\bullet\s*", "- ", markdown_text)
     markdown_text = re.sub(r"(?m)^([ \t]*[-*+]\s*)\\\\bullet\s+", r"\1", markdown_text)
-    markdown_text = re.sub(r"(?m)^([ \t]*\d+[.)]\s*)\\\\bullet\s+", r"\1", markdown_text)
-    markdown_text = re.sub(r"(?m)^([ \t]*[-*+]\s*)[•∙]\s+(.*\S)\s*$", r"\1\2", markdown_text)
+    markdown_text = re.sub(
+        r"(?m)^([ \t]*\d+[.)]\s*)\\\\bullet\s+", r"\1", markdown_text
+    )
+    markdown_text = re.sub(
+        r"(?m)^([ \t]*[-*+]\s*)[•∙]\s+(.*\S)\s*$", r"\1\2", markdown_text
+    )
     markdown_text = re.sub(r"(?m)^([ \t]*[-*+]\s*)[•∙]\s*$", r"\1", markdown_text)
-    markdown_text = re.sub(r"(?m)^([ \t]*[-*+]\s*)\n\s*\n([ \t]+)(\S.*)$", r"\1\3", markdown_text)
+    markdown_text = re.sub(
+        r"(?m)^([ \t]*[-*+]\s*)\n\s*\n([ \t]+)(\S.*)$", r"\1\3", markdown_text
+    )
     return markdown_text
 
 
@@ -3672,7 +3986,7 @@ def _isolate_display_math_blocks(markdown_text: str) -> str:
     pieces: list[str] = []
     cursor = 0
     for match in pattern.finditer(markdown_text):
-        before = markdown_text[cursor:match.start()]
+        before = markdown_text[cursor : match.start()]
         between = before.strip("\n")
         stripped = between.strip(" \t")
 
@@ -3702,13 +4016,33 @@ def _isolate_display_math_blocks(markdown_text: str) -> str:
 
 
 def _postprocess_pdf_markdown(markdown_text: str) -> str:
-    """Clean OCR-derived markdown without affecting the HTML article pipeline."""
-    markdown_text = html.unescape(markdown_text)
-    markdown_text = _postprocess_markdown(markdown_text)
+    """Clean PDF-derived markdown from non-OCR fallback extraction."""
+    markdown_text = _fully_unescape_html(markdown_text)
+    markdown_text = markdown_text.replace("/$", r"\$")
     markdown_text = _strip_pdf_thematic_breaks(markdown_text)
     markdown_text = _normalize_latex_delimiters_in_markdown(markdown_text)
     markdown_text = _normalize_latex_in_markdown(markdown_text)
+    markdown_text = _normalize_inline_display_math_environments(markdown_text)
+    markdown_text = _isolate_display_math_blocks(markdown_text)
+    markdown_text = _unwrap_trivial_matrix_displays(markdown_text)
+    markdown_text = _postprocess_markdown_before_math_restore(markdown_text)
+    markdown_text = _postprocess_markdown_after_math_restore(markdown_text)
     markdown_text = _normalize_inline_math_spacing(markdown_text)
+    markdown_text = _strip_unsupported_katex_commands_in_pdf_markdown(markdown_text)
+    markdown_text = _strip_pdf_publisher_frontmatter(markdown_text)
+    markdown_text = _fully_unescape_html(markdown_text)
+    return markdown_text
+
+
+def _postprocess_mistral_pdf_markdown(markdown_text: str) -> str:
+    """Apply the minimal cleanup policy for Mistral OCR output only.
+
+    Preserve the OCR markdown structure as emitted: do not rewrite newlines,
+    tables, or math fences here. Only decode HTML entities and escape the OCR
+    artifact `/$` so it stays literal text.
+    """
+    markdown_text = _fully_unescape_html(markdown_text)
+    markdown_text = markdown_text.replace("/$", r"\$")
     return markdown_text
 
 
@@ -3755,7 +4089,9 @@ def _normalize_latex_in_markdown(markdown_text: str) -> str:
 
 
 def _normalize_latex_math(body: str) -> str:
-    body = body.strip()
+    body = _fully_unescape_html(body)
+    body = _cleanup_latex(body).strip()
+    body = re.sub(r"\\tag\*?\{[^{}]*\}", "", body)
     body = re.sub(r"\\([A-Za-z]+)\s+\{", r"\\\1{", body)
     body = re.sub(r"\s*([_^])\s*", r"\1", body)
     body = re.sub(r"\{\s+", "{", body)
@@ -3777,6 +4113,17 @@ def _normalize_latex_math(body: str) -> str:
     return body.strip()
 
 
+def _fully_unescape_html(text: str, rounds: int = 3) -> str:
+    """Decode HTML entities repeatedly until stable or the round limit is hit."""
+    current = text
+    for _ in range(rounds):
+        updated = html.unescape(current)
+        if updated == current:
+            break
+        current = updated
+    return current
+
+
 def _normalize_inline_math_spacing(markdown_text: str) -> str:
     """Tighten OCR-introduced spacing around inline math in prose."""
     inline_math = r"(\$[^$\n]+\$)"
@@ -3786,6 +4133,101 @@ def _normalize_inline_math_spacing(markdown_text: str) -> str:
     markdown_text = re.sub(rf"([(\[])\s+{inline_math}", r"\1\2", markdown_text)
     markdown_text = re.sub(rf"{inline_math}\s+([)\]])", r"\1\2", markdown_text)
     return markdown_text
+
+
+def _strip_unsupported_katex_commands_in_pdf_markdown(markdown_text: str) -> str:
+    """Remove unsupported TeX commands that OCR often emits outside clean math spans.
+
+    PDF/OCR markdown can contain malformed or partially fenced equations where the
+    command-level cleanup in `_normalize_latex_math()` does not run, because the
+    text is no longer matched as a single `$...$` or `$$...$$` span. KaTeX does
+    not support `\\tag{...}`, and leaving it in malformed OCR output can poison
+    the whole block. Strip it at the markdown level as a final PDF-only safety net.
+    """
+    markdown_text = re.sub(r"\\tag\*?\{[^{}]*\}", "", markdown_text)
+    markdown_text = re.sub(r"[ \t]{2,}", " ", markdown_text)
+    return markdown_text
+
+
+def _strip_pdf_publisher_frontmatter(markdown_text: str) -> str:
+    """Remove common publisher boilerplate lines leaked from PDF first pages."""
+    patterns = [
+        r"(?mi)^\s*\d{4}-\d{4}/\$\s*-\s*see front matter.*(?:\n|$)",
+        r"(?mi)^\s*©\s*\d{4}\s+Elsevier.*(?:\n|$)",
+    ]
+    for pattern in patterns:
+        markdown_text = re.sub(pattern, "", markdown_text)
+    return markdown_text
+
+
+def _isolate_pipe_tables_in_markdown(markdown_text: str) -> str:
+    """Ensure markdown pipe tables are separated from surrounding prose.
+
+    OCR/PDF conversions frequently glue captions, section prose, or footnotes
+    directly onto the first/last table row, e.g.:
+    `... dimensions are$256x256$| Metric | ...`
+    or
+    `| MIND | 20.25 | 9.78 | 320.4 | in two different sessions ...`
+    """
+    lines = markdown_text.splitlines()
+    normalized: list[str] = []
+
+    table_start = re.compile(r"(\|(?:[^|\n]*\|){3,}.*)")
+    table_row = re.compile(r"^\s*\|(?:[^|\n]*\|){3,}\s*$")
+
+    def is_probable_table_row(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped.startswith("| "):
+            return False
+        return stripped.count("|") >= 4
+
+    for raw_line in lines:
+        line = raw_line
+
+        start_match = table_start.search(line)
+        if start_match and start_match.start() > 0:
+            prefix = line[: start_match.start()].rstrip()
+            table_part = start_match.group(1).rstrip()
+            if prefix:
+                normalized.append(prefix)
+                normalized.append("")
+            line = table_part
+
+        if table_row.match(line):
+            normalized.append(line.rstrip())
+            continue
+
+        if is_probable_table_row(line):
+            pipe_positions = [idx for idx, ch in enumerate(line) if ch == "|"]
+            split_idx = None
+            for idx in reversed(pipe_positions):
+                trailing = line[idx + 1 :]
+                if trailing.strip():
+                    split_idx = idx
+                    break
+            if split_idx is not None:
+                table_part = line[: split_idx + 1].rstrip()
+                trailing_part = line[split_idx + 1 :].strip()
+                normalized.append(table_part)
+                normalized.append("")
+                normalized.append(trailing_part)
+                continue
+
+        normalized.append(line)
+
+    result_lines: list[str] = []
+    for i, line in enumerate(normalized):
+        is_table = table_row.match(line or "") is not None
+        prev_line = result_lines[-1] if result_lines else None
+        if is_table and prev_line not in (None, ""):
+            result_lines.append("")
+        result_lines.append(line)
+        next_line = normalized[i + 1] if i + 1 < len(normalized) else None
+        next_is_table = table_row.match(next_line or "") is not None
+        if is_table and next_line is not None and not next_is_table and next_line != "":
+            result_lines.append("")
+
+    return "\n".join(result_lines)
 
 
 def _prepend_source_link_html(content_html: str, url: str) -> str:
@@ -3953,7 +4395,9 @@ def _normalize_numbered_ul_to_ol(soup: BeautifulSoup) -> None:
                 and first_element.name == "span"
                 and "label" in (first_element.get("class") or [])
             ):
-                match = _REFERENCE_LABEL_PATTERN.match(first_element.get_text(strip=True))
+                match = _REFERENCE_LABEL_PATTERN.match(
+                    first_element.get_text(strip=True)
+                )
                 if match:
                     if mode is None:
                         mode = "span"
@@ -4007,7 +4451,9 @@ def _normalize_lists_for_markdown(soup: BeautifulSoup) -> None:
             if getattr(child, "name", None) == "br":
                 child.decompose()
                 continue
-            if getattr(child, "name", None) != "li" and not _node_has_substantive_content(child):
+            if getattr(
+                child, "name", None
+            ) != "li" and not _node_has_substantive_content(child):
                 child.decompose()
 
     for li in list(soup.find_all("li")):
@@ -4020,7 +4466,11 @@ def _normalize_lists_for_markdown(soup: BeautifulSoup) -> None:
             else:
                 child.decompose()
 
-        direct_lists = [child for child in li.contents if getattr(child, "name", None) in {"ul", "ol"}]
+        direct_lists = [
+            child
+            for child in li.contents
+            if getattr(child, "name", None) in {"ul", "ol"}
+        ]
         direct_non_list = [child for child in li.contents if child not in direct_lists]
 
         text_bits = []
@@ -4057,7 +4507,9 @@ def _normalize_code_listing_tables(soup: BeautifulSoup) -> None:
     """Replace syntax-highlighter layout tables with semantic pre/code blocks."""
     for table in list(soup.find_all("table")):
         classes = set(table.get("class", []))
-        code_cell = table.find("td", class_=lambda c: c and "urvanov-syntax-highlighter-code" in c.split())
+        code_cell = table.find(
+            "td", class_=lambda c: c and "urvanov-syntax-highlighter-code" in c.split()
+        )
         if "crayon-table" not in classes and code_cell is None:
             continue
 
@@ -4125,18 +4577,30 @@ def _prepare_html_for_pdf(soup: BeautifulSoup) -> None:
             continue
         if not figure.find("figcaption"):
             continue
-        for child in list(figure.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], recursive=False)):
+        for child in list(
+            figure.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], recursive=False)
+        ):
             child.decompose()
 
     for anchor in list(soup.find_all("a")):
-        children = [c for c in anchor.contents if getattr(c, "name", None) or str(c).strip()]
+        children = [
+            c for c in anchor.contents if getattr(c, "name", None) or str(c).strip()
+        ]
         if len(children) == 1 and getattr(children[0], "name", None) == "img":
             anchor.replace_with(children[0].extract())
 
     _remove_image_utility_blocks(soup)
 
     for img in soup.find_all("img"):
-        for attr in ("width", "height", "srcset", "sizes", "loading", "decoding", "style"):
+        for attr in (
+            "width",
+            "height",
+            "srcset",
+            "sizes",
+            "loading",
+            "decoding",
+            "style",
+        ):
             img.attrs.pop(attr, None)
 
 
@@ -4191,7 +4655,11 @@ def _standalone_block_image(tag):
         if len(anchor_images) == 1:
             return anchor_images[0]
 
-    if len(children) == 1 and getattr(children[0], "name", None) in {"p", "div", "figure"}:
+    if len(children) == 1 and getattr(children[0], "name", None) in {
+        "p",
+        "div",
+        "figure",
+    }:
         return _standalone_block_image(children[0])
 
     if (
@@ -4242,7 +4710,9 @@ def _remove_image_utility_blocks(soup: BeautifulSoup) -> None:
             prev = prev.find_previous_sibling(["img", "p", "div", "figure"])
         if prev is None:
             continue
-        if getattr(prev, "name", None) != "img" and not _is_standalone_image_block(prev):
+        if getattr(prev, "name", None) != "img" and not _is_standalone_image_block(
+            prev
+        ):
             continue
         block.decompose()
 
@@ -4253,7 +4723,9 @@ def _normalize_figures_for_markdown(soup: BeautifulSoup) -> None:
         replacements = []
         heading_texts = []
 
-        for child in list(figure.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], recursive=False)):
+        for child in list(
+            figure.find_all(["h1", "h2", "h3", "h4", "h5", "h6"], recursive=False)
+        ):
             text = child.get_text(" ", strip=True)
             if text:
                 heading_texts.append(text)
@@ -4294,8 +4766,12 @@ def _normalize_figures_for_markdown(soup: BeautifulSoup) -> None:
                 normalized_caption = normalized_caption.strip()
                 for heading_text in heading_texts:
                     if normalized_caption.startswith(heading_text):
-                        normalized_caption = normalized_caption[len(heading_text):].strip()
-                        normalized_caption = normalized_caption.lstrip(":.- \u2013\u2014")
+                        normalized_caption = normalized_caption[
+                            len(heading_text) :
+                        ].strip()
+                        normalized_caption = normalized_caption.lstrip(
+                            ":.- \u2013\u2014"
+                        )
             if normalized_caption:
                 caption_p = soup.new_tag("p")
                 caption_p.append(NavigableString(normalized_caption))
@@ -4452,7 +4928,7 @@ def _replace_text_in_html(soup: BeautifulSoup, needle: str, mode: str) -> None:
         if idx < 0:
             continue
         before = current[:idx]
-        after = current[idx + len(needle):]
+        after = current[idx + len(needle) :]
         replacements: list = []
         if before:
             replacements.append(NavigableString(before))
@@ -4494,16 +4970,16 @@ def _markdown_line_to_plain(line: str) -> str:
     the markdown source so the two sides can be compared.
     """
     plain = line
-    plain = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", plain)            # images → ""
-    plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", plain)        # links → anchor text
-    plain = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", plain)       # reference links
-    plain = re.sub(r"<(https?://[^>]+)>", r"\1", plain)           # auto-links → URL text
-    plain = re.sub(r"`([^`]+)`", r"\1", plain)                    # inline code
+    plain = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", plain)  # images → ""
+    plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", plain)  # links → anchor text
+    plain = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", plain)  # reference links
+    plain = re.sub(r"<(https?://[^>]+)>", r"\1", plain)  # auto-links → URL text
+    plain = re.sub(r"`([^`]+)`", r"\1", plain)  # inline code
     plain = re.sub(r"[*_]{2,3}([^*_]+?)[*_]{2,3}", r"\1", plain)  # bold
-    plain = re.sub(r"[*_]([^*_]+?)[*_]", r"\1", plain)            # italics
-    plain = re.sub(r"^\s*#{1,6}\s*", "", plain)                   # heading markers
-    plain = re.sub(r"^\s*([-*+]|\d+[.)])\s+", "", plain)          # list bullets
-    plain = re.sub(r"^\s*>+\s?", "", plain)                       # blockquotes
+    plain = re.sub(r"[*_]([^*_]+?)[*_]", r"\1", plain)  # italics
+    plain = re.sub(r"^\s*#{1,6}\s*", "", plain)  # heading markers
+    plain = re.sub(r"^\s*([-*+]|\d+[.)])\s+", "", plain)  # list bullets
+    plain = re.sub(r"^\s*>+\s?", "", plain)  # blockquotes
     return plain
 
 
@@ -4547,9 +5023,7 @@ def _strip_noise_from_markdown(
             noise_text_items.append(text)
 
     if noise_text_items:
-        noise_normalized = [
-            _normalize_for_noise_match(t) for t in noise_text_items
-        ]
+        noise_normalized = [_normalize_for_noise_match(t) for t in noise_text_items]
         lines = cleaned.split("\n")
         kept_lines: list[str] = []
         for line in lines:
@@ -4590,7 +5064,7 @@ def _strip_noise_from_markdown(
         for idx in image_noise_indices:
             if 0 <= idx < len(matches):
                 span = matches[idx]
-                cleaned = cleaned[: span.start()] + cleaned[span.end():]
+                cleaned = cleaned[: span.start()] + cleaned[span.end() :]
                 matches = list(image_pattern.finditer(cleaned))
 
     if strip_references:
@@ -4621,7 +5095,7 @@ def regenerate_reading_pdf(
     page_cfg = _PAGE_SIZES.get(page_size.lower(), _PAGE_SIZES["a5"])
     md_raw = article_path.read_text(encoding="utf-8")
     match = re.match(r"^---\n.*?\n---\n\n?", md_raw, re.DOTALL)
-    body = md_raw[match.end():] if match else md_raw
+    body = md_raw[match.end() :] if match else md_raw
     if highlights or strip_references:
         body = _strip_noise_from_markdown(
             body,
@@ -4868,13 +5342,21 @@ def _separate_inline_math_from_text(soup: BeautifulSoup) -> None:
         prev_node = math_tag.previous_sibling
         if isinstance(prev_node, NavigableString):
             prev_text = str(prev_node)
-            if prev_text and not prev_text[-1].isspace() and re.search(r"[\w\)\]\}.,;:!?]$", prev_text):
+            if (
+                prev_text
+                and not prev_text[-1].isspace()
+                and re.search(r"[\w\)\]\}.,;:!?]$", prev_text)
+            ):
                 prev_node.replace_with(NavigableString(prev_text + " "))
 
         next_node = math_tag.next_sibling
         if isinstance(next_node, NavigableString):
             next_text = str(next_node)
-            if next_text and not next_text[0].isspace() and re.match(r"[\w\(\[\{]", next_text):
+            if (
+                next_text
+                and not next_text[0].isspace()
+                and re.match(r"[\w\(\[\{]", next_text)
+            ):
                 next_node.replace_with(NavigableString(" " + next_text))
 
 
