@@ -2229,7 +2229,14 @@ def _save_mistral_page_images(
 
 
 def _postprocess_mistral_markdown(page_markdowns: list[str]) -> str:
-    return "".join(page_markdown for page_markdown in page_markdowns if page_markdown)
+    parts: list[str] = []
+    for page_markdown in page_markdowns:
+        if not page_markdown:
+            continue
+        if parts and page_markdown.startswith("|"):
+            parts.append("\n\n")
+        parts.append(page_markdown)
+    return "".join(parts)
 
 
 def _pdf_text_to_markdown(text: str) -> str:
@@ -4039,10 +4046,25 @@ def _postprocess_mistral_pdf_markdown(markdown_text: str) -> str:
 
     Preserve the OCR markdown structure as emitted: do not rewrite newlines,
     tables, or math fences here. Only decode HTML entities and escape the OCR
-    artifact `/$` so it stays literal text.
+    artifact `/$` so it stays literal text. Display math emitted as `\[ ... \]`
+    is normalized to `$ ... $` for the reader so trailing equation numbers like
+    `(6)` remain outside the math span.
     """
     markdown_text = _fully_unescape_html(markdown_text)
     markdown_text = markdown_text.replace("/$", r"\$")
+    markdown_text = re.sub(
+        r"\\small\s*\\begin\{split\}",
+        r"\\begin{aligned}",
+        markdown_text,
+    )
+    markdown_text = markdown_text.replace(r"\end{split}", r"\end{aligned}")
+    markdown_text = re.sub(r"\\small\b", "", markdown_text)
+    markdown_text = re.sub(
+        r"\\\[\s*([\s\S]*?)\s*\\\]",
+        lambda m: "$" + m.group(1).strip() + "$",
+        markdown_text,
+        flags=re.DOTALL,
+    )
     return markdown_text
 
 
