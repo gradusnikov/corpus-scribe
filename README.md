@@ -269,6 +269,85 @@ The current browser UI supports:
 
 ![Corpus Scribe bundle layout](docs/bundle-demo.svg)
 
+## MCP server
+
+Corpus Scribe includes a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that exposes the library to any MCP-compatible host — Claude Desktop, Claude Code, Cursor, or custom agents. The server lives in `scripts/scribe.py` and runs as a stdio transport, so the host spawns it directly rather than connecting to an HTTP endpoint.
+
+### Why MCP
+
+The MCP layer turns the corpus into a tool-equipped knowledge base that an LLM can navigate during conversation. Without it, the LLM would need the full text of every relevant article pasted into context. With it, the LLM can search, triage, and selectively read only the parts it needs — the same way a human skims a table of contents before reading a section.
+
+### Setup
+
+Add a server entry to your MCP host configuration. For Claude Desktop or Claude Code, add to the MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "scribe-mcp": {
+      "command": "python",
+      "args": ["/path/to/send-to-scribe/scripts/scribe.py", "mcp-server"],
+      "env": {
+        "SCRIBE_API_BASE": "http://127.0.0.1:5000"
+      }
+    }
+  }
+}
+```
+
+The `mcp` Python package must be installed in the environment the host uses to spawn the server (`pip install mcp` or `uv tool install mcp`). The Flask backend must be running.
+
+### Tools
+
+The server exposes 13 tools. They fall into four groups:
+
+**Context and navigation**
+- `get_current_context` — what the desktop reader currently has open (focused document, open tabs, label filter)
+- `list_labels` — top-level corpus folders
+- `list_documents` — compact metadata list, optionally filtered by label
+- `search` — PubMed-style field queries (`(CSD[Title]) AND (Tournier JD[Author])`)
+
+**Reading**
+- `read_document` — full article body with noise and references stripped by default
+- `list_sections` — heading outline with per-section character counts
+- `read_section` — a single section by heading, case-insensitive match
+
+**Highlights and notes**
+- `get_highlights` — user-saved highlights with comments (noise-variant excluded)
+- `read_notes` — companion `.notes.md` body
+- `append_notes` — additive write to notes without replacing existing content
+- `update_notes` — whole-file replace of notes
+
+**Related documents**
+- `get_related` — user-curated related-document links for cross-paper navigation
+
+### Optimized reading for context efficiency
+
+Academic papers in the corpus can be 50k–150k characters. Loading full documents into an LLM's context window is expensive and often unnecessary — most tasks only need a few sections. The MCP server provides a progressive-disclosure reading pattern that keeps context token usage low:
+
+1. **`list_sections`** fetches the document outline without any body text. Each entry includes the heading name, nesting level, and character count, so the LLM can see the structure of a 100-page paper in a few hundred tokens and decide which parts matter.
+
+2. **`read_section`** fetches a single section by heading (case-insensitive, with prefix-match fallback). Only the targeted slice — including nested subsections — enters the context. A typical section is 2k–10k characters instead of the full 100k.
+
+3. **`read_document`** with `stripNoise=true` (default) removes content the user has marked as noise — author affiliations, page headers, boilerplate. Setting `stripReferences=true` (also default) drops the references section, which in academic papers can be 20–40% of the total length. Together these flags can cut a document's token footprint in half before the LLM sees it.
+
+The recommended workflow for a long paper is: `list_sections` to survey, then `read_section` for the parts that matter. Reserve `read_document` for short articles or when the user explicitly asks for the full body.
+
+For cross-paper research, `search` and `list_documents` return compact metadata (title, authors, rating, DOI, excerpt) — enough to triage dozens of candidates without reading any bodies. Follow up with `get_highlights` on promising hits: highlights are typically a few hundred tokens and represent what the user already considered important.
+
+### CLI mirror
+
+The same `scripts/scribe.py` file doubles as a CLI that mirrors the core MCP tools:
+
+```bash
+python scripts/scribe.py search "diffusion models"
+python scripts/scribe.py read /output/ml/Paper/Paper.md
+python scripts/scribe.py context
+python scripts/scribe.py update-notes /output/ml/Paper/Paper.md --from-file notes.md
+```
+
+Pass `--json` for machine-readable output. The CLI uses only the Python standard library and does not require the `mcp` package.
+
 ## API
 
 All endpoints accept JSON with an `apiKey` field for authentication (default: `api-key-1234`, configurable via `API_KEY` env var).
