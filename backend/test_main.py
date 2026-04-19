@@ -1324,6 +1324,108 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["success"])
 
+    def test_desktop_bibliography_generates_all_formats(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Label" / "Article" / "Article.md"
+            article_path.parent.mkdir(parents=True, exist_ok=True)
+            article_path.write_text(
+                "---\n"
+                'title: "Test Article"\n'
+                'authors: "Alice Smith, Bob Jones"\n'
+                'year: "2024"\n'
+                'journal: "Nature"\n'
+                'doi: "10.1234/test"\n'
+                'url: "https://example.com/article"\n'
+                'citation_key: "smith2024test"\n'
+                'entry_type: "article"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            for fmt in ("bibtex", "apa", "ieee", "mla", "chicago", "harvard"):
+                response = self.client.get(
+                    "/desktop/bibliography",
+                    query_string={"articlePath": str(article_path), "format": fmt},
+                )
+                self.assertEqual(response.status_code, 200, f"{fmt}: {response.get_json()}")
+                payload = response.get_json()
+                self.assertTrue(payload["success"])
+                self.assertIn("Test Article", payload["citation"])
+                self.assertEqual(payload["format"], fmt)
+
+            bibtex = self.client.get(
+                "/desktop/bibliography",
+                query_string={"articlePath": str(article_path), "format": "bibtex"},
+            ).get_json()["citation"]
+            self.assertIn("smith2024test", bibtex)
+            self.assertIn("Alice Smith, Bob Jones", bibtex)
+            self.assertIn("Nature", bibtex)
+
+            apa = self.client.get(
+                "/desktop/bibliography",
+                query_string={"articlePath": str(article_path), "format": "apa"},
+            ).get_json()["citation"]
+            self.assertIn("Smith, Alice", apa)
+            self.assertIn("(2024)", apa)
+            self.assertIn("*Nature*", apa)
+            self.assertIn("doi.org", apa)
+
+    def test_desktop_bibliography_falls_back_year_from_ingested_at(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "No Year Article"\n'
+                'ingested_at: "2025-03-15T10:00:00+00:00"\n'
+                'source_site: "example.com"\n'
+                'citation_key: "anon2025noyear"\n'
+                'entry_type: "misc"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            response = self.client.get(
+                "/desktop/bibliography",
+                query_string={"articlePath": str(article_path), "format": "apa"},
+            )
+            payload = response.get_json()
+            self.assertIn("2025", payload["citation"])
+            self.assertIn("example.com", payload["citation"])
+
+    def test_desktop_bibliography_invalid_format_returns_400(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text("---\ntitle: \"X\"\n---\n\nBody.\n", encoding="utf-8")
+            response = self.client.get(
+                "/desktop/bibliography",
+                query_string={"articlePath": str(article_path), "format": "xyz"},
+            )
+            self.assertEqual(response.status_code, 400)
+
+    def test_desktop_bibliography_save_writes_bib_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_path = Path(tmpdir) / "Article.md"
+            article_path.write_text(
+                "---\n"
+                'title: "Saved Bib"\n'
+                'authors: "Jane Doe"\n'
+                'year: "2023"\n'
+                'citation_key: "doe2023saved"\n'
+                'entry_type: "article"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            response = self.client.post(
+                "/desktop/bibliography",
+                json={"articlePath": str(article_path), "format": "bibtex", "save": True},
+            )
+            payload = response.get_json()
+            self.assertTrue(payload["saved"])
+            bib_path = article_path.with_suffix(".bib")
+            self.assertTrue(bib_path.exists())
+            bib_text = bib_path.read_text(encoding="utf-8")
+            self.assertIn("doe2023saved", bib_text)
+            self.assertIn("Jane Doe", bib_text)
+
     def test_desktop_browse_directory_lists_subdirectories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -21,6 +21,7 @@ from pathvalidate import sanitize_filename
 import pypandoc
 
 from article_extractor import (
+    _build_bibtex_entry,
     _build_frontmatter,
     _generate_companion_notes,
     _notes_doc_id,
@@ -192,6 +193,11 @@ def _frontmatter_int(frontmatter: dict, key: str) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _extract_year(text: str) -> str | None:
+    m = re.search(r"(19|20)\d{2}", text)
+    return m.group(0) if m else None
 
 
 def _coerce_rating(value) -> int:
@@ -673,7 +679,7 @@ def _build_search_document(path: Path) -> dict:
             "canonicalUrl": canonical_url,
             "authors": authors or None,
             "doi": doi or None,
-            "year": metadata_text.get("year"),
+            "year": metadata_text.get("year") or _extract_year(metadata_text.get("date") or metadata_text.get("published") or ingested_at or ""),
             "arxivId": arxiv_id or None,
             "pmid": pmid or None,
             "pmcid": pmcid or None,
@@ -2462,6 +2468,198 @@ def desktop_document():
             "frontmatter": frontmatter,
             "related": related,
         },
+    )
+
+
+_CITATION_FORMATS = {"bibtex", "apa", "ieee", "mla", "chicago", "harvard"}
+
+
+def _format_citation_from_frontmatter(frontmatter: dict, fmt: str) -> str:
+    title = _frontmatter_string(frontmatter, "title") or ""
+    authors = _frontmatter_string(frontmatter, "authors") or _frontmatter_string(frontmatter, "author") or ""
+    year = _frontmatter_string(frontmatter, "year") or _extract_year(_frontmatter_string(frontmatter, "date") or _frontmatter_string(frontmatter, "ingested_at") or "") or ""
+    journal = _frontmatter_string(frontmatter, "journal") or ""
+    doi = _frontmatter_string(frontmatter, "doi") or ""
+    url = _frontmatter_string(frontmatter, "url") or ""
+    canonical_url = _frontmatter_string(frontmatter, "canonical_url") or ""
+    arxiv_id = _frontmatter_string(frontmatter, "arxiv_id") or ""
+    entry_type = _frontmatter_string(frontmatter, "entry_type") or "misc"
+    citation_key = _frontmatter_string(frontmatter, "citation_key") or "unknown"
+    source_site = _frontmatter_string(frontmatter, "source_site") or ""
+    description = _frontmatter_string(frontmatter, "description") or ""
+    publisher = _frontmatter_string(frontmatter, "publisher") or ""
+    volume = _frontmatter_string(frontmatter, "volume") or ""
+    issue = _frontmatter_string(frontmatter, "issue") or ""
+    pages = _frontmatter_string(frontmatter, "pages") or ""
+    effective_url = canonical_url or url
+
+    if fmt == "bibtex":
+        return _build_bibtex_entry(
+            entry_type=entry_type,
+            citation_key=citation_key,
+            title=title,
+            author=authors or None,
+            date=year or None,
+            url=effective_url or None,
+            source_site=source_site or None,
+            description=description or None,
+            doi=doi or None,
+            arxiv_id=arxiv_id or None,
+            container_title=journal or None,
+            publisher=publisher or None,
+            volume=volume or None,
+            issue=issue or None,
+            pages=pages or None,
+        )
+
+    author_list = [a.strip() for a in re.split(r"\s*(?:,| and |;)\s*", authors) if a.strip()] if authors else []
+
+    def _last_first(name: str) -> str:
+        parts = name.split()
+        if len(parts) < 2:
+            return name
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+
+    def _initials(name: str) -> str:
+        parts = name.split()
+        if len(parts) < 2:
+            return name
+        return f"{parts[-1]}, " + " ".join(p[0] + "." for p in parts[:-1] if p)
+
+    def _et_al(names: list[str], formatter, limit: int = 3, join: str = ", ") -> str:
+        if not names:
+            return ""
+        formatted = [formatter(n) for n in names[:limit]]
+        if len(names) > limit:
+            return join.join(formatted) + ", et al."
+        if len(formatted) > 1:
+            return join.join(formatted[:-1]) + f", & {formatted[-1]}"
+        return formatted[0]
+
+    loc = ""
+    if journal:
+        loc = f"*{journal}*"
+        if volume:
+            loc += f", *{volume}*"
+            if issue:
+                loc += f"({issue})"
+        if pages:
+            loc += f", {pages}"
+        loc += "."
+    elif source_site:
+        loc = f"*{source_site}*."
+
+    doi_link = f"https://doi.org/{doi}" if doi else ""
+
+    if fmt == "apa":
+        a = _et_al(author_list, _last_first)
+        parts = [f"{a} ({year})." if a and year else f"({year})." if year else ""]
+        parts.append(f"{title}.")
+        if loc:
+            parts.append(loc)
+        if doi_link:
+            parts.append(doi_link)
+        elif effective_url:
+            parts.append(effective_url)
+        return " ".join(p for p in parts if p)
+
+    if fmt == "ieee":
+        a = _et_al(author_list, _initials, limit=6, join=", ")
+        parts = []
+        if a:
+            parts.append(f"{a},")
+        parts.append(f'"{title},"')
+        if loc:
+            parts.append(loc)
+        if year:
+            parts.append(f"{year}.")
+        if doi_link:
+            parts.append(f"doi: {doi}.")
+        elif effective_url:
+            parts.append(f"[Online]. Available: {effective_url}")
+        return " ".join(p for p in parts if p)
+
+    if fmt == "mla":
+        a = _et_al(author_list, _last_first)
+        parts = [f"{a}." if a else ""]
+        parts.append(f'"{title}."')
+        if loc:
+            parts.append(loc)
+        if year:
+            parts.append(f"{year}.")
+        if doi_link:
+            parts.append(doi_link)
+        elif effective_url:
+            parts.append(f"Web. {effective_url}")
+        return " ".join(p for p in parts if p)
+
+    if fmt == "chicago":
+        a = _et_al(author_list, _last_first)
+        parts = [f"{a}." if a else ""]
+        if year:
+            parts.append(f"{year}.")
+        parts.append(f'"{title}."')
+        if loc:
+            parts.append(loc)
+        if doi_link:
+            parts.append(doi_link)
+        elif effective_url:
+            parts.append(effective_url)
+        return " ".join(p for p in parts if p)
+
+    if fmt == "harvard":
+        a = _et_al(author_list, _last_first)
+        parts = [f"{a}" if a else ""]
+        if year:
+            parts.append(f"({year})")
+        parts.append(f"'{title}',")
+        if loc:
+            parts.append(loc)
+        if doi_link:
+            parts.append(f"doi: {doi}.")
+        elif effective_url:
+            parts.append(f"Available at: {effective_url}.")
+        return " ".join(p for p in parts if p)
+
+    return ""
+
+
+@app.route("/desktop/bibliography", methods=["GET", "POST"])
+def desktop_bibliography():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+    else:
+        data = dict(request.args)
+    article_path = Path((data.get("articlePath") or "").strip())
+    fmt = (data.get("format") or "bibtex").strip().lower()
+    save = bool(data.get("save"))
+    if not article_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    if not article_path.exists():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+    if fmt not in _CITATION_FORMATS:
+        return jsonify(success=False, message=f"Unsupported format: {fmt}. Supported: {', '.join(sorted(_CITATION_FORMATS))}"), 400
+
+    content = article_path.read_text(encoding="utf-8")
+    frontmatter, _ = _split_frontmatter(content)
+    bib_path = _sibling_if_exists(article_path, "bib")
+    if bib_path is None:
+        bib_path = article_path.with_suffix(".bib")
+    _backfill_metadata_from_bib(bib_path, frontmatter)
+
+    citation = _format_citation_from_frontmatter(frontmatter, fmt)
+
+    saved = False
+    if save and fmt == "bibtex":
+        bib_path.write_text(citation, encoding="utf-8")
+        saved = True
+
+    return jsonify(
+        success=True,
+        format=fmt,
+        citation=citation,
+        saved=saved,
+        formats=sorted(_CITATION_FORMATS),
     )
 
 
