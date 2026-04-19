@@ -7,6 +7,7 @@ It captures messy publisher pages and source PDFs, normalizes them into **clean,
 It includes:
 
 - a Chrome extension for one-click capture
+- a Zotero plugin for sending library items with metadata and notes
 - a Dockerized Flask backend
 - a browser reader for search, reading, highlights, notes, and bibliography review
 
@@ -133,6 +134,13 @@ corpus-scribe/
     popup.html / popup.js     # extension UI
     background.js
     assets/
+  zotero-plugin/
+    manifest.json             # Zotero WebExtension manifest
+    bootstrap.js              # lifecycle hooks (startup/shutdown)
+    prefs.js                  # default preferences
+    content/
+      corpus-scribe.js        # plugin logic (menu, upload, metadata)
+      preferences.xhtml       # settings pane
   desktop/
     src/                      # browser reader + notes/highlights UI
     vite.config.ts
@@ -186,6 +194,28 @@ The primary workflow is:
 - optionally generate notes and reading PDFs
 
 Kindle delivery is supported, but it is an export path, not the center of the system.
+
+### Zotero plugin
+
+The Zotero plugin sends library items directly from Zotero to the Corpus Scribe backend. It works with Zotero 7 and 8.
+
+What it does:
+
+- Right-click one or more Zotero items and choose **Send to Corpus Scribe**
+- The plugin reads the PDF attachment, extracts Zotero metadata (title, authors, DOI, date, publication, abstract, etc.), and uploads everything to the backend
+- If the Zotero item has child notes, they are converted from HTML to Markdown and sent as working notes
+- The backend processes the PDF through the standard extraction pipeline (Mistral OCR or pdftotext fallback) with the Zotero metadata taking precedence over OCR-extracted metadata
+- A label prompt lets you file the item into an existing or new corpus label
+
+Installation:
+
+1. Build or download `zotero_plugin.zip` from the `zotero-plugin/` directory
+2. In Zotero, go to **Tools → Add-ons**
+3. Click the gear icon → **Install Add-on From File** and select the `.zip`
+4. Open the plugin preferences (Zotero **Settings → Corpus Scribe**) and configure:
+   - **API Base URL** — the backend address (default `http://127.0.0.1:5000`)
+   - **API Key** — must match the backend `API_KEY` (default `api-key-1234`)
+   - **Page Size** — reading PDF page size (A4, A5, or Letter)
 
 ## Reader UI
 
@@ -324,6 +354,33 @@ Response fields of interest:
   "bib": "/output/Papers/Article Title/Article Title.bib",
   "pdfAvailable": true,
   "sourcePdfAvailable": true,
+  "primary": "/output/Papers/Article Title/Article Title.md"
+}
+```
+
+### `POST /save_pdf_upload`
+
+Upload a PDF file directly with optional metadata overrides and working notes. This is the endpoint used by the Zotero plugin.
+
+Accepts `multipart/form-data` with these fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `file` | yes | The PDF file |
+| `apiKey` | yes | API authentication key |
+| `label` | yes | Corpus label to file under |
+| `pageSize` | no | Reading PDF page size (`a4`, `a5`, `letter`; default `a5`) |
+| `sourceName` | no | Original filename |
+| `metadata` | no | JSON string with citation overrides (`title`, `author`, `doi`, `date`, `url`, `container_title`, `publisher`, `volume`, `issue`, `pages`, `abstract`) |
+| `note` | no | Markdown text to save as a `.notes.md` companion file |
+
+Response:
+
+```json
+{
+  "success": true,
+  "title": "Article Title",
+  "label": "Papers",
   "primary": "/output/Papers/Article Title/Article Title.md"
 }
 ```
