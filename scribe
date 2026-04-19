@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}"
+COMPOSE="${REPO_ROOT}/scripts/compose-with-home-env.sh"
+DESKTOP_DIR="${REPO_ROOT}/desktop"
+FRONTEND_PID_FILE="${REPO_ROOT}/.frontend.pid"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+info()  { printf "${CYAN}%s${RESET}\n" "$*"; }
+ok()    { printf "${GREEN}%s${RESET}\n" "$*"; }
+warn()  { printf "${YELLOW}%s${RESET}\n" "$*"; }
+err()   { printf "${RED}%s${RESET}\n" "$*" >&2; }
+
+backend_running() {
+    docker compose -f "${REPO_ROOT}/docker-compose.yml" ps --status running 2>/dev/null | grep -q backend
+}
+
+frontend_running() {
+    [[ -f "$FRONTEND_PID_FILE" ]] && kill -0 "$(cat "$FRONTEND_PID_FILE")" 2>/dev/null
+}
+
+start_backend() {
+    info "Building and starting backend..."
+    "$COMPOSE" up -d --build backend
+    ok "Backend running on http://localhost:5000"
+}
+
+stop_backend() {
+    info "Stopping backend..."
+    "$COMPOSE" down
+    ok "Backend stopped."
+}
+
+restart_backend() {
+    info "Rebuilding and restarting backend..."
+    "$COMPOSE" up -d --build backend
+    ok "Backend restarted on http://localhost:5000"
+}
+
+hotswap_backend() {
+    info "Hot-swapping backend code (no rebuild)..."
+    docker compose -f "${REPO_ROOT}/docker-compose.yml" cp backend/main.py backend:/app/main.py
+    docker compose -f "${REPO_ROOT}/docker-compose.yml" cp backend/article_extractor.py backend:/app/article_extractor.py
+    docker compose -f "${REPO_ROOT}/docker-compose.yml" restart backend
+    ok "Backend code swapped and restarted."
+}
+
+start_frontend() {
+    if frontend_running; then
+        warn "Frontend already running (PID $(cat "$FRONTEND_PID_FILE"))."
+        return
+    fi
+    if [[ ! -d "${DESKTOP_DIR}/node_modules" ]]; then
+        info "Installing frontend dependencies..."
+        (cd "$DESKTOP_DIR" && npm install)
+    fi
+    info "Starting frontend dev server..."
+    (cd "$DESKTOP_DIR" && npm run dev &)
+    local pid=$!
+    echo "$pid" > "$FRONTEND_PID_FILE"
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        ok "Frontend running on http://localhost:1420  (PID $pid)"
+    else
+        err "Frontend failed to start."
+        rm -f "$FRONTEND_PID_FILE"
+        return 1
+    fi
+}
+
+stop_frontend() {
+    if frontend_running; then
+        local pid
+        pid=$(cat "$FRONTEND_PID_FILE")
+        info "Stopping frontend (PID $pid)..."
+        kill "$pid" 2>/dev/null || true
+        # Also kill any child vite processes
+        pkill -P "$pid" 2>/dev/null || true
+        rm -f "$FRONTEND_PID_FILE"
+        ok "Frontend stopped."
+    else
+        rm -f "$FRONTEND_PID_FILE"
+        warn "Frontend is not running."
+    fi
+}
+
+run_tests() {
+    info "Running backend tests..."
+    docker compose -f "${REPO_ROOT}/docker-compose.yml" exec -T backend python -m unittest -v test_main
+}
+
+show_logs() {
+    "$COMPOSE" logs -f backend
+}
+
+show_status() {
+    printf "\n${BOLD}Corpus Scribe${RESET}\n\n"
+
+    if backend_running; then
+        ok "  Backend:   running  http://localhost:5000"
+    else
+        err "  Backend:   stopped"
+    fi
+
+    if frontend_running; then
+        ok "  Frontend:  running  http://localhost:1420  (PID $(cat "$FRONTEND_PID_FILE"))"
+    else
+        err "  Frontend:  stopped"
+    fi
+    echo
+}
+
+usage() {
+    echo ""
+    printf "${BOLD}Usage:${RESET} scribe <command>\n"
+    echo ""
+    printf "${BOLD}Commands:${RESET}\n"
+    printf "  ${CYAN}start${RESET}            Start backend (build) and frontend\n"
+    printf "  ${CYAN}stop${RESET}             Stop backend and frontend\n"
+    printf "  ${CYAN}restart${RESET}          Rebuild and restart everything\n"
+    printf "  ${CYAN}status${RESET}           Show what's running\n"
+    echo ""
+    printf "  ${CYAN}backend start${RESET}    Build and start backend only\n"
+    printf "  ${CYAN}backend stop${RESET}     Stop backend\n"
+    printf "  ${CYAN}backend restart${RESET}  Rebuild and restart backend\n"
+    printf "  ${CYAN}backend swap${RESET}     Hot-swap .py files without rebuilding image\n"
+    printf "  ${CYAN}backend logs${RESET}     Tail backend logs\n"
+    printf "  ${CYAN}backend test${RESET}     Run backend test suite\n"
+    echo ""
+    printf "  ${CYAN}frontend start${RESET}   Start Vite dev server\n"
+    printf "  ${CYAN}frontend stop${RESET}    Stop Vite dev server\n"
+    echo ""
+}
+
+case "${1:-}" in
+    start)
+        start_backend
+        start_frontend
+        show_status
+        ;;
+    stop)
+        stop_frontend
+        stop_backend
+        show_status
+        ;;
+    restart)
+        stop_frontend
+        restart_backend
+        start_frontend
+        show_status
+        ;;
+    status)
+        show_status
+        ;;
+    backend|be)
+        case "${2:-}" in
+            start)   start_backend ;;
+            stop)    stop_backend ;;
+            restart) restart_backend ;;
+            swap)    hotswap_backend ;;
+            logs)    show_logs ;;
+            test)    run_tests ;;
+            *)       err "Unknown backend command: ${2:-}"; usage; exit 1 ;;
+        esac
+        ;;
+    frontend|fe)
+        case "${2:-}" in
+            start)   start_frontend ;;
+            stop)    stop_frontend ;;
+            *)       err "Unknown frontend command: ${2:-}"; usage; exit 1 ;;
+        esac
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
