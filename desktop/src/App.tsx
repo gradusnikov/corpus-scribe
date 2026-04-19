@@ -4280,25 +4280,38 @@ function App() {
                   size="lg"
                   ariaLabel="Rate this article"
                 />
-                <select
-                  className="label-select"
-                  value={detail.summary.label ?? ''}
-                  onChange={(e) => {
-                    const value = e.target.value
-                    if (value === '__new__') {
-                      const name = window.prompt('New label name:')
-                      if (name?.trim()) void changeLabel(name.trim())
-                    } else {
-                      void changeLabel(value)
-                    }
-                  }}
-                >
-                  <option value="">unlabeled</option>
-                  {library.labels.map((l) => (
-                    <option key={l} value={l}>{l}</option>
-                  ))}
-                  <option value="__new__">+ New label…</option>
-                </select>
+                <span className="label-chip-group">
+                  <span className="document-label">{detail.summary.label ?? 'unlabeled'}</span>
+                  <span className="label-edit-wrapper">
+                    <button
+                      type="button"
+                      className="label-edit-btn"
+                      title="Change label"
+                      aria-label="Change label"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                    </button>
+                    <select
+                      className="label-select-overlay"
+                      value={detail.summary.label ?? ''}
+                      onChange={(e) => {
+                        const value = e.target.value
+                        if (value === '__new__') {
+                          const name = window.prompt('New label name:')
+                          if (name?.trim()) void changeLabel(name.trim())
+                        } else {
+                          void changeLabel(value)
+                        }
+                      }}
+                    >
+                      <option value="">unlabeled</option>
+                      {library.labels.map((l) => (
+                        <option key={l} value={l}>{l}</option>
+                      ))}
+                      <option value="__new__">+ New label…</option>
+                    </select>
+                  </span>
+                </span>
                 {detail.summary.url ? (
                   <a
                     className="reader-source-link"
