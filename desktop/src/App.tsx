@@ -36,6 +36,9 @@ type DocumentSummary = {
   url: string | null
   canonicalUrl: string | null
   excerpt: string
+  authors: string | null
+  year: string | null
+  journal: string | null
   affinityScore?: number
 }
 
@@ -4205,8 +4208,10 @@ function App() {
                   ) : null}
                 </div>
                 <strong>{doc.title}</strong>
-                <span className="document-meta">{doc.sourceSite ?? 'local'} {doc.ingestedAt ? `• ${doc.ingestedAt.slice(0, 10)}` : ''}</span>
-                <p>{doc.excerpt}</p>
+                {doc.authors ? <span className="document-meta">{doc.authors}</span> : null}
+                <span className="document-meta">
+                  {[doc.journal ?? doc.sourceSite ?? 'local', doc.year].filter(Boolean).join(' · ')}
+                </span>
               </button>
             ))}
             {!visibleDocuments.length ? (

@@ -1997,11 +1997,19 @@ def _derive_citation_metadata(
         issue=issue,
         pages=pages,
     )
+    year = None
+    if date:
+        year_match = re.search(r"(19|20)\d{2}", date)
+        if year_match:
+            year = year_match.group(0)
     frontmatter = {
         "citation_key": citation_key,
         "doi": doi,
         "arxiv_id": arxiv_id,
         "entry_type": entry_type,
+        "authors": author,
+        "year": year,
+        "journal": container_title,
     }
     return {
         "citation_key": citation_key,

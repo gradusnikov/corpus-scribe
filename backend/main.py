@@ -585,6 +585,21 @@ def _path_mtime_ns(path: Path | None) -> int:
         return 0
 
 
+_BIB_FIELD_RE = re.compile(r"^\s*(author|year|journal)\s*=\s*\{(.+?)\}", re.MULTILINE | re.IGNORECASE)
+_BIB_TO_METADATA = {"author": "authors", "year": "year", "journal": "journal"}
+
+
+def _backfill_metadata_from_bib(bib_path: Path, metadata: dict[str, str]) -> None:
+    try:
+        bib_text = bib_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    for match in _BIB_FIELD_RE.finditer(bib_text):
+        key = _BIB_TO_METADATA.get(match.group(1).lower(), match.group(1).lower())
+        if key not in metadata:
+            metadata[key] = match.group(2).strip()
+
+
 def _build_search_document(path: Path) -> dict:
     content = path.read_text(encoding="utf-8")
     frontmatter, body = _split_frontmatter(content)
@@ -604,6 +619,9 @@ def _build_search_document(path: Path) -> dict:
         value = _frontmatter_text_field(frontmatter, key)
         if value:
             metadata_text[key] = value
+
+    if bib_path:
+        _backfill_metadata_from_bib(bib_path, metadata_text)
 
     notes_body = ""
     if notes_path:
@@ -2198,7 +2216,7 @@ def _fts_phrase(text: str) -> str:
 def _search_term_uses_prefix(text: str, quoted: bool) -> bool:
     if quoted:
         return False
-    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", text))
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_]*", text))
 
 
 def _compile_search_term_query(text: str, field: str, quoted: bool) -> str:
@@ -2274,14 +2292,15 @@ def _search_result_from_row(row: sqlite3.Row) -> dict:
         "url": row["url"],
         "canonicalUrl": row["canonical_url"],
         "excerpt": row["excerpt"] or "",
+        "authors": row["authors"],
+        "year": row["year"],
+        "journal": row["journal"],
     }
 
 
 def _indexed_document_from_row(row: sqlite3.Row) -> dict:
     doc = _search_result_from_row(row)
-    doc["authors"] = row["authors"]
     doc["doi"] = row["doi"]
-    doc["year"] = row["year"]
     doc["arxivId"] = row["arxiv_id"]
     doc["pmid"] = row["pmid"]
     doc["pmcid"] = row["pmcid"]

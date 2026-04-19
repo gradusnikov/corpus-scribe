@@ -442,14 +442,22 @@ class MainApiTests(unittest.TestCase):
                 "/desktop/notes/generate",
                 json={"articlePath": str(article_path)},
             )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.get_json()["success"])
 
+            for t in threading.enumerate():
+                if t.name == "scribe-notes-async":
+                    t.join(timeout=5.0)
+
+            status_response = self.client.get(
+                "/desktop/notes/status",
+                query_string={"articlePath": str(article_path)},
+            )
+            status = status_response.get_json()
             article_text = article_path.read_text(encoding="utf-8")
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["success"])
-        self.assertEqual(payload["notesPath"], str(notes_path))
-        self.assertIn("- Generated.", payload["notesMarkdown"])
+        self.assertEqual(status["notesPath"], str(notes_path))
+        self.assertIn("- Generated.", status["notesMarkdown"])
         self.assertIn('notes_file: "Article.notes.md"', article_text)
         self.assertIn('notes_doc_id: "fixture-article:notes"', article_text)
 
@@ -460,7 +468,7 @@ class MainApiTests(unittest.TestCase):
         captured = {}
         completion = threading.Event()
 
-        def fake_generate(path, config):
+        def fake_generate(path, config, **kwargs):
             captured["path"] = path
             captured["config"] = config
             completion.set()
@@ -477,7 +485,7 @@ class MainApiTests(unittest.TestCase):
 
         completion = threading.Event()
 
-        def boom(path, config):
+        def boom(path, config, **kwargs):
             completion.set()
             raise RuntimeError("LLM down")
 
