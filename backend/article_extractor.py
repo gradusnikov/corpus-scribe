@@ -2233,7 +2233,7 @@ def _postprocess_mistral_markdown(page_markdowns: list[str]) -> str:
     for page_markdown in page_markdowns:
         if not page_markdown:
             continue
-        if parts and page_markdown.startswith("|"):
+        if parts and (page_markdown.startswith("|") or page_markdown.startswith("#")):
             parts.append("\n\n")
         parts.append(page_markdown)
     return "".join(parts)

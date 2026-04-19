@@ -159,6 +159,98 @@ class MainApiTests(unittest.TestCase):
             f"{tmpdir}/Papers/Fixture PDF/Fixture PDF.md",
         )
 
+    @patch("main.extract_pdf_bytes")
+    def test_save_pdf_upload_stores_metadata_and_working_notes(self, extract_pdf_bytes_mock):
+        import io
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_dir = Path(tmpdir) / "Zotero" / "Fixture"
+            article_dir.mkdir(parents=True)
+            md_path = article_dir / "Fixture.md"
+            md_path.write_text("---\ntitle: Fixture\n---\n\nBody\n", encoding="utf-8")
+
+            extract_pdf_bytes_mock.return_value = {
+                "title": "Fixture",
+                "dir": str(article_dir),
+                "file-path": None,
+                "source-pdf-path": str(article_dir / "Fixture.source.pdf"),
+                "bib-path": str(article_dir / "Fixture.bib"),
+                "md-path": str(md_path),
+                "notes-path": None,
+                "notes-doc-id": None,
+                "metadata": {
+                    "doc_id": "fix123",
+                    "url": "https://doi.org/10.1000/example",
+                    "canonical_url": "https://doi.org/10.1000/example",
+                    "label": "Zotero",
+                    "source_site": "doi.org",
+                    "source_format": "pdf",
+                    "citation_key": "doe2026fixture",
+                    "doi": "10.1000/example",
+                    "arxiv_id": None,
+                    "page_count": 4,
+                    "language": "en",
+                    "word_count": 100,
+                    "image_count": 0,
+                    "ingested_at": "2026-04-15T10:00:00+00:00",
+                },
+            }
+
+            metadata_payload = {
+                "title": "Fixture",
+                "author": "Jane Doe",
+                "doi": "10.1000/example",
+                "url": "https://doi.org/10.1000/example",
+                "date": "2026",
+                "container_title": "Journal of Fixtures",
+            }
+            with patch.object(main, "_upsert_index_records") as upsert_mock:
+                response = self.client.post(
+                    "/save_pdf_upload",
+                    data={
+                        "apiKey": main.API_KEY,
+                        "label": "Zotero",
+                        "pageSize": "a4",
+                        "sourceName": "paper.pdf",
+                        "metadata": json.dumps(metadata_payload),
+                        "note": "Key insight: regularization helps.",
+                        "file": (io.BytesIO(b"%PDF-1.4 fake"), "paper.pdf"),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["label"], "Zotero")
+            self.assertEqual(payload["primary"], str(md_path))
+            self.assertTrue(payload["notesAvailable"])
+            notes_path = Path(payload["notes"])
+            self.assertTrue(notes_path.exists())
+            notes_text = notes_path.read_text(encoding="utf-8")
+            self.assertIn("Key insight: regularization helps.", notes_text)
+            self.assertIn('doc_type: "notes"', notes_text)
+
+            call_kwargs = extract_pdf_bytes_mock.call_args.kwargs
+            self.assertEqual(call_kwargs["output_dir"], f"{tmpdir}/Zotero")
+            self.assertEqual(call_kwargs["label"], "Zotero")
+            self.assertEqual(call_kwargs["page_size"], "a4")
+            self.assertEqual(call_kwargs["source_name"], "paper.pdf")
+            self.assertEqual(call_kwargs["url"], "https://doi.org/10.1000/example")
+            self.assertEqual(call_kwargs["pdf_bytes"], b"%PDF-1.4 fake")
+            self.assertEqual(
+                call_kwargs["citation_overrides"]["author"], "Jane Doe"
+            )
+            upsert_mock.assert_called()
+
+    def test_save_pdf_upload_rejects_missing_api_key(self):
+        response = self.client.post(
+            "/save_pdf_upload",
+            data={"label": "Zotero"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 401)
+
     def test_labels_returns_existing_output_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

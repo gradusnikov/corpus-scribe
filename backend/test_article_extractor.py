@@ -35,6 +35,7 @@ from article_extractor import (
     _prepare_html_for_markdown,
     _prepare_html_for_pdf,
     _preferred_figure_image_url,
+    _resolve_document_relative_url,
     _render_html_to_pdf_with_chromium,
     _resolve_notes_client_config,
     _resize_images_for_pdf,
@@ -265,6 +266,29 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
             self.assertEqual(rewritten, '<figure><img src="assets/figure.png" /></figure>')
             self.assertTrue((assets_dir / "figure.png").exists())
 
+    def test_collect_markdown_image_assets_downloads_remote_markdown_images(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = Path(tmpdir) / "src"
+            assets_dir = Path(tmpdir) / "assets"
+            source_dir.mkdir()
+            assets_dir.mkdir()
+
+            with unittest.mock.patch(
+                "article_extractor._download_markdown_asset",
+                return_value=("remote-figure.png", "image"),
+            ) as download_mock:
+                rewritten = _collect_markdown_image_assets(
+                    "![caption](https://arxiv.org/html/extracted/6445955/figures/method_overview.png)",
+                    source_dir,
+                    assets_dir,
+                )
+
+            self.assertEqual(rewritten, "![caption](assets/remote-figure.png)")
+            download_mock.assert_called_once_with(
+                "https://arxiv.org/html/extracted/6445955/figures/method_overview.png",
+                assets_dir,
+            )
+
     def test_collect_markdown_image_assets_renders_pdf_embeds_to_png(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source_dir = Path(tmpdir) / "src"
@@ -482,15 +506,75 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
         text = (
             "At timestep  $t$ , draw  $k _ {\\mathrm {i n i t}}$ . "
             "Inline $\\alpha_ {t} = \\frac {1} {2}$ and "
-            "display $$\\mathbf {A} _ {t} = \\left\\{a _ {t} ^ {(1)}\\right\\}$$ "
+            "display $$\\mathbf {A} _ {t} = \\left\\{a _ {t} ^ {(1)}\\right\\}\\tag{1}$$ "
+            "and $$\\mathcal{D}\\Big%\\n{(}x,y\\Big{)}$$ "
             "plus escaped prose &lt; 0.4 and $k _ {\\mathrm {i n i t}}$."
         )
         cleaned = _postprocess_pdf_markdown(text)
         self.assertIn("At timestep $t$, draw $k_{\\mathrm{init}}$.", cleaned)
         self.assertIn("$\\alpha_{t} = \\frac{1}{2}$", cleaned)
         self.assertIn("$$\\mathbf{A}_{t} = \\left\\{a_{t}^{(1)}\\right\\}$$", cleaned)
+        self.assertIn("$$\\mathcal{D}\\Big(x,y\\Big)$$", cleaned)
+        self.assertNotIn("\\tag{1}", cleaned)
         self.assertIn("< 0.4", cleaned)
         self.assertIn("$k_{\\mathrm{init}}$", cleaned)
+
+    def test_pdf_markdown_postprocess_preserves_valid_inline_math_fences(self):
+        text = (
+            "That is, $b = E\\rho.$ Here, $\\rho \\in C^{N \\times 1}$ is arranged as a vector. "
+            "The encoding operator may be expressed as $E = W D F C M,$ where $M$ denotes motion."
+        )
+
+        cleaned = _postprocess_pdf_markdown(text)
+
+        self.assertIn("That is, $b = E\\rho.$ Here,", cleaned)
+        self.assertIn("$\\rho \\in C^{N \\times 1}$ is arranged as a vector.", cleaned)
+        self.assertIn("$E = W D F C M,$ where $M$ denotes motion.", cleaned)
+
+    def test_pdf_markdown_postprocess_strips_tag_from_malformed_display_context(self):
+        text = (
+            "using:$$\\mathrm{NMI}(x)=y\\tag{1}$$Alternatively, "
+            "the next sentence continues."
+        )
+
+        cleaned = _postprocess_pdf_markdown(text)
+
+        self.assertIn("using:\n\n$$\\mathrm{NMI}(x)=y$$\n\nAlternatively,", cleaned)
+        self.assertNotIn("\\tag{1}", cleaned)
+
+    def test_pdf_markdown_postprocess_strips_publisher_frontmatter_and_isolates_tables(self):
+        text = (
+            "1361-8415/$- see front matter © 2012 Elsevier B.V. All rights reserved.\n"
+            "Table 2 Computation time. The image dimensions are$256\\times 256$| Metric | Similarity term | Full registration |\n"
+            "| --- | --- | --- |\n"
+            "| MIND | 9.78 | 320.4 | in two different sessions there are non-rigid deformations.\n"
+        )
+
+        cleaned = _postprocess_pdf_markdown(text)
+
+        self.assertNotIn("1361-8415/$", cleaned)
+        self.assertNotIn("see front matter", cleaned)
+        self.assertIn("Table 2 Computation time. The image dimensions are$256\\times 256$", cleaned)
+        self.assertIn("\n\n| Metric | Similarity term | Full registration |\n| --- | --- | --- |\n| MIND | 9.78 | 320.4 |\n\nin two different sessions", cleaned)
+
+    def test_pdf_markdown_postprocess_preserves_absolute_value_bars_and_heading_breaks(self):
+        text = (
+            "differences between descriptors:\n\n"
+            "$$\n"
+            "\\mathcal{S}(\\mathbf{x}) = \\frac{1}{|R|} \\sum_{\\mathbf{r} \\in R} |\\mathrm{MIND}(I, \\mathbf{x}, \\mathbf{r}) - \\mathrm{MIND}(J, \\mathbf{x}, \\mathbf{r})|\n"
+            "$$\n"
+            "This requires $|R|$ computations.\n"
+            "Body text.\n### Variance\nMore text.\nBullets intro.\n- first\n- second\nTail prose.\nNumbered intro.\n1. one\n2. two\nDone.\n"
+        )
+
+        cleaned = _postprocess_pdf_markdown(text)
+
+        self.assertIn("\\frac{1}{|R|}", cleaned)
+        self.assertIn("This requires $|R|$ computations.", cleaned)
+        self.assertNotIn("\n|R|\n", cleaned)
+        self.assertIn("Body text.\n\n### Variance\n\nMore text.", cleaned)
+        self.assertIn("Bullets intro.\n\n- first\n- second\n\nTail prose.", cleaned)
+        self.assertIn("Numbered intro.\n\n1. one\n2. two\n\nDone.", cleaned)
 
     def test_pdf_markdown_postprocess_removes_page_separator_thematic_breaks(self):
         text = (
@@ -1160,6 +1244,17 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
 
         self.assertIn("https://ars.els-cdn.com/content/image/1-s2.0-S0925231219301961-gr7_lrg.jpg", images)
 
+    def test_resolve_document_relative_url_preserves_arxiv_html_article_path(self):
+        resolved = _resolve_document_relative_url(
+            "https://arxiv.org/html/2503.24121v3",
+            "extracted/6445955/figures/featuresMap.png",
+        )
+
+        self.assertEqual(
+            resolved,
+            "https://arxiv.org/html/2503.24121v3/extracted/6445955/figures/featuresMap.png",
+        )
+
     def test_download_image_uses_actual_image_bytes_not_misleading_headers(self):
         png_rgba = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         png_rgba.close()
@@ -1390,7 +1485,12 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
 
             with patch(
                 "article_extractor._extract_pdf_markdown_via_mistral",
-                return_value=("## OCR Output\n\n- Equation: $E = mc^2$\n", {"pages": [{"markdown": "x"}]}),
+                return_value=(
+                    "## OCR Output\n\n"
+                    "- Equation: $$\\mathrm{NMI} (x) = y\\tag{1}$$\n"
+                    "- Delimiter: $$\\mathcal{D}\\Big%\\n{(}x,y\\Big{)}$$\n",
+                    {"pages": [{"markdown": "x"}]},
+                ),
             ):
                 result = extract_pdf_bytes(
                     pdf_bytes=pdf_path.read_bytes(),
@@ -1420,7 +1520,9 @@ See \cite{CKM2025,RL87}. Let $\xbar{\mU}_j$ be the average."""
             self.assertIn('citation_key: "', md_text)
             self.assertIn('source_file: "fixture.pdf"', md_text)
             self.assertIn('page_count: 1', md_text)
-            self.assertIn("Equation: $E = mc^2$", md_text)
+            self.assertIn("Equation: $$\\mathrm{NMI}(x) = y$$", md_text)
+            self.assertIn("Delimiter: $$\\mathcal{D}\\Big(x,y\\Big)$$", md_text)
+            self.assertNotIn("\\tag{1}", md_text)
             self.assertIn("@misc{", bib_text)
             self.assertIn("archivePrefix = {arXiv}", bib_text)
             self.assertIn("eprint = {2604.08369}", bib_text)

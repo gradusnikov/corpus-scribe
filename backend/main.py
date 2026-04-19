@@ -29,6 +29,7 @@ from article_extractor import (
     _strip_noise_from_markdown,
     extract_article,
     extract_url,
+    extract_pdf_bytes,
     extract_pdf_url,
     regenerate_reading_pdf,
 )
@@ -1643,6 +1644,113 @@ def save_pdf():
 
     if metadata.get("md-path"):
         _spawn_async_notes_generation(Path(metadata["md-path"]), notes_config)
+
+    return jsonify(**payload)
+
+
+@app.route("/save_pdf_upload", methods=["POST"])
+def save_pdf_upload():
+    """Accept a directly-uploaded PDF (e.g. from the Zotero plugin).
+
+    Expects multipart/form-data with a ``file`` part and form fields for
+    ``apiKey``, ``label``, ``pageSize``, plus an optional ``metadata`` JSON
+    blob carrying Zotero citation fields and an optional ``note`` markdown
+    string that is written as the article's ``.notes.md`` companion.
+    """
+    api_key_value = request.form.get("apiKey") or request.args.get("apiKey") or ""
+    if not _check_api_key({"apiKey": api_key_value}):
+        return jsonify(success=False, message="Unauthorized"), 401
+
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify(success=False, message="Missing 'file' upload"), 400
+
+    pdf_bytes = upload.read()
+    if not pdf_bytes:
+        return jsonify(success=False, message="Uploaded file is empty"), 400
+
+    label = request.form.get("label", "")
+    page_size = request.form.get("pageSize", "a5")
+    source_name = request.form.get("sourceName") or upload.filename or "document.pdf"
+
+    raw_metadata = request.form.get("metadata") or ""
+    try:
+        citation_overrides = json.loads(raw_metadata) if raw_metadata else {}
+    except json.JSONDecodeError as exc:
+        return jsonify(success=False, message=f"Invalid metadata JSON: {exc}"), 400
+    if not isinstance(citation_overrides, dict):
+        return jsonify(success=False, message="metadata must be a JSON object"), 400
+
+    note_text = (request.form.get("note") or "").strip()
+    target_dir = _resolve_output_dir(label)
+    override_url = (citation_overrides.get("url") or "").strip()
+    app.logger.info(
+        "Ingesting uploaded PDF from client (save_pdf_upload) url=%s label=%s",
+        override_url or "<none>",
+        label or "<none>",
+    )
+
+    metadata = extract_pdf_bytes(
+        pdf_bytes=pdf_bytes,
+        output_dir=str(target_dir),
+        url=override_url,
+        source_name=source_name,
+        label=_clean_label(label),
+        page_size=page_size,
+        generate_notes=False,
+        notes_config={},
+        render_pdf=False,
+        citation_overrides=citation_overrides,
+    )
+
+    notes_path_value = metadata.get("notes-path")
+    notes_doc_id_value = metadata.get("notes-doc-id")
+    if note_text:
+        md_path = Path(metadata["md-path"])
+        notes_file = md_path.with_name(md_path.stem + ".notes.md")
+        notes_doc_id_value = _notes_doc_id(metadata["metadata"]["doc_id"])
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        notes_fields = {
+            "title": f"Notes: {metadata['title']}",
+            "doc_id": notes_doc_id_value,
+            "doc_type": "notes",
+            "article_doc_id": metadata["metadata"]["doc_id"],
+            "article_title": metadata["title"],
+            "article_md": md_path.name,
+            "label": _clean_label(label) or None,
+            "language": "en",
+            "source_format": "zotero",
+            "generator": "zotero-import",
+            "ingested_at": now_iso,
+            "updated_at": now_iso,
+        }
+        notes_file.write_text(
+            _build_frontmatter(notes_fields) + "\n\n" + note_text.strip() + "\n",
+            encoding="utf-8",
+        )
+        notes_path_value = str(notes_file)
+
+    app.logger.info("Saved uploaded PDF to %s", metadata["dir"])
+
+    payload = {
+        "success": True,
+        "title": metadata["title"],
+        "label": _clean_label(label),
+        "dir": metadata["dir"],
+        "pdf": metadata["file-path"],
+        "sourcePdf": metadata.get("source-pdf-path"),
+        "bib": metadata.get("bib-path"),
+        "md": metadata["md-path"],
+        "primary": metadata["md-path"],
+        "pdfAvailable": bool(metadata["file-path"]),
+        "sourcePdfAvailable": bool(metadata.get("source-pdf-path")),
+        "notes": notes_path_value,
+        "notesAvailable": bool(notes_path_value),
+        "notesPending": False,
+        "notesDocId": notes_doc_id_value,
+        "metadata": metadata.get("metadata", {}),
+    }
+    _upsert_index_records(_build_index_records(payload, _clean_label(label)))
 
     return jsonify(**payload)
 
