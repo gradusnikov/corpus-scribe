@@ -1528,6 +1528,11 @@ function App() {
   const [searchResults, setSearchResults] = useState<DocumentSummary[] | null>(null)
   const [searchTotal, setSearchTotal] = useState<number | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
+  const navHistoryRef = useRef<string[]>([])
+  const navIndexRef = useRef(-1)
+  const navSkipPushRef = useRef(false)
+  const [canGoBack, setCanGoBack] = useState(false)
+  const [canGoForward, setCanGoForward] = useState(false)
   const [detail, setDetail] = useState<DocumentDetail | null>(null)
   const [sourceDraft, setSourceDraft] = useState('')
   const [sourceSavedSnapshot, setSourceSavedSnapshot] = useState('')
@@ -1676,6 +1681,7 @@ function App() {
   const sourceEditorViewRef = useRef<EditorView | null>(null)
   const notesAutoScrollingRef = useRef(false)
   const activeDocIdRef = useRef<string | null>(null)
+  const visibleDocsRef = useRef<DocumentSummary[]>([])
   const settingsMenuRef = useRef<HTMLDivElement | null>(null)
   const hashRefreshAttemptedRef = useRef<string | null>(null)
   const focusedArticlePathRef = useRef<string | null>(null)
@@ -1997,6 +2003,27 @@ function App() {
   }, [])
 
   useEffect(() => {
+    function onNavKey(event: KeyboardEvent) {
+      if (!event.altKey) return
+      if (event.key === 'ArrowLeft') { event.preventDefault(); navigateBack() }
+      if (event.key === 'ArrowRight') { event.preventDefault(); navigateForward() }
+      if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+        event.preventDefault()
+        const docs = visibleDocsRef.current
+        if (!docs.length) return
+        const currentId = activeDocIdRef.current
+        const idx = currentId ? docs.findIndex((d) => d.id === currentId) : -1
+        const next = event.key === 'ArrowUp'
+          ? (idx <= 0 ? docs.length - 1 : idx - 1)
+          : (idx < 0 || idx >= docs.length - 1 ? 0 : idx + 1)
+        startTransition(() => setActiveId(docs[next].id))
+      }
+    }
+    window.addEventListener('keydown', onNavKey)
+    return () => window.removeEventListener('keydown', onNavKey)
+  }, [])
+
+  useEffect(() => {
     setHighlightCursor((current) => {
       if (!highlights.length) return 0
       return Math.min(current, highlights.length - 1)
@@ -2282,6 +2309,12 @@ function App() {
     }
   }, [activeId, library.documents, searchResults])
 
+  useEffect(() => {
+    if (!activeId) return
+    const el = document.querySelector('.document-card.active')
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [activeId])
+
   const activeDocumentId = detail?.summary.id ?? null
 
   useEffect(() => {
@@ -2422,7 +2455,44 @@ function App() {
     }
   }
 
+  function updateNavButtons() {
+    setCanGoBack(navIndexRef.current > 0)
+    setCanGoForward(navIndexRef.current < navHistoryRef.current.length - 1)
+  }
+
+  function pushNavHistory(articlePath: string) {
+    if (navSkipPushRef.current) {
+      navSkipPushRef.current = false
+      return
+    }
+    const history = navHistoryRef.current
+    const idx = navIndexRef.current
+    if (history[idx] === articlePath) return
+    navHistoryRef.current = [...history.slice(0, idx + 1), articlePath]
+    navIndexRef.current = navHistoryRef.current.length - 1
+    updateNavButtons()
+  }
+
+  function navigateBack() {
+    if (navIndexRef.current <= 0) return
+    navIndexRef.current -= 1
+    const path = navHistoryRef.current[navIndexRef.current]
+    updateNavButtons()
+    navSkipPushRef.current = true
+    void loadDocumentByPath(path)
+  }
+
+  function navigateForward() {
+    if (navIndexRef.current >= navHistoryRef.current.length - 1) return
+    navIndexRef.current += 1
+    const path = navHistoryRef.current[navIndexRef.current]
+    updateNavButtons()
+    navSkipPushRef.current = true
+    void loadDocumentByPath(path)
+  }
+
   async function loadDocumentByPath(articlePath: string, statusTitle?: string) {
+    pushNavHistory(articlePath)
     setLoadingDetail(true)
     setStatus(statusTitle ? `Loading ${statusTitle}…` : 'Loading…')
     try {
@@ -3466,6 +3536,7 @@ function App() {
         }
         return true
       })
+  visibleDocsRef.current = visibleDocuments
 
   const effectiveArticleMarkdown = useMemo(
     () => (detail ? sourceDraft : ''),
@@ -4270,7 +4341,17 @@ function App() {
       <main className="reader-pane">
         <header className="reader-header">
           <div className="reader-header-main">
-            <p className="eyebrow">Reader</p>
+            <div className="eyebrow">
+              <span>Reader</span>
+              <span className="nav-buttons">
+                <button type="button" className="nav-btn" onClick={navigateBack} disabled={!canGoBack} title="Back (Alt+Left)" aria-label="Go back">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/></svg>
+                </button>
+                <button type="button" className="nav-btn" onClick={navigateForward} disabled={!canGoForward} title="Forward (Alt+Right)" aria-label="Go forward">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>
+                </button>
+              </span>
+            </div>
             <h2>{detail?.summary.title ?? 'No document selected'}</h2>
             {detail ? (
               <div className="reader-header-row">
@@ -5061,6 +5142,16 @@ function App() {
                   >
                     {loadingSuggestions ? 'Suggesting…' : 'Suggest'}
                   </button>
+                  {relatedSuggestions.length ? (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => setRelatedSuggestions([])}
+                      title="Clear suggestions"
+                    >
+                      Clear
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="ghost-button"
