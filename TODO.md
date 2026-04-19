@@ -94,15 +94,13 @@
 ## Chrome Extension
 
 1. [x] Feature: Remove send to scribe button
-
 2. [x] Feature: Add a button to open the document in Corpus Scribe
-
 3. [x] Bug: Open in Corpus Scribe button should open the downloaded md file
-
 4. [x] Bug: When user tries to re-download already existing article, do not re-download
-
 5. [x] Bug: Note summaries should be async. No need to wait for notes, to open the extracted article.
-
 6. [x] Feature: If possible download the source PDF (e.g. from pubmed, or science direct, or archive - similar to Zotero, this may require per-site rules)
 
+## Zotero plugin
+1. [x] Feature: Allow to export a Zotero entry to Corpus Scribe. Take meta data from zotero, process PDF with the PDF stream by the backend, ask which label to assign.
+2. [x] Feature: If a Zotero entry has notes, convert them to Working Notes
    
