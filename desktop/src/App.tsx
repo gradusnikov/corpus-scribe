@@ -1907,6 +1907,10 @@ function App() {
         return
       }
       if (!event || typeof event.type !== 'string') return
+      if (event.type === 'library_synced') {
+        void refreshLibrary()
+        return
+      }
       if (!refetchTypes.has(event.type)) return
       const targetPath = event.articlePath
       const currentPath = focusedArticlePathRef.current

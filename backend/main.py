@@ -489,6 +489,7 @@ def _search_schema_is_current(conn: sqlite3.Connection) -> bool:
         "article_path text",
         "authors text",
         "highlights_mtime_ns integer",
+        "notes_pending integer",
     )
     required_fts = (
         "author",
@@ -546,7 +547,8 @@ def _ensure_search_schema(conn: sqlite3.Connection) -> None:
             publisher TEXT,
             article_mtime_ns INTEGER NOT NULL,
             notes_mtime_ns INTEGER NOT NULL DEFAULT 0,
-            highlights_mtime_ns INTEGER NOT NULL DEFAULT 0
+            highlights_mtime_ns INTEGER NOT NULL DEFAULT 0,
+            notes_pending INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -658,6 +660,7 @@ def _build_search_document(path: Path) -> dict:
             "pmid": pmid or None,
             "pmcid": pmcid or None,
             "excerpt": _excerpt_from_markdown(body),
+            "notesPending": 1 if _notes_generation_pending(path) else 0,
         },
         "search": {
             "title": title,
@@ -721,8 +724,9 @@ def _upsert_search_document(conn: sqlite3.Connection, document: dict) -> None:
             publisher,
             article_mtime_ns,
             notes_mtime_ns,
-            highlights_mtime_ns
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            highlights_mtime_ns,
+            notes_pending
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(article_path) DO UPDATE SET
             doc_key = excluded.doc_key,
             title = excluded.title,
@@ -751,7 +755,8 @@ def _upsert_search_document(conn: sqlite3.Connection, document: dict) -> None:
             publisher = excluded.publisher,
             article_mtime_ns = excluded.article_mtime_ns,
             notes_mtime_ns = excluded.notes_mtime_ns,
-            highlights_mtime_ns = excluded.highlights_mtime_ns
+            highlights_mtime_ns = excluded.highlights_mtime_ns,
+            notes_pending = excluded.notes_pending
         """,
         (
             summary["id"],
@@ -783,6 +788,7 @@ def _upsert_search_document(conn: sqlite3.Connection, document: dict) -> None:
             mtimes["article_mtime_ns"],
             mtimes["notes_mtime_ns"],
             mtimes["highlights_mtime_ns"],
+            summary["notesPending"],
         ),
     )
     row_id = conn.execute(
@@ -832,6 +838,63 @@ def _upsert_search_document(conn: sqlite3.Connection, document: dict) -> None:
     )
 
 
+def _resolve_search_db_root(article_path: Path) -> Path | None:
+    """Find the corpus root that owns the search DB for *article_path*.
+
+    Returns None if no DB file exists yet (skip rather than create one
+    from scratch on a hot write path).
+    """
+    candidate = Path(OUTPUT_DIR)
+    if _search_db_path(candidate).exists():
+        return candidate
+    p = article_path.parent
+    while p != p.parent:
+        if _search_db_path(p).exists():
+            return p
+        p = p.parent
+    return None
+
+
+def _inline_upsert_search_db(article_path: Path) -> None:
+    """Rebuild and upsert a single document's search DB record."""
+    root = _resolve_search_db_root(article_path)
+    if root is None:
+        return
+    conn = _open_search_db(root)
+    try:
+        _ensure_search_schema(conn)
+        document = _build_search_document(article_path)
+        _upsert_search_document(conn, document)
+        conn.commit()
+    except Exception as exc:
+        app.logger.warning("Inline search DB upsert failed for %s: %s", article_path, exc)
+    finally:
+        conn.close()
+
+
+def _update_search_field(article_path: Path, **fields) -> None:
+    """Targeted UPDATE on the documents table (no FTS rebuild)."""
+    if not fields:
+        return
+    root = _resolve_search_db_root(article_path)
+    if root is None:
+        return
+    columns = list(fields.keys())
+    set_clause = ", ".join(f"{col} = ?" for col in columns)
+    values = [fields[col] for col in columns]
+    conn = _open_search_db(root)
+    try:
+        conn.execute(
+            f"UPDATE documents SET {set_clause} WHERE article_path = ?",
+            [*values, str(article_path)],
+        )
+        conn.commit()
+    except Exception as exc:
+        app.logger.warning("Targeted search DB update failed for %s: %s", article_path, exc)
+    finally:
+        conn.close()
+
+
 def _sync_search_index(root: Path) -> dict[str, int | str]:
     conn = _open_search_db(root)
     try:
@@ -878,6 +941,8 @@ def _sync_search_index(root: Path) -> dict[str, int | str]:
                 _upsert_search_document(conn, document)
                 indexed += 1
                 updated += 1
+                if updated % 50 == 0:
+                    conn.commit()
             except Exception as exc:
                 app.logger.warning("Search index sync skipped %s: %s", path, exc)
                 errors += 1
@@ -900,6 +965,53 @@ def _sync_search_index(root: Path) -> dict[str, int | str]:
         }
     finally:
         conn.close()
+
+
+_bg_sync_lock = threading.Lock()
+_bg_sync_started: dict[str, bool] = {}
+_BG_SYNC_INTERVAL = 60
+
+
+def _ensure_background_sync_started(root: Path) -> None:
+    key = str(root)
+    if key in _bg_sync_started:
+        return
+    with _bg_sync_lock:
+        if key in _bg_sync_started:
+            return
+        conn = _open_search_db(root)
+        try:
+            _ensure_search_schema(conn)
+            count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        finally:
+            conn.close()
+        if count == 0:
+            _sync_search_index(root)
+        _bg_sync_started[key] = True
+        thread = threading.Thread(
+            target=_background_sync_loop,
+            args=(root,),
+            name=f"scribe-bg-sync-{root.name}",
+            daemon=True,
+        )
+        thread.start()
+
+
+def _background_sync_loop(root: Path) -> None:
+    while True:
+        try:
+            result = _sync_search_index(root)
+            changed = (result.get("updated") or 0) + (result.get("removed") or 0)
+            if changed:
+                _publish_desktop_event(
+                    "library_synced",
+                    updated=result.get("updated", 0),
+                    removed=result.get("removed", 0),
+                    indexed=result.get("indexed", 0),
+                )
+        except Exception as exc:
+            app.logger.warning("Background sync failed for %s: %s", root, exc)
+        time.sleep(_BG_SYNC_INTERVAL)
 
 
 def _remove_search_records_for_article(article_path: Path) -> int:
@@ -1382,6 +1494,7 @@ def _spawn_async_notes_generation(
                 message="Working notes ready.",
                 notes_path=payload.get("notes"),
             )
+            _inline_upsert_search_db(article_path)
         except Exception:
             if _notes_generation_cancel_requested(article_path):
                 _write_notes_generation_status(
@@ -1589,6 +1702,8 @@ def save_local():
         "metadata": metadata.get("metadata", {}),
     }
     _upsert_index_records(_build_index_records(payload, _clean_label(label)))
+    if metadata.get("md-path"):
+        _inline_upsert_search_db(Path(metadata["md-path"]))
 
     if metadata.get("md-path"):
         _spawn_async_notes_generation(Path(metadata["md-path"]), notes_config)
@@ -1641,6 +1756,8 @@ def save_pdf():
         "metadata": metadata.get("metadata", {}),
     }
     _upsert_index_records(_build_index_records(payload, _clean_label(label)))
+    if metadata.get("md-path"):
+        _inline_upsert_search_db(Path(metadata["md-path"]))
 
     if metadata.get("md-path"):
         _spawn_async_notes_generation(Path(metadata["md-path"]), notes_config)
@@ -1751,6 +1868,8 @@ def save_pdf_upload():
         "metadata": metadata.get("metadata", {}),
     }
     _upsert_index_records(_build_index_records(payload, _clean_label(label)))
+    if metadata.get("md-path"):
+        _inline_upsert_search_db(Path(metadata["md-path"]))
 
     return jsonify(**payload)
 
@@ -1803,7 +1922,8 @@ def desktop_library():
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
 
-    documents = _scan_library_documents(root)
+    _ensure_background_sync_started(root)
+    documents = _load_indexed_documents(root)
     labels = sorted({doc["label"] for doc in documents if doc.get("label")}, key=str.casefold)
     return jsonify(success=True, root=str(root), labels=labels, documents=documents)
 
@@ -2142,7 +2262,7 @@ def _search_result_from_row(row: sqlite3.Row) -> dict:
         "label": row["label"],
         "articlePath": row["article_path"],
         "notesPath": row["notes_path"],
-        "notesPending": False,
+        "notesPending": bool(row["notes_pending"]),
         "bibPath": row["bib_path"],
         "highlightsPath": row["highlights_path"],
         "highlightCount": int(row["highlight_count"] or 0),
@@ -2257,14 +2377,14 @@ def desktop_search():
     except _SearchQueryError as exc:
         return jsonify(success=False, message=f"Invalid query: {exc}"), 400
 
-    sync_info = _sync_search_index(root)
+    _ensure_background_sync_started(root)
     results, total = _run_indexed_search(root, tree, label or None, limit=200)
     return jsonify(
         success=True,
         documents=results,
         total=total,
         truncated=total > len(results),
-        indexPath=sync_info["dbPath"],
+        indexPath=str(_search_db_path(root)),
     )
 
 
@@ -2405,6 +2525,7 @@ def desktop_save_notes():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _inline_upsert_search_db(article_path)
     _publish_desktop_event("notes_updated", article_path, notesPath=str(notes_path))
     return jsonify(success=True, notesPath=str(notes_path), notesMarkdown=notes_markdown, notesPending=False)
 
@@ -2425,6 +2546,7 @@ def desktop_save_document():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _inline_upsert_search_db(article_path)
     _publish_desktop_event("document_updated", article_path)
     return jsonify(success=True, articlePath=str(article_path), markdown=markdown)
 
@@ -2552,6 +2674,7 @@ def desktop_save_highlights():
         cleaned.append(cleaned_item)
 
     highlights_path = _write_highlights(article_path, cleaned)
+    _inline_upsert_search_db(article_path)
     _publish_desktop_event(
         "highlights_updated",
         article_path,
@@ -2695,7 +2818,7 @@ def desktop_suggest_related():
     root = _resolve_library_root(request.args.get("root"))
     if not root.exists():
         return jsonify(success=False, message=f"Corpus root does not exist: {root}"), 404
-    _sync_search_index(root)
+    _ensure_background_sync_started(root)
 
     try:
         body = _read_markdown_body(article_path)
@@ -2939,6 +3062,7 @@ def desktop_save_rating():
 
     payload = _build_existing_article_payload(article_path)
     _upsert_index_records(_build_index_records(payload, payload["label"]))
+    _update_search_field(article_path, rating=rating, article_mtime_ns=_path_mtime_ns(article_path))
     _publish_desktop_event("rating_updated", article_path, rating=rating)
     return jsonify(success=True, articlePath=str(article_path), rating=rating)
 
