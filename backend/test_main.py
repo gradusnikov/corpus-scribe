@@ -1426,6 +1426,94 @@ class MainApiTests(unittest.TestCase):
             self.assertIn("doe2023saved", bib_text)
             self.assertIn("Jane Doe", bib_text)
 
+    def test_desktop_change_label_moves_bundle(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            old_dir = Path(tmpdir) / "OldLabel" / "Article"
+            old_dir.mkdir(parents=True)
+            article = old_dir / "Article.md"
+            article.write_text(
+                "---\n"
+                'title: "Movable Article"\n'
+                'doc_id: "movable"\n'
+                'label: "OldLabel"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            notes = old_dir / "Article.notes.md"
+            notes.write_text(
+                "---\n"
+                'title: "Movable Article Notes"\n'
+                'label: "OldLabel"\n'
+                "---\n\nNotes.\n",
+                encoding="utf-8",
+            )
+            bib = old_dir / "Article.bib"
+            bib.write_text("@misc{movable, title={Movable Article}}\n", encoding="utf-8")
+
+            response = self.client.post(
+                "/desktop/label",
+                json={"articlePath": str(article), "label": "NewLabel"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["success"])
+            self.assertTrue(payload["moved"])
+            self.assertEqual(payload["label"], "NewLabel")
+            self.assertEqual(payload["oldLabel"], "OldLabel")
+
+            new_article = Path(payload["articlePath"])
+            self.assertTrue(new_article.exists())
+            self.assertIn("NewLabel", str(new_article))
+            self.assertFalse(article.exists())
+
+            new_text = new_article.read_text(encoding="utf-8")
+            self.assertIn('label: "NewLabel"', new_text)
+
+            new_notes = new_article.with_name("Article.notes.md")
+            self.assertTrue(new_notes.exists())
+            notes_text = new_notes.read_text(encoding="utf-8")
+            self.assertIn('label: "NewLabel"', notes_text)
+
+            self.assertTrue(new_article.with_name("Article.bib").exists())
+            self.assertFalse(old_dir.exists())
+
+    def test_desktop_change_label_same_label_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            article_dir = Path(tmpdir) / "MyLabel" / "Article"
+            article_dir.mkdir(parents=True)
+            article = article_dir / "Article.md"
+            article.write_text(
+                "---\n"
+                'title: "Stay Put"\n'
+                'label: "MyLabel"\n'
+                "---\n\nBody.\n",
+                encoding="utf-8",
+            )
+            response = self.client.post(
+                "/desktop/label",
+                json={"articlePath": str(article), "label": "MyLabel"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.get_json()["moved"])
+            self.assertTrue(article.exists())
+
+    def test_desktop_change_label_conflict_returns_409(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "OUTPUT_DIR", tmpdir):
+            old_dir = Path(tmpdir) / "A" / "Article"
+            old_dir.mkdir(parents=True)
+            article = old_dir / "Article.md"
+            article.write_text("---\ntitle: \"X\"\nlabel: \"A\"\n---\n\nBody.\n", encoding="utf-8")
+            conflict_dir = Path(tmpdir) / "B" / "Article"
+            conflict_dir.mkdir(parents=True)
+            (conflict_dir / "other.txt").write_text("occupied", encoding="utf-8")
+
+            response = self.client.post(
+                "/desktop/label",
+                json={"articlePath": str(article), "label": "B"},
+            )
+            self.assertEqual(response.status_code, 409)
+            self.assertTrue(article.exists())
+
     def test_desktop_browse_directory_lists_subdirectories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

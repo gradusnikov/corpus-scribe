@@ -1910,7 +1910,7 @@ function App() {
         return
       }
       if (!event || typeof event.type !== 'string') return
-      if (event.type === 'library_synced') {
+      if (event.type === 'library_synced' || event.type === 'label_changed') {
         void refreshLibrary()
         return
       }

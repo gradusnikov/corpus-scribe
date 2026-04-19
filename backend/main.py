@@ -3284,6 +3284,79 @@ def desktop_save_rating():
     return jsonify(success=True, articlePath=str(article_path), rating=rating)
 
 
+@app.route("/desktop/label", methods=["POST"])
+def desktop_change_label():
+    data = request.get_json(silent=True) or {}
+    raw_path = (data.get("articlePath") or "").strip()
+    new_label = (data.get("label") or "").strip()
+    if not raw_path:
+        return jsonify(success=False, message="Missing articlePath"), 400
+    article_path = Path(raw_path)
+    if not article_path.exists() or not article_path.is_file():
+        return jsonify(success=False, message=f"Document not found: {article_path}"), 404
+
+    safe_label = _clean_label(new_label)
+    article_text = article_path.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(article_text)
+    old_label = _frontmatter_string(frontmatter, "label") or ""
+    if safe_label == _clean_label(old_label):
+        return jsonify(success=True, articlePath=str(article_path), label=safe_label, moved=False)
+
+    old_article_dir = article_path.parent
+    new_label_dir = _resolve_output_dir(safe_label)
+    new_article_dir = new_label_dir / old_article_dir.name
+
+    if new_article_dir.exists():
+        return jsonify(success=False, message=f"Target directory already exists: {new_article_dir}"), 409
+
+    old_paths: set[str] = set()
+    stem = article_path.stem
+    for name in (article_path.name, f"{stem}.notes.md"):
+        rel = _relative_to_output(str(old_article_dir / name))
+        if rel:
+            old_paths.add(rel)
+
+    new_label_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.move(str(old_article_dir), str(new_article_dir))
+
+    new_article_path = new_article_dir / article_path.name
+    frontmatter["label"] = safe_label or None
+    _write_article_frontmatter(new_article_path, frontmatter, body)
+
+    notes_path = new_article_dir / f"{stem}.notes.md"
+    if notes_path.exists():
+        notes_text = notes_path.read_text(encoding="utf-8")
+        notes_fm, notes_body = _split_frontmatter(notes_text)
+        if notes_fm:
+            notes_fm["label"] = safe_label or None
+            _write_article_frontmatter(notes_path, notes_fm, notes_body)
+
+    _remove_index_records_for_paths(old_paths)
+    _remove_search_records_for_article(article_path)
+    payload = _build_existing_article_payload(new_article_path)
+    _upsert_index_records(_build_index_records(payload, safe_label))
+    _inline_upsert_search_db(new_article_path)
+
+    try:
+        if old_article_dir.exists() and not any(old_article_dir.iterdir()):
+            old_article_dir.rmdir()
+        old_label_dir = old_article_dir.parent
+        if old_label_dir != Path(OUTPUT_DIR) and old_label_dir.exists() and not any(old_label_dir.iterdir()):
+            old_label_dir.rmdir()
+    except OSError:
+        pass
+
+    _publish_desktop_event("label_changed", new_article_path, label=safe_label, oldLabel=old_label)
+    return jsonify(
+        success=True,
+        articlePath=str(new_article_path),
+        label=safe_label,
+        oldLabel=old_label,
+        moved=True,
+    )
+
+
 @app.route("/desktop/document/delete", methods=["POST"])
 def desktop_delete_document():
     data = request.get_json(silent=True) or {}
