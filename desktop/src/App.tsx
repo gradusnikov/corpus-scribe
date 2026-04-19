@@ -4210,7 +4210,7 @@ function App() {
                 <strong>{doc.title}</strong>
                 {doc.authors ? <span className="document-meta">{doc.authors}</span> : null}
                 <span className="document-meta">
-                  {[doc.journal ?? doc.sourceSite ?? 'local', doc.year].filter(Boolean).join(' · ')}
+                  {[doc.journal ?? doc.sourceSite ?? 'local', doc.year, doc.journal && doc.sourceSite ? doc.sourceSite : null].filter(Boolean).join(' · ')}
                 </span>
               </button>
             ))}
