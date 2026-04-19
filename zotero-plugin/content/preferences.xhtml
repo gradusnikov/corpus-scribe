@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml">
+  <groupbox>
+    <label><html:h2>Corpus Scribe backend</html:h2></label>
+
+    <html:div style="display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; align-items: center; padding: 8px;">
+      <html:label for="corpus-scribe-api-base">API base URL</html:label>
+      <html:input id="corpus-scribe-api-base"
+                  type="text"
+                  size="40"
+                  data-preference="extensions.corpus-scribe.apiBase"/>
+
+      <html:label for="corpus-scribe-api-key">API key</html:label>
+      <html:input id="corpus-scribe-api-key"
+                  type="text"
+                  size="40"
+                  data-preference="extensions.corpus-scribe.apiKey"/>
+
+      <html:label for="corpus-scribe-default-label">Default label</html:label>
+      <html:input id="corpus-scribe-default-label"
+                  type="text"
+                  size="40"
+                  data-preference="extensions.corpus-scribe.defaultLabel"/>
+
+      <html:label for="corpus-scribe-page-size">Reading PDF page size</html:label>
+      <menulist id="corpus-scribe-page-size"
+                preference="extensions.corpus-scribe.pageSize">
+        <menupopup>
+          <menuitem label="A4" value="a4"/>
+          <menuitem label="A5" value="a5"/>
+          <menuitem label="Letter" value="letter"/>
+        </menupopup>
+      </menulist>
+    </html:div>
+
+    <html:p style="padding: 0 8px; color: #666;">
+      Right-click an item in your library and choose
+      <html:em>Send to Corpus Scribe</html:em>. The item's best PDF attachment
+      is uploaded together with Zotero metadata; any child notes are saved as
+      the article's working notes.
+    </html:p>
+  </groupbox>
+</vbox>
