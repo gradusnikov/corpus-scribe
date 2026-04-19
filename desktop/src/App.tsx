@@ -323,6 +323,21 @@ async function desktopCommand<T>(command: string, payload: Record<string, unknow
       }
       return data as T
     }
+    case 'change_label': {
+      const response = await fetch(`${browserApiBase}/desktop/label`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          articlePath: payload.articlePath,
+          label: payload.label,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok || !data.success) {
+        throw new Error(data.message ?? 'Failed to change label')
+      }
+      return data as T
+    }
     case 'reindex_library': {
       const response = await fetch(`${browserApiBase}/desktop/reindex`, {
         method: 'POST',
@@ -3252,6 +3267,28 @@ function App() {
     }
   }
 
+  async function changeLabel(newLabel: string) {
+    if (!detail) return
+    const oldPath = detail.summary.articlePath
+    const oldLabel = detail.summary.label
+    try {
+      const result = await desktopCommand<{ articlePath: string; label: string; moved: boolean }>(
+        'change_label',
+        { articlePath: oldPath, label: newLabel },
+      )
+      if (result.moved) {
+        await refreshLibrary()
+        await loadDocumentByPath(result.articlePath)
+        setStatus(`Moved to "${result.label || 'unlabeled'}"`)
+      }
+    } catch (error) {
+      setDetail((current) =>
+        current ? { ...current, summary: { ...current.summary, label: oldLabel } } : current,
+      )
+      setStatus(stringifyError(error))
+    }
+  }
+
   function insertSelectionAsQuote() {
     if (!pendingSelection?.text) {
       return
@@ -4243,6 +4280,25 @@ function App() {
                   size="lg"
                   ariaLabel="Rate this article"
                 />
+                <select
+                  className="label-select"
+                  value={detail.summary.label ?? ''}
+                  onChange={(e) => {
+                    const value = e.target.value
+                    if (value === '__new__') {
+                      const name = window.prompt('New label name:')
+                      if (name?.trim()) void changeLabel(name.trim())
+                    } else {
+                      void changeLabel(value)
+                    }
+                  }}
+                >
+                  <option value="">unlabeled</option>
+                  {library.labels.map((l) => (
+                    <option key={l} value={l}>{l}</option>
+                  ))}
+                  <option value="__new__">+ New label…</option>
+                </select>
                 {detail.summary.url ? (
                   <a
                     className="reader-source-link"
