@@ -547,7 +547,6 @@ select:focus {
 .star-rating-lg {
   font-size: 1.45rem;
   gap: 4px;
-  margin-top: 6px;
 }
 
 .reader-pane {
@@ -582,8 +581,8 @@ select:focus {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 14px;
-  margin-top: 6px;
+  gap: 12px;
+  margin-top: 8px;
 }
 
 .label-chip-group {
