@@ -66,6 +66,7 @@
 
 [data-theme="dark"],
 .shell[data-theme="dark"] {
+  color-scheme: dark;
   --color-shell-bg: #141820;
   --color-sidebar-bg: #1a1f2a;
   --color-sidebar-border: rgba(255, 255, 255, 0.08);
@@ -138,6 +139,36 @@
   background: var(--color-shell-bg);
   color: var(--color-text-primary);
   overflow: hidden;
+  scrollbar-color: rgba(41, 53, 65, 0.35) transparent;
+  scrollbar-width: thin;
+}
+
+[data-theme="dark"] .shell,
+.shell[data-theme="dark"] {
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.shell ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.shell ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.shell ::-webkit-scrollbar-thumb {
+  background: rgba(41, 53, 65, 0.35);
+  border-radius: 999px;
+}
+
+[data-theme="dark"] .shell ::-webkit-scrollbar-thumb,
+.shell[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.shell ::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 .shell.focus-mode {
@@ -371,6 +402,24 @@ select {
   font: inherit;
   color: var(--color-text-primary);
   box-sizing: border-box;
+}
+
+select:not(.label-select-overlay) {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2322303d' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+}
+
+[data-theme="dark"] select:not(.label-select-overlay),
+.shell[data-theme="dark"] select:not(.label-select-overlay) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23d9e0ea' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+}
+
+select option {
+  background: var(--color-panel-bg);
+  color: var(--color-text-primary);
 }
 
 .notes-mode-row {
@@ -1014,6 +1063,10 @@ select:focus {
 }
 
 .markdown-body[data-hide-noise="true"] [data-element-noise="true"] {
+  display: none;
+}
+
+.markdown-body[data-hide-noise="true"] li.noise-only {
   display: none;
 }
 

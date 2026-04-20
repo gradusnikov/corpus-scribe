@@ -533,6 +533,12 @@ function quoteMarkdown(text: string) {
     .join('\n')
 }
 
+function shortenAuthors(authors: string, max = 2): string {
+  const parts = authors.split(/,\s*(?:and\s+)?|;\s*|\s+and\s+/).map((s) => s.trim()).filter(Boolean)
+  if (parts.length <= max) return authors
+  return parts.slice(0, max).join(', ') + ' et al.'
+}
+
 function collectFindRanges(root: HTMLElement, needle: string): Range[] {
   const matches: Range[] = []
   if (!needle) return matches
@@ -927,6 +933,53 @@ function findElementNoiseTarget(
   return null
 }
 
+function updateNoiseOnlyElements(root: HTMLElement) {
+  for (const el of Array.from(root.querySelectorAll('li.noise-only'))) {
+    el.classList.remove('noise-only')
+  }
+  if (root.dataset.hideNoise !== 'true') return
+
+  const liElements = Array.from(root.querySelectorAll('li'))
+  for (let i = liElements.length - 1; i >= 0; i--) {
+    const li = liElements[i]
+    if (li.classList.contains('noise-only')) continue
+    if (!hasVisibleContent(li)) {
+      li.classList.add('noise-only')
+    }
+  }
+}
+
+function hasVisibleContent(element: HTMLElement): boolean {
+  const textWalker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node.textContent ?? ''
+      if (!text.trim()) return NodeFilter.FILTER_REJECT
+      const closestNoiseLi = (node as Text).parentElement?.closest('li.noise-only')
+      if (closestNoiseLi && closestNoiseLi !== element) return NodeFilter.FILTER_REJECT
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+  let textNode = textWalker.nextNode()
+  while (textNode) {
+    const closestNoise = (textNode as Text).parentElement?.closest('mark.inline-noise')
+    if (!closestNoise) return true
+    textNode = textWalker.nextNode()
+  }
+
+  for (const el of Array.from(
+    element.querySelectorAll('img, table, input:not([type="hidden"]), hr, iframe, video, audio, canvas, svg'),
+  )) {
+    const closestNoiseLi = (el as HTMLElement).closest('li.noise-only')
+    if (closestNoiseLi && closestNoiseLi !== element) continue
+    if (el.closest('mark.inline-noise')) continue
+    const tag = el.tagName.toLowerCase()
+    if ((tag === 'img' || tag === 'table') && (el as HTMLElement).dataset.elementNoise === 'true') continue
+    return true
+  }
+
+  return false
+}
+
 function applyInlineHighlights(root: HTMLElement, highlights: Highlight[]) {
   unwrapHighlightMarks(root)
   if (!highlights.length) {
@@ -1297,7 +1350,14 @@ const ReaderContent = memo(function ReaderContent({
     }
     applyInlineHighlights(articleRef.current, highlights)
     applyElementNoise(articleRef.current, highlights)
+    updateNoiseOnlyElements(articleRef.current)
   }, [highlights, markdown])
+
+  useEffect(() => {
+    const root = articleRef.current
+    if (!root) return
+    updateNoiseOnlyElements(root)
+  }, [hideNoise])
 
   useEffect(() => {
     const root = articleRef.current
@@ -1671,6 +1731,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [notesStrategyDialogOpen, setNotesStrategyDialogOpen] = useState(false)
   const [pendingHashPath, setPendingHashPath] = useState<string | null>(null)
+  const [pendingHashLabel, setPendingHashLabel] = useState<string | null>(null)
   const [scrollHeadingRequest, setScrollHeadingRequest] = useState<{ index: number; ts: number } | null>(null)
   const deferredSearch = useDeferredValue(search.trim())
   const dragStateRef = useRef<{ pane: 'left' | 'right' | 'notes'; pointerId: number } | null>(null)
@@ -1697,11 +1758,14 @@ function App() {
       const hash = window.location.hash
       if (!hash || !hash.startsWith('#')) return null
       const params = new URLSearchParams(hash.slice(1))
-      return params.get('open')
+      return { open: params.get('open'), label: params.get('label') }
     }
     const updateFromHash = () => {
-      const path = parseHash()
-      if (path) setPendingHashPath(path)
+      const parsed = parseHash()
+      if (parsed?.open) {
+        setPendingHashPath(parsed.open)
+        if (parsed.label) setPendingHashLabel(parsed.label)
+      }
     }
     updateFromHash()
     window.addEventListener('hashchange', updateFromHash)
@@ -1731,13 +1795,16 @@ function App() {
     const refreshed = hashRefreshAttemptedRef.current === pendingHashPath
     if (!target && !refreshed) return
     const path = pendingHashPath
+    const label = pendingHashLabel
     setPendingHashPath(null)
+    setPendingHashLabel(null)
     hashRefreshAttemptedRef.current = null
     window.history.replaceState(
       null,
       '',
       window.location.pathname + window.location.search,
     )
+    if (label) setSelectedLabel(label)
     if (target) {
       void loadDocument(target)
     } else {
@@ -4316,7 +4383,7 @@ function App() {
                   ) : null}
                 </div>
                 <strong>{doc.title}</strong>
-                {doc.authors ? <span className="document-meta">{doc.authors}</span> : null}
+                {doc.authors ? <span className="document-meta">{shortenAuthors(doc.authors)}</span> : null}
                 <span className="document-meta">
                   {[doc.journal ?? doc.sourceSite ?? 'local', doc.year, doc.journal && doc.sourceSite ? doc.sourceSite : null].filter(Boolean).join(' · ')}
                 </span>
