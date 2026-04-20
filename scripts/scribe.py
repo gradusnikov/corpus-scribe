@@ -343,7 +343,13 @@ def build_mcp_server(client: ScribeClient):
         ),
     )
     def get_current_context() -> str:
-        return json.dumps(client.get_session(), ensure_ascii=False, indent=2)
+        session = client.get_session()
+        focused = session.get("focusedDocumentPath")
+        if isinstance(focused, str) and focused:
+            highlights = client.get_highlights(focused)
+            content_highlights = [h for h in highlights if h.get("variant") != "noise"]
+            session["focusedHighlightCount"] = len(content_highlights)
+        return json.dumps(session, ensure_ascii=False, indent=2)
 
     @mcp.tool(
         name="read_document",
