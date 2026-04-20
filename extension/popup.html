@@ -5,22 +5,28 @@
 </head>
 <body>
   <div class="container">
-    <h3>Corpus Scribe</h3>
-    <div class="row row-stack">
-      <label for="label-name">Label</label>
-      <input id="label-name" type="text" list="label-options" placeholder="Choose or create a label" autocomplete="off">
-      <datalist id="label-options"></datalist>
+    <div class="header-row">
+      <h3>Corpus Scribe</h3>
+      <span id="connection-dot" class="dot dot-pending" title="Checking backend..."></span>
     </div>
-    <div class="row">
-      <label for="page-size">Page size</label>
-      <select id="page-size">
-        <option value="a5" selected>A5</option>
-        <option value="a4">A4</option>
-      </select>
+
+    <div id="page-info" class="page-info"></div>
+
+    <div class="field">
+      <label for="label-select">Label</label>
+      <div class="label-input-group">
+        <select id="label-select">
+          <option value="" disabled>Loading labels...</option>
+        </select>
+        <input id="label-new" type="text" placeholder="New label name..." class="hidden">
+        <button id="label-new-cancel" type="button" class="label-cancel hidden" title="Cancel">&times;</button>
+      </div>
     </div>
-    <div id="doc-hint" class="hint"></div>
-    <button id="btn-open-scribe" class="btn btn-primary">Open in Corpus Scribe</button>
-    <button id="btn-save" class="btn btn-secondary">Save PDF + MD</button>
+
+    <div class="actions">
+      <button id="btn-save" class="btn btn-secondary">Save</button>
+      <button id="btn-open-scribe" class="btn btn-primary">Save &amp; Open</button>
+    </div>
     <div id="status" class="status"></div>
 
     <details id="settings-toggle">
